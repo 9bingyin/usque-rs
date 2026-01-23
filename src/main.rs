@@ -139,7 +139,6 @@ async fn run_socks_server(
     config_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
-    use std::time::Duration;
 
     let cfg = config::Config::load(config_path)?;
     println!("Config loaded from {}", config_path);
@@ -148,36 +147,27 @@ async fn run_socks_server(
     let (cert_der, key_der) = crypto::generate_self_signed_cert(&signing_key)?;
     println!("Generated self-signed certificate");
 
-    // endpoint_v4 may contain ":0" port from API, extract IP and use port 443
     let endpoint_ip = cfg.endpoint_v4
         .split(':')
         .next()
         .unwrap_or(&cfg.endpoint_v4);
     let endpoint: SocketAddr = format!("{}:443", endpoint_ip).parse()?;
-    println!("Connecting to endpoint: {}", endpoint);
+    println!("Will connect to endpoint: {}", endpoint);
 
     let endpoint_pub_key = cfg.get_endpoint_pub_key_der().ok();
-    let quic_conn = tunnel::quic::connect_with_pinning(
+
+    let params = tunnel::ConnectionParams {
         endpoint,
-        &cert_der,
-        &key_der,
-        tunnel::quic::CONNECT_SNI,
-        Duration::from_secs(30),
-        endpoint_pub_key.as_deref(),
-    ).await?;
-    println!("QUIC connection established");
+        cert_der,
+        key_der,
+        sni: tunnel::quic::CONNECT_SNI.to_string(),
+        endpoint_pub_key,
+        ipv4: cfg.ipv4.clone(),
+        ipv6: Some(cfg.ipv6.clone()),
+    };
 
-    let mut masque_tunnel = tunnel::MasqueTunnel::new(quic_conn);
-    masque_tunnel.establish(Duration::from_secs(30)).await?;
-    println!("MASQUE tunnel established");
-
-    // Create tunnel manager with userspace TCP/IP stack
-    let tunnel_manager = Arc::new(tunnel::TunnelManager::new(
-        masque_tunnel,
-        &cfg.ipv4,
-        Some(&cfg.ipv6),
-    ));
-    println!("Tunnel manager started");
+    let tunnel_manager = Arc::new(tunnel::TunnelManager::new(params));
+    println!("Tunnel manager started (will auto-reconnect)");
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
     let server = proxy::Socks5Server::new(addr, tunnel_manager);

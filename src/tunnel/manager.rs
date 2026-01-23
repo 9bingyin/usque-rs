@@ -1,10 +1,23 @@
 use crate::tunnel::masque::MasqueTunnel;
+use crate::tunnel::quic;
 use crate::tunnel::stack::NetworkStack;
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+// Connection parameters for establishing and reconnecting tunnel
+pub struct ConnectionParams {
+    pub endpoint: SocketAddr,
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
+    pub sni: String,
+    pub endpoint_pub_key: Option<Vec<u8>>,
+    pub ipv4: String,
+    pub ipv6: Option<String>,
+}
 
 // Commands sent from SOCKS5 connections to the manager
 pub enum ManagerCommand {
@@ -41,20 +54,63 @@ pub struct TunnelManager {
 }
 
 impl TunnelManager {
-    pub fn new(tunnel: MasqueTunnel, ipv4: &str, ipv6: Option<&str>) -> Self {
-        let stack = NetworkStack::new(ipv4, ipv6, 1280);
+    pub fn new(params: ConnectionParams) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
-        let manager_task = ManagerTask {
-            stack,
-            tunnel,
-            sockets: HashMap::new(),
-            cmd_rx,
-        };
-
-        tokio::spawn(manager_task.run());
+        tokio::spawn(Self::maintain_tunnel(params, cmd_rx));
 
         Self { cmd_tx }
+    }
+
+    async fn maintain_tunnel(
+        params: ConnectionParams,
+        mut cmd_rx: mpsc::Receiver<ManagerCommand>,
+    ) {
+        let reconnect_delay = Duration::from_secs(1);
+
+        loop {
+            log::info!("Establishing MASQUE connection to {}", params.endpoint);
+
+            match Self::establish_connection(&params).await {
+                Ok((tunnel, stack)) => {
+                    log::info!("Tunnel connected successfully");
+
+                    // Run main loop until connection is closed
+                    Self::run_loop(tunnel, stack, &mut cmd_rx).await;
+
+                    log::warn!("Connection lost, reconnecting...");
+                }
+                Err(e) => {
+                    log::error!("Failed to connect: {}", e);
+                }
+            }
+
+            tokio::time::sleep(reconnect_delay).await;
+        }
+    }
+
+    async fn establish_connection(
+        params: &ConnectionParams,
+    ) -> Result<(MasqueTunnel, NetworkStack), Box<dyn std::error::Error + Send + Sync>> {
+        let quic_conn = quic::connect_with_pinning(
+            params.endpoint,
+            &params.cert_der,
+            &params.key_der,
+            &params.sni,
+            Duration::from_secs(30),
+            params.endpoint_pub_key.as_deref(),
+        ).await?;
+
+        let mut masque_tunnel = MasqueTunnel::new(quic_conn);
+        masque_tunnel.establish(Duration::from_secs(30)).await?;
+
+        let stack = NetworkStack::new(
+            &params.ipv4,
+            params.ipv6.as_deref(),
+            1280,
+        );
+
+        Ok((masque_tunnel, stack))
     }
 
     pub async fn connect(
@@ -87,49 +143,57 @@ impl TunnelManager {
     pub fn cmd_sender(&self) -> mpsc::Sender<ManagerCommand> {
         self.cmd_tx.clone()
     }
-}
 
-struct ManagerTask {
-    stack: NetworkStack,
-    tunnel: MasqueTunnel,
-    sockets: HashMap<SocketHandle, SocketState>,
-    cmd_rx: mpsc::Receiver<ManagerCommand>,
-}
-
-impl ManagerTask {
-    async fn run(mut self) {
-        let socket = self.tunnel.quic_conn.socket.clone();
-        let local_addr = self.tunnel.quic_conn.local_addr;
+    async fn run_loop(
+        mut tunnel: MasqueTunnel,
+        mut stack: NetworkStack,
+        cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
+    ) {
+        let socket = tunnel.quic_conn.socket.clone();
+        let local_addr = tunnel.quic_conn.local_addr;
 
         let mut buf = [0u8; 65535];
+        let mut sockets: HashMap<SocketHandle, SocketState> = HashMap::new();
         let mut interval = tokio::time::interval(Duration::from_micros(50));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            // Check connection status at the start of each iteration
+            if tunnel.quic_conn.is_closed() {
+                log::error!("QUIC connection closed");
+                break;
+            }
+
             tokio::select! {
                 biased;
 
                 // Handle commands from SOCKS5 connections
-                Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_command(cmd);
+                Some(cmd) = cmd_rx.recv() => {
+                    Self::handle_command(&mut stack, &mut sockets, cmd);
                 }
 
                 // Receive UDP data
                 result = socket.recv_from(&mut buf) => {
                     if let Ok((len, from)) = result {
-                        self.handle_udp_recv(&buf[..len], from, local_addr);
+                        Self::handle_udp_recv(&mut tunnel, &mut stack, &buf[..len], from, local_addr);
                     }
                 }
 
                 // Periodic poll
                 _ = interval.tick() => {
-                    self.poll_all().await;
+                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets).await;
                 }
             }
         }
+
+        log::info!("TunnelManager run_loop ended");
     }
 
-    fn handle_command(&mut self, cmd: ManagerCommand) {
+    fn handle_command(
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
+        cmd: ManagerCommand,
+    ) {
         match cmd {
             ManagerCommand::Connect {
                 remote_ip,
@@ -137,29 +201,29 @@ impl ManagerTask {
                 local_port,
                 response,
             } => {
-                let result = self.create_connection(remote_ip, remote_port, local_port);
+                let result = Self::create_connection(stack, sockets, remote_ip, remote_port, local_port);
                 let _ = response.send(result);
             }
             ManagerCommand::Close { handle } => {
-                self.close_connection(handle);
+                Self::close_connection(stack, sockets, handle);
             }
         }
     }
 
     fn create_connection(
-        &mut self,
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
     ) -> Result<SocketChannels, String> {
-        let handle = self.stack.create_tcp_socket();
+        let handle = stack.create_tcp_socket();
 
-        if let Err(e) = self.stack.connect_tcp(handle, remote_ip, remote_port, local_port) {
-            self.stack.remove_socket(handle);
+        if let Err(e) = stack.connect_tcp(handle, remote_ip, remote_port, local_port) {
+            stack.remove_socket(handle);
             return Err(format!("Connect failed: {}", e));
         }
 
-        // Create channels for this socket
         let (to_client_tx, to_client_rx) = mpsc::channel(1024);
         let (from_client_tx, from_client_rx) = mpsc::channel(1024);
 
@@ -170,7 +234,7 @@ impl ManagerTask {
             pending_data: Vec::new(),
         };
 
-        self.sockets.insert(handle, state);
+        sockets.insert(handle, state);
 
         Ok(SocketChannels {
             handle,
@@ -179,14 +243,19 @@ impl ManagerTask {
         })
     }
 
-    fn close_connection(&mut self, handle: SocketHandle) {
-        self.stack.tcp_close(handle);
-        self.stack.remove_socket(handle);
-        self.sockets.remove(&handle);
+    fn close_connection(
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
+        handle: SocketHandle,
+    ) {
+        stack.tcp_close(handle);
+        stack.remove_socket(handle);
+        sockets.remove(&handle);
     }
 
     fn handle_udp_recv(
-        &mut self,
+        tunnel: &mut MasqueTunnel,
+        stack: &mut NetworkStack,
         data: &[u8],
         from: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
@@ -196,76 +265,65 @@ impl ManagerTask {
             to: local_addr,
         };
 
-        if let Err(e) = self.tunnel.quic_conn.conn.recv(&mut data.to_vec(), recv_info) {
+        if let Err(e) = tunnel.quic_conn.conn.recv(&mut data.to_vec(), recv_info) {
             log::warn!("QUIC recv error: {:?}", e);
             return;
         }
 
-        // Poll H3 to process any events
-        self.tunnel.poll_h3();
+        tunnel.poll_h3();
 
-        // Read datagrams and inject into stack
         let mut dgram_buf = [0u8; 65535];
         loop {
-            match self.tunnel.recv_datagram(&mut dgram_buf) {
+            match tunnel.recv_datagram(&mut dgram_buf) {
                 Ok(len) if len > 0 => {
-                    self.stack.inject_packet(dgram_buf[..len].to_vec());
+                    stack.inject_packet(dgram_buf[..len].to_vec());
                 }
                 _ => break,
             }
         }
     }
 
-    async fn poll_all(&mut self) {
-        // Handle QUIC timeout to send PING frames and keep connection alive
-        self.tunnel.quic_conn.conn.on_timeout();
+    async fn poll_all(
+        tunnel: &mut MasqueTunnel,
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
+    ) {
+        tunnel.quic_conn.conn.on_timeout();
 
-        // Check if QUIC connection is closed
-        if self.tunnel.quic_conn.is_closed() {
-            log::error!("QUIC connection closed");
-            return;
-        }
+        stack.poll();
 
-        // Poll the TCP/IP stack
-        self.stack.poll();
-
-        // Process each socket
-        let handles: Vec<SocketHandle> = self.sockets.keys().copied().collect();
+        let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
         let mut closed_handles = Vec::new();
 
         for handle in handles {
-            if !self.stack.tcp_is_active(handle) {
+            if !stack.tcp_is_active(handle) {
                 closed_handles.push(handle);
                 continue;
             }
 
-            // Read data from stack and send to client
-            if self.stack.tcp_may_recv(handle) {
+            if stack.tcp_may_recv(handle) {
                 let mut buf = [0u8; 65535];
-                if let Ok(n) = self.stack.tcp_recv(handle, &mut buf) {
+                if let Ok(n) = stack.tcp_recv(handle, &mut buf) {
                     if n > 0 {
-                        if let Some(state) = self.sockets.get(&handle) {
+                        if let Some(state) = sockets.get(&handle) {
                             let _ = state.to_client.try_send(buf[..n].to_vec());
                         }
                     }
                 }
             }
 
-            // Read data from client and send to stack
-            if let Some(state) = self.sockets.get_mut(&handle) {
-                // First, try to send any pending data
-                if !state.pending_data.is_empty() && self.stack.tcp_may_send(handle) {
-                    if let Ok(sent) = self.stack.tcp_send(handle, &state.pending_data) {
+            if let Some(state) = sockets.get_mut(&handle) {
+                if !state.pending_data.is_empty() && stack.tcp_may_send(handle) {
+                    if let Ok(sent) = stack.tcp_send(handle, &state.pending_data) {
                         if sent > 0 {
                             state.pending_data.drain(..sent);
                         }
                     }
                 }
 
-                // Then receive new data from client
                 while let Ok(data) = state.from_client.try_recv() {
-                    if self.stack.tcp_may_send(handle) {
-                        match self.stack.tcp_send(handle, &data) {
+                    if stack.tcp_may_send(handle) {
+                        match stack.tcp_send(handle, &data) {
                             Ok(sent) if sent < data.len() => {
                                 state.pending_data.extend_from_slice(&data[sent..]);
                             }
@@ -281,21 +339,18 @@ impl ManagerTask {
             }
         }
 
-        // Clean up closed sockets
         for handle in closed_handles {
-            self.sockets.remove(&handle);
-            self.stack.remove_socket(handle);
+            sockets.remove(&handle);
+            stack.remove_socket(handle);
         }
 
-        // Take packets from stack and send to tunnel
-        while let Some(packet) = self.stack.take_packet() {
-            if let Err(e) = self.tunnel.send_datagram(&packet) {
+        while let Some(packet) = stack.take_packet() {
+            if let Err(e) = tunnel.send_datagram(&packet) {
                 log::warn!("Failed to send datagram: {:?}", e);
             }
         }
 
-        // Send QUIC data
-        if let Err(e) = self.tunnel.quic_conn.send_async().await {
+        if let Err(e) = tunnel.quic_conn.send_async().await {
             log::warn!("Failed to send QUIC data: {:?}", e);
         }
     }
