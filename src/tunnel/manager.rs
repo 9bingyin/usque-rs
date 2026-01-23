@@ -1,3 +1,7 @@
+use crate::tunnel::dns::{
+    build_dns_query, dns_port, dns_server, get_dns_local_port, parse_dns_response, DnsError,
+    DnsRecordType,
+};
 use crate::tunnel::masque::MasqueTunnel;
 use crate::tunnel::quic;
 use crate::tunnel::stack::NetworkStack;
@@ -5,7 +9,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 // Connection parameters for establishing and reconnecting tunnel
@@ -32,6 +36,12 @@ pub enum ManagerCommand {
     Close {
         handle: SocketHandle,
     },
+    // DNS resolution through tunnel
+    DnsResolve {
+        domain: String,
+        prefer_ipv6: bool,
+        response: oneshot::Sender<Result<IpAddress, DnsError>>,
+    },
 }
 
 // Channels for a single TCP socket
@@ -48,6 +58,23 @@ struct SocketState {
     from_client: mpsc::Receiver<Vec<u8>>,
     pending_data: Vec<u8>,
 }
+
+// DNS query state for a single query (A or AAAA)
+struct DnsQueryState {
+    handle: SocketHandle,
+    group_id: u32,
+    query_type: DnsRecordType,
+}
+
+// Happy Eyeballs: tracks paired A/AAAA queries
+struct DnsQueryGroup {
+    response: oneshot::Sender<Result<IpAddress, DnsError>>,
+    ipv4_result: Option<Result<Vec<IpAddress>, DnsError>>,
+    ipv6_result: Option<Result<Vec<IpAddress>, DnsError>>,
+    created_at: Instant,
+}
+
+static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 pub struct TunnelManager {
     cmd_tx: mpsc::Sender<ManagerCommand>,
@@ -155,6 +182,21 @@ impl TunnelManager {
         self.cmd_tx.clone()
     }
 
+    pub async fn resolve(&self, domain: &str, prefer_ipv6: bool) -> Result<IpAddress, DnsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.cmd_tx
+            .send(ManagerCommand::DnsResolve {
+                domain: domain.to_string(),
+                prefer_ipv6,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DnsError::ChannelError)?;
+
+        response_rx.await.map_err(|_| DnsError::ChannelError)?
+    }
+
     async fn run_loop(
         mut tunnel: MasqueTunnel,
         mut stack: NetworkStack,
@@ -165,8 +207,14 @@ impl TunnelManager {
 
         let mut buf = [0u8; 65535];
         let mut sockets: HashMap<SocketHandle, SocketState> = HashMap::new();
+        let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
+        let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
         let mut interval = tokio::time::interval(Duration::from_micros(50));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // KeepAlive timer - send PING frames every 30 seconds to keep connection alive
+        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(30));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // Check connection status at the start of each iteration
@@ -180,7 +228,7 @@ impl TunnelManager {
 
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut stack, &mut sockets, cmd);
+                    Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, cmd);
                 }
 
                 // Receive UDP data
@@ -192,7 +240,16 @@ impl TunnelManager {
 
                 // Periodic poll
                 _ = interval.tick() => {
-                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets).await;
+                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups).await;
+                }
+
+                // KeepAlive - send PING frame to keep connection alive
+                _ = keepalive_interval.tick() => {
+                    if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
+                        log::warn!("Failed to send keepalive PING: {:?}", e);
+                    } else {
+                        log::debug!("Sent keepalive PING frame");
+                    }
                 }
             }
         }
@@ -203,6 +260,8 @@ impl TunnelManager {
     fn handle_command(
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         cmd: ManagerCommand,
     ) {
         match cmd {
@@ -217,6 +276,13 @@ impl TunnelManager {
             }
             ManagerCommand::Close { handle } => {
                 Self::close_connection(stack, sockets, handle);
+            }
+            ManagerCommand::DnsResolve {
+                domain,
+                prefer_ipv6,
+                response,
+            } => {
+                Self::start_dns_query(stack, dns_queries, dns_groups, &domain, prefer_ipv6, response);
             }
         }
     }
@@ -264,6 +330,166 @@ impl TunnelManager {
         sockets.remove(&handle);
     }
 
+    fn start_dns_query(
+        stack: &mut NetworkStack,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        domain: &str,
+        _prefer_ipv6: bool,
+        response: oneshot::Sender<Result<IpAddress, DnsError>>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let group_id = DNS_GROUP_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Create group to track both queries
+        dns_groups.insert(
+            group_id,
+            DnsQueryGroup {
+                response,
+                ipv4_result: None,
+                ipv6_result: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        // Send A query (IPv4)
+        if let Ok((tx_id_a, packet_a)) = build_dns_query(domain, DnsRecordType::A) {
+            let local_port = get_dns_local_port();
+            let handle = stack.create_udp_socket(local_port);
+            if stack.udp_send(handle, dns_server(), dns_port(), &packet_a).is_ok() {
+                dns_queries.insert(
+                    tx_id_a,
+                    DnsQueryState {
+                        handle,
+                        group_id,
+                        query_type: DnsRecordType::A,
+                    },
+                );
+                log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
+            } else {
+                stack.remove_socket(handle);
+            }
+        }
+
+        // Send AAAA query (IPv6)
+        if let Ok((tx_id_aaaa, packet_aaaa)) = build_dns_query(domain, DnsRecordType::AAAA) {
+            let local_port = get_dns_local_port();
+            let handle = stack.create_udp_socket(local_port);
+            if stack.udp_send(handle, dns_server(), dns_port(), &packet_aaaa).is_ok() {
+                dns_queries.insert(
+                    tx_id_aaaa,
+                    DnsQueryState {
+                        handle,
+                        group_id,
+                        query_type: DnsRecordType::AAAA,
+                    },
+                );
+                log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
+            } else {
+                stack.remove_socket(handle);
+            }
+        }
+    }
+
+    fn process_dns_responses(
+        stack: &mut NetworkStack,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+    ) {
+        let query_ids: Vec<u16> = dns_queries.keys().copied().collect();
+
+        for transaction_id in query_ids {
+            let (handle, group_id, query_type) = match dns_queries.get(&transaction_id) {
+                Some(state) => (state.handle, state.group_id, state.query_type),
+                None => continue,
+            };
+
+            if !stack.udp_can_recv(handle) {
+                continue;
+            }
+
+            let mut buf = [0u8; 512];
+            let result = stack.udp_recv(handle, &mut buf);
+
+            if let Ok((len, _endpoint)) = result {
+                let response_result = parse_dns_response(&buf[..len], transaction_id);
+
+                // Remove query and socket
+                dns_queries.remove(&transaction_id);
+                stack.remove_socket(handle);
+
+                // Update group with result
+                if let Some(group) = dns_groups.get_mut(&group_id) {
+                    match query_type {
+                        DnsRecordType::A => {
+                            group.ipv4_result = Some(response_result);
+                        }
+                        DnsRecordType::AAAA => {
+                            group.ipv6_result = Some(response_result);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Try to resolve the group
+                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+            }
+        }
+    }
+
+    fn try_resolve_dns_group(
+        stack: &mut NetworkStack,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        group_id: u32,
+    ) {
+        let group = match dns_groups.get(&group_id) {
+            Some(g) => g,
+            None => return,
+        };
+
+        // Happy Eyeballs: prefer IPv6 if available, fallback to IPv4
+        let result = match (&group.ipv6_result, &group.ipv4_result) {
+            // IPv6 succeeded with addresses
+            (Some(Ok(v6_addrs)), _) if !v6_addrs.is_empty() => {
+                log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
+                Some(Ok(v6_addrs[0]))
+            }
+            // IPv4 succeeded with addresses
+            (_, Some(Ok(v4_addrs))) if !v4_addrs.is_empty() => {
+                log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
+                Some(Ok(v4_addrs[0]))
+            }
+            // Both failed or returned no records
+            (Some(_), Some(_)) => {
+                log::debug!("DNS resolution failed: no records from both A and AAAA");
+                Some(Err(DnsError::NoRecords))
+            }
+            // Still waiting for one response
+            _ => None,
+        };
+
+        if let Some(res) = result {
+            // Cleanup remaining queries for this group
+            let remaining: Vec<u16> = dns_queries
+                .iter()
+                .filter(|(_, s)| s.group_id == group_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in remaining {
+                if let Some(state) = dns_queries.remove(&id) {
+                    stack.remove_socket(state.handle);
+                }
+            }
+
+            // Send response and remove group
+            if let Some(group) = dns_groups.remove(&group_id) {
+                let _ = group.response.send(res);
+            }
+        }
+    }
+
     fn handle_udp_recv(
         tunnel: &mut MasqueTunnel,
         stack: &mut NetworkStack,
@@ -298,10 +524,41 @@ impl TunnelManager {
         tunnel: &mut MasqueTunnel,
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
     ) {
         tunnel.quic_conn.conn.on_timeout();
 
         stack.poll();
+
+        // Process DNS responses
+        Self::process_dns_responses(stack, dns_queries, dns_groups);
+
+        // Cleanup timed out DNS groups (5 second timeout)
+        let now = Instant::now();
+        let timed_out_groups: Vec<u32> = dns_groups
+            .iter()
+            .filter(|(_, group)| now.duration_since(group.created_at) > Duration::from_secs(5))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for group_id in timed_out_groups {
+            // Remove all queries for this group
+            let query_ids: Vec<u16> = dns_queries
+                .iter()
+                .filter(|(_, s)| s.group_id == group_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in query_ids {
+                if let Some(state) = dns_queries.remove(&id) {
+                    stack.remove_socket(state.handle);
+                }
+            }
+            // Send timeout error
+            if let Some(group) = dns_groups.remove(&group_id) {
+                let _ = group.response.send(Err(DnsError::Timeout));
+            }
+        }
 
         let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
         let mut closed_handles = Vec::new();

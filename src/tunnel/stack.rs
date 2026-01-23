@@ -1,8 +1,9 @@
 use crate::tunnel::device::VirtualDevice;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
+use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -136,5 +137,58 @@ impl NetworkStack {
 
     pub fn take_packet(&mut self) -> Option<Vec<u8>> {
         self.device.take_packet()
+    }
+
+    // UDP socket methods for DNS resolution
+    pub fn create_udp_socket(&mut self, local_port: u16) -> smoltcp::iface::SocketHandle {
+        let rx_buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; 16],
+            vec![0; 8192],
+        );
+        let tx_buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; 16],
+            vec![0; 8192],
+        );
+        let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
+
+        let local_endpoint = IpEndpoint::new(IpAddress::Ipv4(self.local_ipv4), local_port);
+        socket.bind(local_endpoint).ok();
+
+        self.sockets.add(socket)
+    }
+
+    pub fn udp_send(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        remote_ip: IpAddress,
+        remote_port: u16,
+        data: &[u8],
+    ) -> Result<(), StackError> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        let endpoint = IpEndpoint::new(remote_ip, remote_port);
+        socket
+            .send_slice(data, endpoint)
+            .map_err(|e| StackError::SocketError(format!("{:?}", e)))
+    }
+
+    pub fn udp_recv(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        buf: &mut [u8],
+    ) -> Result<(usize, UdpMetadata), StackError> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket
+            .recv_slice(buf)
+            .map_err(|e| StackError::SocketError(format!("{:?}", e)))
+    }
+
+    pub fn udp_can_recv(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.can_recv()
+    }
+
+    pub fn udp_can_send(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.can_send()
     }
 }

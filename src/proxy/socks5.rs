@@ -28,7 +28,8 @@ pub enum Socks5Error {
 
 #[derive(Debug, Clone)]
 struct TargetAddress {
-    ip: IpAddress,
+    ip: Option<IpAddress>,
+    domain: Option<String>,
     port: u16,
 }
 
@@ -97,12 +98,35 @@ async fn handle_client(
     }
 
     let target = read_address(&mut stream, header[3]).await?;
-    log::debug!("Connect request to {:?}:{}", target.ip, target.port);
+
+    // Resolve domain name if needed (through tunnel to prevent DNS leak)
+    let remote_ip = if let Some(ip) = target.ip {
+        log::debug!("Connect request to {:?}:{}", ip, target.port);
+        ip
+    } else if let Some(ref domain) = target.domain {
+        log::debug!("Connect request to {}:{}, resolving DNS through tunnel", domain, target.port);
+        match manager.resolve(domain, false).await {
+            Ok(ip) => {
+                log::debug!("DNS resolved {} -> {:?}", domain, ip);
+                ip
+            }
+            Err(e) => {
+                log::error!("DNS resolution failed for {}: {:?}", domain, e);
+                send_error_response(&mut stream, REP_GENERAL_FAILURE).await?;
+                return Err(Socks5Error::ProtocolError(format!(
+                    "DNS resolution failed: {:?}",
+                    e
+                )));
+            }
+        }
+    } else {
+        return Err(Socks5Error::ProtocolError("No address provided".into()));
+    };
 
     // Create TCP connection through the manager
     let local_port = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let channels = manager
-        .connect(target.ip, target.port, local_port)
+        .connect(remote_ip, target.port, local_port)
         .await
         .map_err(|e| Socks5Error::ConnectionFailed(e))?;
 
@@ -140,7 +164,8 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
             stream.read_exact(&mut port).await?;
             let port = u16::from_be_bytes(port);
             Ok(TargetAddress {
-                ip: IpAddress::Ipv4(Ipv4Address::new(addr[0], addr[1], addr[2], addr[3])),
+                ip: Some(IpAddress::Ipv4(Ipv4Address::new(addr[0], addr[1], addr[2], addr[3]))),
+                domain: None,
                 port,
             })
         }
@@ -151,12 +176,13 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
             stream.read_exact(&mut domain).await?;
             let mut port = [0u8; 2];
             stream.read_exact(&mut port).await?;
-            let _port = u16::from_be_bytes(port);
-            let domain_str = String::from_utf8_lossy(&domain);
-            Err(Socks5Error::ProtocolError(format!(
-                "Domain names not yet supported: {}",
-                domain_str
-            )))
+            let port = u16::from_be_bytes(port);
+            let domain_str = String::from_utf8_lossy(&domain).to_string();
+            Ok(TargetAddress {
+                ip: None,
+                domain: Some(domain_str),
+                port,
+            })
         }
         ATYP_IPV6 => {
             let mut addr = [0u8; 16];
@@ -165,7 +191,7 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
             stream.read_exact(&mut port).await?;
             let port = u16::from_be_bytes(port);
             Ok(TargetAddress {
-                ip: IpAddress::Ipv6(Ipv6Address::new(
+                ip: Some(IpAddress::Ipv6(Ipv6Address::new(
                     u16::from_be_bytes([addr[0], addr[1]]),
                     u16::from_be_bytes([addr[2], addr[3]]),
                     u16::from_be_bytes([addr[4], addr[5]]),
@@ -174,7 +200,8 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
                     u16::from_be_bytes([addr[10], addr[11]]),
                     u16::from_be_bytes([addr[12], addr[13]]),
                     u16::from_be_bytes([addr[14], addr[15]]),
-                )),
+                ))),
+                domain: None,
                 port,
             })
         }
