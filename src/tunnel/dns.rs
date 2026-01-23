@@ -89,29 +89,33 @@ pub fn build_dns_query(domain: &str, record_type: RecordType) -> Result<(u16, Ve
     Ok((transaction_id, bytes.to_vec()))
 }
 
-/// Parse DNS response and extract IP addresses using hickory-proto
-pub fn parse_dns_response(data: &[u8], expected_id: u16) -> Result<Vec<IpAddress>, DnsError> {
+pub fn parse_dns_response_with_id(
+    data: &[u8],
+) -> Result<(u16, Result<Vec<IpAddress>, DnsError>), DnsError> {
     let message = Message::from_bytes(data)
         .map_err(|e| DnsError::DecodeError(format!("{}", e)))?;
+    let id = message.id();
+    let result = match validate_dns_response(&message) {
+        Ok(()) => extract_dns_addresses(&message),
+        Err(e) => Err(e),
+    };
+    Ok((id, result))
+}
 
-    // Check transaction ID
-    if message.id() != expected_id {
-        return Err(DnsError::InvalidResponse);
-    }
-
-    // Check if it's a response
+fn validate_dns_response(message: &Message) -> Result<(), DnsError> {
     if message.message_type() != MessageType::Response {
         return Err(DnsError::InvalidResponse);
     }
-
-    // Check response code
     if message.response_code() != hickory_proto::op::ResponseCode::NoError {
         return Err(DnsError::QueryFailed(format!(
             "RCODE: {:?}",
             message.response_code()
         )));
     }
+    Ok(())
+}
 
+fn extract_dns_addresses(message: &Message) -> Result<Vec<IpAddress>, DnsError> {
     let mut addresses = Vec::new();
 
     for answer in message.answers() {
@@ -129,8 +133,6 @@ pub fn parse_dns_response(data: &[u8], expected_id: u16) -> Result<Vec<IpAddress
                     segments[4], segments[5], segments[6], segments[7],
                 )));
             }
-            // CNAME records are automatically followed by the DNS server
-            // Other record types are ignored for IP resolution
             _ => {}
         }
     }

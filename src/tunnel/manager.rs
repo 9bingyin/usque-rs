@@ -1,5 +1,5 @@
 use crate::tunnel::dns::{
-    build_dns_query, dns_port, get_dns_local_port, parse_dns_response, DnsError,
+    build_dns_query, dns_port, get_dns_local_port, parse_dns_response_with_id, DnsError,
     DnsRecordType,
 };
 use crate::tunnel::masque::MasqueTunnel;
@@ -147,9 +147,45 @@ struct SocketState {
 
 // DNS query state for a single query (A or AAAA)
 struct DnsQueryState {
-    handle: SocketHandle,
     group_id: u32,
     query_type: DnsRecordType,
+}
+
+struct DnsSockets {
+    v4: Option<SocketHandle>,
+    v6: Option<SocketHandle>,
+}
+
+impl DnsSockets {
+    fn new() -> Self {
+        Self { v4: None, v6: None }
+    }
+
+    fn ensure_socket(
+        &mut self,
+        stack: &mut NetworkStack,
+        server: IpAddress,
+    ) -> Result<SocketHandle, DnsError> {
+        let slot = match server {
+            IpAddress::Ipv4(_) => &mut self.v4,
+            IpAddress::Ipv6(_) => &mut self.v6,
+        };
+
+        if let Some(handle) = *slot {
+            return Ok(handle);
+        }
+
+        let local_port = get_dns_local_port();
+        let handle = stack
+            .create_udp_socket_for(local_port, server)
+            .map_err(|e| DnsError::SocketError(format!("{}", e)))?;
+        *slot = Some(handle);
+        Ok(handle)
+    }
+
+    fn handles(&self) -> impl Iterator<Item = SocketHandle> {
+        self.v4.iter().copied().chain(self.v6.iter().copied())
+    }
 }
 
 // Happy Eyeballs: tracks paired A/AAAA queries
@@ -187,8 +223,8 @@ const UDP_RECV_BUFFER_SIZE: usize = 65535;
 const MAX_TCP_READ_CHUNK: usize = 64 * 1024;
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-const MAX_PENDING_DATA: usize = 4 * 1024 * 1024; // 4MB per socket
-const MAX_PENDING_TO_CLIENT: usize = 4 * 1024 * 1024; // 4MB per socket
+const MAX_PENDING_DATA: usize = 512 * 1024; // 512KB per socket
+const MAX_PENDING_TO_CLIENT: usize = 512 * 1024; // 512KB per socket
 
 enum DeliverError {
     Backpressure,
@@ -483,7 +519,7 @@ impl TunnelManager {
                                 let mut data = std::mem::take(&mut buf);
                                 data.truncate(len);
                                 if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
-                                    log::debug!("Incoming datagram channel closed");
+                                    log::trace!("Incoming datagram channel closed");
                                     break;
                                 }
                                 buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
@@ -500,6 +536,7 @@ impl TunnelManager {
         let mut sockets: HashMap<SocketHandle, SocketState> = HashMap::new();
         let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
+        let mut dns_sockets = DnsSockets::new();
         let mut udp_sessions: HashMap<u16, UdpSessionState> = HashMap::new(); // local_port -> session
 
         // Keepalive tracking
@@ -534,6 +571,7 @@ impl TunnelManager {
                         &mut sockets,
                         &mut dns_queries,
                         &mut dns_groups,
+                        &mut dns_sockets,
                         &mut udp_sessions,
                         dns_servers,
                         tcp_buffer_size,
@@ -564,7 +602,17 @@ impl TunnelManager {
                 // Dynamic timeout - replaces fixed interval polling
                 _ = &mut poll_timer => {
                     tunnel.quic_conn.conn.on_timeout();
-                    if !Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, keepalive_interval).await {
+                    if !Self::poll_all(
+                        &mut tunnel,
+                        &mut stack,
+                        &mut sockets,
+                        &mut dns_queries,
+                        &mut dns_groups,
+                        &dns_sockets,
+                        &mut udp_sessions,
+                        &mut last_keepalive,
+                        keepalive_interval,
+                    ).await {
                         break;
                     }
                 }
@@ -581,6 +629,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_sockets: &mut DnsSockets,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         dns_servers: &[IpAddress],
         tcp_buffer_size: usize,
@@ -602,7 +651,7 @@ impl TunnelManager {
                     tcp_buffer_size,
                 );
                 if response.send(result).is_err() {
-                    log::warn!("Failed to send connect response: receiver dropped");
+                    log::trace!("Failed to send connect response: receiver dropped");
                 }
             }
             ManagerCommand::Close { handle } => {
@@ -613,7 +662,16 @@ impl TunnelManager {
                 prefer_ipv6,
                 response,
             } => {
-                Self::start_dns_query(stack, dns_queries, dns_groups, &domain, prefer_ipv6, response, dns_servers);
+                Self::start_dns_query(
+                    stack,
+                    dns_queries,
+                    dns_groups,
+                    dns_sockets,
+                    &domain,
+                    prefer_ipv6,
+                    response,
+                    dns_servers,
+                );
             }
             ManagerCommand::UdpRegister { local_port, response } => {
                 Self::register_udp_session(stack, udp_sessions, local_port, response);
@@ -624,7 +682,7 @@ impl TunnelManager {
             ManagerCommand::GetSocketState { handle, response } => {
                 let state = Self::get_tcp_socket_state(stack, sockets, handle);
                 if response.send(state).is_err() {
-                    log::debug!("Failed to send socket state response: receiver dropped");
+                    log::trace!("Failed to send socket state response: receiver dropped");
                 }
             }
         }
@@ -634,24 +692,24 @@ impl TunnelManager {
         match cmd {
             ManagerCommand::Connect { response, .. } => {
                 if response.send(Err(ManagerError::NotConnected)).is_err() {
-                    log::debug!("Failed to send connect error: receiver dropped");
+                    log::trace!("Failed to send connect error: receiver dropped");
                 }
             }
             ManagerCommand::Close { .. } => {}
             ManagerCommand::DnsResolve { response, .. } => {
                 if response.send(Err(ManagerError::NotConnected)).is_err() {
-                    log::debug!("Failed to send DNS error: receiver dropped");
+                    log::trace!("Failed to send DNS error: receiver dropped");
                 }
             }
             ManagerCommand::UdpRegister { response, .. } => {
                 if response.send(Err(ManagerError::NotConnected)).is_err() {
-                    log::debug!("Failed to send UDP register error: receiver dropped");
+                    log::trace!("Failed to send UDP register error: receiver dropped");
                 }
             }
             ManagerCommand::UdpUnregister { .. } => {}
             ManagerCommand::GetSocketState { response, .. } => {
                 if response.send(TcpSocketState::Closed).is_err() {
-                    log::debug!("Failed to send socket state: receiver dropped");
+                    log::trace!("Failed to send socket state: receiver dropped");
                 }
             }
         }
@@ -673,7 +731,7 @@ impl TunnelManager {
     }
 
     fn handle_udp_send_disconnected(cmd: UdpSend) {
-        log::debug!(
+        log::trace!(
             "Dropping UDP send to {:?}:{} from local port {}: tunnel not connected",
             cmd.remote_ip,
             cmd.remote_port,
@@ -755,7 +813,7 @@ impl TunnelManager {
             Ok(handle) => handle,
             Err(e) => {
                 if response.send(Err(ManagerError::Stack(e))).is_err() {
-                    log::debug!("Failed to send UDP register error: receiver dropped");
+                    log::trace!("Failed to send UDP register error: receiver dropped");
                 }
                 return;
             }
@@ -770,7 +828,7 @@ impl TunnelManager {
 
         log::debug!("UDP session registered on port {}", local_port);
         if response.send(Ok(rx)).is_err() {
-            log::warn!("Failed to send UDP register response: receiver dropped");
+            log::trace!("Failed to send UDP register response: receiver dropped");
         }
     }
 
@@ -822,10 +880,27 @@ impl TunnelManager {
         }
     }
 
+    fn build_unique_dns_query(
+        dns_queries: &HashMap<u16, DnsQueryState>,
+        domain: &str,
+        record_type: DnsRecordType,
+    ) -> Result<(u16, Vec<u8>), DnsError> {
+        for _ in 0..=u16::MAX {
+            let (tx_id, packet) = build_dns_query(domain, record_type)?;
+            if !dns_queries.contains_key(&tx_id) {
+                return Ok((tx_id, packet));
+            }
+        }
+        Err(DnsError::SocketError(
+            "DNS transaction ID exhausted".into(),
+        ))
+    }
+
     fn start_dns_query(
         stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_sockets: &mut DnsSockets,
         domain: &str,
         prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, ManagerError>>,
@@ -850,91 +925,72 @@ impl TunnelManager {
         // Select DNS server with round-robin and preferred address family
         let dns_server = Self::select_dns_server(dns_servers, prefer_ipv6);
 
+        let dns_handle = match dns_sockets.ensure_socket(stack, dns_server) {
+            Ok(handle) => handle,
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e.clone());
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                return;
+            }
+        };
+
         // Send A query (IPv4)
-        match build_dns_query(domain, DnsRecordType::A) {
+        match Self::build_unique_dns_query(dns_queries, domain, DnsRecordType::A) {
             Ok((tx_id_a, packet_a)) => {
-                let local_port = get_dns_local_port();
-                match stack.create_udp_socket_for(local_port, dns_server) {
-                    Ok(handle) => {
-                        if stack.udp_send(handle, dns_server, dns_port(), &packet_a).is_ok() {
-                            dns_queries.insert(
-                                tx_id_a,
-                                DnsQueryState {
-                                    handle,
-                                    group_id,
-                                    query_type: DnsRecordType::A,
-                                },
-                            );
-                            log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
-                        } else {
-                            stack.remove_socket(handle);
-                            Self::record_dns_error(
-                                dns_groups,
-                                group_id,
-                                DnsRecordType::A,
-                                DnsError::SocketError("DNS A send failed".into()),
-                            );
-                            Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
-                        }
-                    }
-                    Err(e) => {
-                        Self::record_dns_error(
-                            dns_groups,
+                if stack.udp_send(dns_handle, dns_server, dns_port(), &packet_a).is_ok() {
+                    dns_queries.insert(
+                        tx_id_a,
+                        DnsQueryState {
                             group_id,
-                            DnsRecordType::A,
-                            DnsError::SocketError(format!("DNS A socket error: {}", e)),
-                        );
-                        Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
-                    }
+                            query_type: DnsRecordType::A,
+                        },
+                    );
+                    log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
+                } else {
+                    Self::record_dns_error(
+                        dns_groups,
+                        group_id,
+                        DnsRecordType::A,
+                        DnsError::SocketError("DNS A send failed".into()),
+                    );
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
                 }
             }
             Err(e) => {
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e);
-                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
             }
         }
 
         // Send AAAA query (IPv6)
-        match build_dns_query(domain, DnsRecordType::AAAA) {
+        match Self::build_unique_dns_query(dns_queries, domain, DnsRecordType::AAAA) {
             Ok((tx_id_aaaa, packet_aaaa)) => {
-                let local_port = get_dns_local_port();
-                match stack.create_udp_socket_for(local_port, dns_server) {
-                    Ok(handle) => {
-                        if stack.udp_send(handle, dns_server, dns_port(), &packet_aaaa).is_ok() {
-                            dns_queries.insert(
-                                tx_id_aaaa,
-                                DnsQueryState {
-                                    handle,
-                                    group_id,
-                                    query_type: DnsRecordType::AAAA,
-                                },
-                            );
-                            log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
-                        } else {
-                            stack.remove_socket(handle);
-                            Self::record_dns_error(
-                                dns_groups,
-                                group_id,
-                                DnsRecordType::AAAA,
-                                DnsError::SocketError("DNS AAAA send failed".into()),
-                            );
-                            Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
-                        }
-                    }
-                    Err(e) => {
-                        Self::record_dns_error(
-                            dns_groups,
+                if stack
+                    .udp_send(dns_handle, dns_server, dns_port(), &packet_aaaa)
+                    .is_ok()
+                {
+                    dns_queries.insert(
+                        tx_id_aaaa,
+                        DnsQueryState {
                             group_id,
-                            DnsRecordType::AAAA,
-                            DnsError::SocketError(format!("DNS AAAA socket error: {}", e)),
-                        );
-                        Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
-                    }
+                            query_type: DnsRecordType::AAAA,
+                        },
+                    );
+                    log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
+                } else {
+                    Self::record_dns_error(
+                        dns_groups,
+                        group_id,
+                        DnsRecordType::AAAA,
+                        DnsError::SocketError("DNS AAAA send failed".into()),
+                    );
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
                 }
             }
             Err(e) => {
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
-                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
             }
         }
     }
@@ -943,32 +999,38 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_sockets: &DnsSockets,
     ) {
-        let query_ids: Vec<u16> = dns_queries.keys().copied().collect();
+        for handle in dns_sockets.handles() {
+            while stack.udp_can_recv(handle) {
+                let mut buf = [0u8; 4096];
+                let (len, _endpoint) = match stack.udp_recv(handle, &mut buf) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::debug!("DNS recv failed: {}", e);
+                        break;
+                    }
+                };
+                if len == 0 {
+                    continue;
+                }
 
-        for transaction_id in query_ids {
-            let (handle, group_id, query_type) = match dns_queries.get(&transaction_id) {
-                Some(state) => (state.handle, state.group_id, state.query_type),
-                None => continue,
-            };
+                let parsed = match parse_dns_response_with_id(&buf[..len]) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        log::debug!("Failed to parse DNS response: {:?}", e);
+                        continue;
+                    }
+                };
 
-            if !stack.udp_can_recv(handle) {
-                continue;
-            }
+                let (transaction_id, response_result) = parsed;
+                let Some(state) = dns_queries.remove(&transaction_id) else {
+                    log::trace!("DNS response ignored for unknown id={}", transaction_id);
+                    continue;
+                };
 
-            let mut buf = [0u8; 4096];
-            let result = stack.udp_recv(handle, &mut buf);
-
-            if let Ok((len, _endpoint)) = result {
-                let response_result = parse_dns_response(&buf[..len], transaction_id);
-
-                // Remove query and socket
-                dns_queries.remove(&transaction_id);
-                stack.remove_socket(handle);
-
-                // Update group with result
-                if let Some(group) = dns_groups.get_mut(&group_id) {
-                    match query_type {
+                if let Some(group) = dns_groups.get_mut(&state.group_id) {
+                    match state.query_type {
                         DnsRecordType::A => {
                             group.ipv4_result = Some(response_result);
                         }
@@ -979,8 +1041,7 @@ impl TunnelManager {
                     }
                 }
 
-                // Try to resolve the group
-                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, state.group_id);
             }
         }
     }
@@ -1023,7 +1084,6 @@ impl TunnelManager {
     }
 
     fn try_resolve_dns_group(
-        stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         group_id: u32,
@@ -1085,9 +1145,7 @@ impl TunnelManager {
                 .map(|(id, _)| *id)
                 .collect();
             for id in remaining {
-                if let Some(state) = dns_queries.remove(&id) {
-                    stack.remove_socket(state.handle);
-                }
+                dns_queries.remove(&id);
             }
 
             // Send response and remove group
@@ -1095,7 +1153,7 @@ impl TunnelManager {
             if let Some(group) = dns_groups.remove(&group_id)
                 && group.response.send(mapped).is_err()
             {
-                log::debug!("Failed to send DNS response: receiver dropped");
+                log::trace!("Failed to send DNS response: receiver dropped");
             }
         }
     }
@@ -1136,6 +1194,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_sockets: &DnsSockets,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         last_keepalive: &mut Instant,
         keepalive_interval: Duration,
@@ -1156,7 +1215,7 @@ impl TunnelManager {
         }
 
         // Process DNS responses
-        Self::process_dns_responses(stack, dns_queries, dns_groups);
+        Self::process_dns_responses(stack, dns_queries, dns_groups, dns_sockets);
 
         // Process UDP session responses
         Self::process_udp_responses(stack, udp_sessions);
@@ -1177,9 +1236,7 @@ impl TunnelManager {
                 .map(|(id, _)| *id)
                 .collect();
             for id in query_ids {
-                if let Some(state) = dns_queries.remove(&id) {
-                    stack.remove_socket(state.handle);
-                }
+                dns_queries.remove(&id);
             }
             // Send timeout error
             if let Some(group) = dns_groups.remove(&group_id)
@@ -1188,7 +1245,7 @@ impl TunnelManager {
                     .send(Err(ManagerError::Dns(DnsError::Timeout)))
                     .is_err()
             {
-                log::debug!("Failed to send DNS timeout response: receiver dropped");
+                log::trace!("Failed to send DNS timeout response: receiver dropped");
             }
         }
 
@@ -1237,7 +1294,7 @@ impl TunnelManager {
                             match Self::deliver_to_client(handle, state, data) {
                                 Ok(()) | Err(DeliverError::Backpressure) => {}
                                 Err(DeliverError::Closed) => {
-                                    log::debug!("TCP channel closed for socket {:?}", handle);
+                                    log::trace!("TCP channel closed for socket {:?}", handle);
                                     should_close = true;
                                 }
                             }
@@ -1315,7 +1372,7 @@ impl TunnelManager {
             };
 
             if Self::flush_pending_to_client(state) {
-                log::debug!("TCP channel closed for socket {:?}", handle);
+                log::trace!("TCP channel closed for socket {:?}", handle);
                 stack.tcp_close(handle);
                 continue;
             }
@@ -1338,7 +1395,7 @@ impl TunnelManager {
                 match Self::deliver_to_client(handle, state, data) {
                     Ok(()) | Err(DeliverError::Backpressure) => {}
                     Err(DeliverError::Closed) => {
-                        log::debug!("TCP channel closed for socket {:?}", handle);
+                        log::trace!("TCP channel closed for socket {:?}", handle);
                         stack.tcp_close(handle);
                     }
                 }

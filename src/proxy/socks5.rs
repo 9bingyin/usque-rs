@@ -472,7 +472,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     None => {
-                        log::debug!("Tunnel channel closed");
+                        log::trace!("Tunnel channel closed");
                         break;
                     }
                 }
@@ -487,7 +487,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                     Ok(n) => {
                         let data = client_buf.split_to(n).freeze();
                         if channels.to_stack.send(data).await.is_err() {
-                            log::debug!("Tunnel channel closed");
+                            log::trace!("Tunnel channel closed");
                             break;
                         }
                     }
