@@ -5,8 +5,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
-    #[error("failed to generate key: {0}")]
-    KeyGenError(String),
     #[error("failed to encode key: {0}")]
     EncodeError(String),
     #[error("random generation failed: {0}")]
@@ -148,6 +146,7 @@ impl spki::DynSignatureAlgorithmIdentifier for EcdsaSigner {
 
 impl signature::Signer<p256::ecdsa::DerSignature> for EcdsaSigner {
     fn try_sign(&self, msg: &[u8]) -> Result<p256::ecdsa::DerSignature, signature::Error> {
+        #[allow(unused_imports)]
         use p256::ecdsa::signature::Signer;
         self.signing_key.try_sign(msg)
     }

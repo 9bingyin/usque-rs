@@ -1,5 +1,5 @@
 use crate::tunnel::dns::{
-    build_dns_query, dns_port, dns_server, get_dns_local_port, parse_dns_response, DnsError,
+    build_dns_query, dns_port, get_dns_local_port, parse_dns_response, DnsError,
     DnsRecordType,
 };
 use crate::tunnel::masque::MasqueTunnel;
@@ -21,6 +21,10 @@ pub struct ConnectionParams {
     pub endpoint_pub_key: Option<Vec<u8>>,
     pub ipv4: String,
     pub ipv6: Option<String>,
+    pub dns_servers: Vec<IpAddress>,
+    pub keepalive: u64,
+    pub initial_packet_size: u16,
+    pub mtu: u16,
 }
 
 // Commands sent from SOCKS5 connections to the manager
@@ -125,7 +129,7 @@ impl TunnelManager {
                     log::info!("Tunnel connected successfully");
 
                     // Run main loop until connection is closed
-                    Self::run_loop(tunnel, stack, &mut cmd_rx).await;
+                    Self::run_loop(tunnel, stack, &mut cmd_rx, &params.dns_servers).await;
 
                     log::warn!("Connection lost, reconnecting...");
                 }
@@ -141,6 +145,12 @@ impl TunnelManager {
     async fn establish_connection(
         params: &ConnectionParams,
     ) -> Result<(MasqueTunnel, NetworkStack), Box<dyn std::error::Error + Send + Sync>> {
+        let quic_cfg = quic::QuicConfig {
+            idle_timeout: params.keepalive * 1000,
+            initial_packet_size: params.initial_packet_size,
+            ..Default::default()
+        };
+
         let quic_conn = quic::connect_with_pinning(
             params.endpoint,
             &params.cert_der,
@@ -148,6 +158,7 @@ impl TunnelManager {
             &params.sni,
             Duration::from_secs(30),
             params.endpoint_pub_key.as_deref(),
+            &quic_cfg,
         ).await?;
 
         let mut masque_tunnel = MasqueTunnel::new(quic_conn);
@@ -223,6 +234,7 @@ impl TunnelManager {
         mut tunnel: MasqueTunnel,
         mut stack: NetworkStack,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
+        dns_servers: &[IpAddress],
     ) {
         let socket = tunnel.quic_conn.socket.clone();
         let local_addr = tunnel.quic_conn.local_addr;
@@ -251,7 +263,7 @@ impl TunnelManager {
 
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, cmd);
+                    Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, dns_servers, cmd);
                     Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
                 }
 
@@ -288,6 +300,7 @@ impl TunnelManager {
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        dns_servers: &[IpAddress],
         cmd: ManagerCommand,
     ) {
         match cmd {
@@ -308,7 +321,7 @@ impl TunnelManager {
                 prefer_ipv6,
                 response,
             } => {
-                Self::start_dns_query(stack, dns_queries, dns_groups, &domain, prefer_ipv6, response);
+                Self::start_dns_query(stack, dns_queries, dns_groups, &domain, prefer_ipv6, response, dns_servers);
             }
             ManagerCommand::UdpRegister { local_port, response } => {
                 Self::register_udp_session(stack, udp_sessions, local_port, response);
@@ -418,6 +431,7 @@ impl TunnelManager {
         domain: &str,
         _prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, DnsError>>,
+        dns_servers: &[IpAddress],
     ) {
         use std::sync::atomic::Ordering;
 
@@ -434,11 +448,16 @@ impl TunnelManager {
             },
         );
 
+        // Use first DNS server or default
+        let dns_server = dns_servers.first()
+            .copied()
+            .unwrap_or(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(1, 1, 1, 1)));
+
         // Send A query (IPv4)
         if let Ok((tx_id_a, packet_a)) = build_dns_query(domain, DnsRecordType::A) {
             let local_port = get_dns_local_port();
             let handle = stack.create_udp_socket(local_port);
-            if stack.udp_send(handle, dns_server(), dns_port(), &packet_a).is_ok() {
+            if stack.udp_send(handle, dns_server, dns_port(), &packet_a).is_ok() {
                 dns_queries.insert(
                     tx_id_a,
                     DnsQueryState {
@@ -457,7 +476,7 @@ impl TunnelManager {
         if let Ok((tx_id_aaaa, packet_aaaa)) = build_dns_query(domain, DnsRecordType::AAAA) {
             let local_port = get_dns_local_port();
             let handle = stack.create_udp_socket(local_port);
-            if stack.udp_send(handle, dns_server(), dns_port(), &packet_aaaa).is_ok() {
+            if stack.udp_send(handle, dns_server, dns_port(), &packet_aaaa).is_ok() {
                 dns_queries.insert(
                     tx_id_aaaa,
                     DnsQueryState {

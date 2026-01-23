@@ -19,8 +19,6 @@ pub enum Socks5Error {
     IoError(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     ProtocolError(String),
-    #[error("tunnel error: {0}")]
-    TunnelError(String),
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
     #[error("timeout")]

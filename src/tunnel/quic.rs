@@ -4,8 +4,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
-pub const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
-pub const DEFAULT_PORT: u16 = 443;
 
 #[derive(Error, Debug)]
 pub enum QuicError {
@@ -13,8 +11,6 @@ pub enum QuicError {
     IoError(#[from] std::io::Error),
     #[error("QUIC error: {0}")]
     QuicError(#[from] quiche::Error),
-    #[error("TLS error: {0}")]
-    TlsError(String),
     #[error("connection error: {0}")]
     ConnectionError(String),
     #[error("handshake timeout")]
@@ -36,6 +32,7 @@ pub struct QuicConfig {
     pub enable_dgram: bool,
     pub dgram_recv_max_queue_len: u64,
     pub dgram_send_max_queue_len: u64,
+    pub initial_packet_size: u16,
 }
 
 impl Default for QuicConfig {
@@ -51,6 +48,7 @@ impl Default for QuicConfig {
             enable_dgram: true,
             dgram_recv_max_queue_len: 10000,
             dgram_send_max_queue_len: 10000,
+            initial_packet_size: 1242,
         }
     }
 }
@@ -110,7 +108,7 @@ pub fn create_quiche_config(
     config.grease(false);
 
     // Set max UDP payload size (same as Go's InitialPacketSize: 1242)
-    config.set_max_send_udp_payload_size(1242);
+    config.set_max_send_udp_payload_size(quic_cfg.initial_packet_size as usize);
 
     Ok(config)
 }
@@ -141,18 +139,6 @@ impl QuicConnection {
         Ok(total_sent)
     }
 
-    pub async fn recv_async(&mut self, buf: &mut [u8]) -> Result<usize, QuicError> {
-        let (len, from) = self.socket.recv_from(buf).await?;
-
-        let recv_info = quiche::RecvInfo {
-            from,
-            to: self.local_addr,
-        };
-
-        self.conn.recv(&mut buf[..len], recv_info)?;
-        Ok(len)
-    }
-
     pub fn is_established(&self) -> bool {
         self.conn.is_established()
     }
@@ -168,9 +154,9 @@ pub async fn connect(
     key_der: &[u8],
     sni: &str,
     timeout: Duration,
+    quic_cfg: &QuicConfig,
 ) -> Result<QuicConnection, QuicError> {
-    let quic_cfg = QuicConfig::default();
-    let mut config = create_quiche_config(&quic_cfg, cert_der, key_der, sni)?;
+    let mut config = create_quiche_config(quic_cfg, cert_der, key_der, sni)?;
 
     let socket = if endpoint.is_ipv4() {
         UdpSocket::bind("0.0.0.0:0").await?
@@ -234,8 +220,9 @@ pub async fn connect_with_pinning(
     sni: &str,
     timeout: Duration,
     expected_pub_key: Option<&[u8]>,
+    quic_cfg: &QuicConfig,
 ) -> Result<QuicConnection, QuicError> {
-    let quic_conn = connect(endpoint, cert_der, key_der, sni, timeout).await?;
+    let quic_conn = connect(endpoint, cert_der, key_der, sni, timeout, quic_cfg).await?;
 
     if let Some(expected_key) = expected_pub_key {
         if let Some(peer_cert) = quic_conn.conn.peer_cert() {

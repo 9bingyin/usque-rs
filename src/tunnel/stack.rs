@@ -10,10 +10,6 @@ use thiserror::Error;
 pub enum StackError {
     #[error("socket error: {0}")]
     SocketError(String),
-    #[error("connection refused")]
-    ConnectionRefused,
-    #[error("timeout")]
-    Timeout,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -185,10 +181,5 @@ impl NetworkStack {
     pub fn udp_can_recv(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
         let socket = self.sockets.get_mut::<UdpSocket>(handle);
         socket.can_recv()
-    }
-
-    pub fn udp_can_send(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<UdpSocket>(handle);
-        socket.can_send()
     }
 }

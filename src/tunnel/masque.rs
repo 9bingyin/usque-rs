@@ -3,8 +3,6 @@ use quiche::h3::NameValue;
 use std::time::Duration;
 use thiserror::Error;
 
-pub const CONNECT_URI: &str = "https://cloudflareaccess.com";
-
 // Context ID = 0 for IP packets (RFC 9484)
 const CONTEXT_ID_ZERO: u8 = 0x00;
 

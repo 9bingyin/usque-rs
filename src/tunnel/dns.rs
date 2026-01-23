@@ -11,7 +11,6 @@ pub use hickory_proto::rr::RecordType as DnsRecordType;
 
 // DNS constants
 const DNS_PORT: u16 = 53;
-const DNS_SERVER_V4: Ipv4Address = Ipv4Address::new(1, 1, 1, 1); // Cloudflare DNS
 
 static DNS_TRANSACTION_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_LOCAL_PORT: AtomicU16 = AtomicU16::new(50000);
@@ -32,6 +31,33 @@ pub enum DnsError {
     EncodeError(String),
     #[error("decode error: {0}")]
     DecodeError(String),
+    #[error("parse error: {0}")]
+    ParseError(String),
+}
+
+/// Parse DNS server addresses from string list
+pub fn parse_dns_servers(servers: &[String]) -> Result<Vec<IpAddress>, DnsError> {
+    let mut addrs = Vec::new();
+    for server in servers {
+        let addr: std::net::IpAddr = server.parse()
+            .map_err(|e| DnsError::ParseError(format!("Invalid DNS server '{}': {}", server, e)))?;
+        let ip = match addr {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+            }
+        };
+        addrs.push(ip);
+    }
+    if addrs.is_empty() {
+        // Default to Cloudflare DNS
+        addrs.push(IpAddress::Ipv4(Ipv4Address::new(1, 1, 1, 1)));
+    }
+    Ok(addrs)
 }
 
 /// Build a DNS query packet using hickory-proto
@@ -112,10 +138,6 @@ pub fn parse_dns_response(data: &[u8], expected_id: u16) -> Result<Vec<IpAddress
 
 pub fn get_dns_local_port() -> u16 {
     DNS_LOCAL_PORT.fetch_add(1, Ordering::Relaxed)
-}
-
-pub fn dns_server() -> IpAddress {
-    IpAddress::Ipv4(DNS_SERVER_V4)
 }
 
 pub fn dns_port() -> u16 {
