@@ -217,6 +217,15 @@ impl ManagerTask {
     }
 
     async fn poll_all(&mut self) {
+        // Handle QUIC timeout to send PING frames and keep connection alive
+        self.tunnel.quic_conn.conn.on_timeout();
+
+        // Check if QUIC connection is closed
+        if self.tunnel.quic_conn.is_closed() {
+            log::error!("QUIC connection closed");
+            return;
+        }
+
         // Poll the TCP/IP stack
         self.stack.poll();
 
