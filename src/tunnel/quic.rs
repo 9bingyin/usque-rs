@@ -1,6 +1,8 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::net::UdpSocket;
 
 pub const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
 pub const DEFAULT_PORT: u16 = 443;
@@ -47,8 +49,8 @@ impl Default for QuicConfig {
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
             enable_dgram: true,
-            dgram_recv_max_queue_len: 1000,
-            dgram_send_max_queue_len: 1000,
+            dgram_recv_max_queue_len: 10000,
+            dgram_send_max_queue_len: 10000,
         }
     }
 }
@@ -112,12 +114,13 @@ pub fn create_quiche_config(
 
 pub struct QuicConnection {
     pub conn: quiche::Connection,
-    pub socket: UdpSocket,
+    pub socket: Arc<UdpSocket>,
     pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
 }
 
 impl QuicConnection {
-    pub fn send(&mut self) -> Result<usize, QuicError> {
+    pub async fn send_async(&mut self) -> Result<usize, QuicError> {
         let mut out = [0u8; MAX_DATAGRAM_SIZE];
         let mut total_sent = 0;
 
@@ -128,20 +131,19 @@ impl QuicConnection {
                 Err(e) => return Err(QuicError::QuicError(e)),
             };
 
-            // Use send() instead of send_to() since socket is already connected
-            self.socket.send(&out[..write])?;
+            self.socket.send_to(&out[..write], self.peer_addr).await?;
             total_sent += write;
         }
 
         Ok(total_sent)
     }
 
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, QuicError> {
-        let (len, from) = self.socket.recv_from(buf)?;
+    pub async fn recv_async(&mut self, buf: &mut [u8]) -> Result<usize, QuicError> {
+        let (len, from) = self.socket.recv_from(buf).await?;
 
         let recv_info = quiche::RecvInfo {
             from,
-            to: self.socket.local_addr()?,
+            to: self.local_addr,
         };
 
         self.conn.recv(&mut buf[..len], recv_info)?;
@@ -157,7 +159,7 @@ impl QuicConnection {
     }
 }
 
-pub fn connect(
+pub async fn connect(
     endpoint: SocketAddr,
     cert_der: &[u8],
     key_der: &[u8],
@@ -168,15 +170,13 @@ pub fn connect(
     let mut config = create_quiche_config(&quic_cfg, cert_der, key_der, sni)?;
 
     let socket = if endpoint.is_ipv4() {
-        UdpSocket::bind("0.0.0.0:0")?
+        UdpSocket::bind("0.0.0.0:0").await?
     } else {
-        UdpSocket::bind("[::]:0")?
+        UdpSocket::bind("[::]:0").await?
     };
 
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    socket.connect(endpoint)?;
-
     let local_addr = socket.local_addr()?;
+    let socket = Arc::new(socket);
 
     let scid = generate_scid();
     let conn = quiche::connect(Some(sni), &scid, local_addr, endpoint, &mut config)?;
@@ -185,31 +185,35 @@ pub fn connect(
         conn,
         socket,
         peer_addr: endpoint,
+        local_addr,
     };
 
     let start = std::time::Instant::now();
     let mut buf = [0u8; 65535];
 
-    quic_conn.send()?;
+    quic_conn.send_async().await?;
 
     while !quic_conn.is_established() {
         if start.elapsed() > timeout {
             return Err(QuicError::HandshakeTimeout);
         }
 
-        match quic_conn.socket.recv(&mut buf) {
-            Ok(len) => {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            quic_conn.socket.recv_from(&mut buf),
+        ).await {
+            Ok(Ok((len, from))) => {
                 let recv_info = quiche::RecvInfo {
-                    from: quic_conn.peer_addr,
-                    to: quic_conn.socket.local_addr()?,
+                    from,
+                    to: local_addr,
                 };
                 quic_conn.conn.recv(&mut buf[..len], recv_info)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(QuicError::IoError(e)),
+            Ok(Err(e)) => return Err(QuicError::IoError(e)),
+            Err(_) => {} // timeout, continue
         }
 
-        quic_conn.send()?;
+        quic_conn.send_async().await?;
 
         if quic_conn.is_closed() {
             return Err(QuicError::ConnectionError("connection closed".into()));
@@ -220,7 +224,7 @@ pub fn connect(
     Ok(quic_conn)
 }
 
-pub fn connect_with_pinning(
+pub async fn connect_with_pinning(
     endpoint: SocketAddr,
     cert_der: &[u8],
     key_der: &[u8],
@@ -228,7 +232,7 @@ pub fn connect_with_pinning(
     timeout: Duration,
     expected_pub_key: Option<&[u8]>,
 ) -> Result<QuicConnection, QuicError> {
-    let quic_conn = connect(endpoint, cert_der, key_der, sni, timeout)?;
+    let quic_conn = connect(endpoint, cert_der, key_der, sni, timeout).await?;
 
     if let Some(expected_key) = expected_pub_key {
         if let Some(peer_cert) = quic_conn.conn.peer_cert() {

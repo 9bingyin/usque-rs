@@ -115,29 +115,9 @@ impl MasqueTunnel {
         Ok(())
     }
 
-    /// Process incoming QUIC packets from the socket.
-    /// This must be called regularly to receive data from the network.
-    pub fn process_quic(&mut self) -> Result<(), MasqueError> {
-        let mut buf = [0u8; 65535];
-
-        // Receive from socket and process QUIC
-        loop {
-            match self.quic_conn.socket.recv(&mut buf) {
-                Ok(len) => {
-                    let recv_info = quiche::RecvInfo {
-                        from: self.quic_conn.peer_addr,
-                        to: self.quic_conn.socket.local_addr()?,
-                    };
-                    if let Err(e) = self.quic_conn.conn.recv(&mut buf[..len], recv_info) {
-                        log::warn!("QUIC recv error: {:?}", e);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(MasqueError::IoError(e)),
-            }
-        }
-
-        // Process H3 events (for datagrams)
+    /// Process QUIC data that has already been received.
+    /// Call this after injecting data via quic_conn.conn.recv()
+    pub fn poll_h3(&mut self) {
         if let Some(h3_conn) = self.h3_conn.as_mut() {
             loop {
                 match h3_conn.poll(&mut self.quic_conn.conn) {
@@ -152,8 +132,6 @@ impl MasqueTunnel {
                 }
             }
         }
-
-        Ok(())
     }
 
     pub fn recv_datagram(&mut self, buf: &mut [u8]) -> Result<usize, MasqueError> {
@@ -185,12 +163,12 @@ impl MasqueTunnel {
         }
     }
 
-    pub fn establish(&mut self, timeout: Duration) -> Result<(), MasqueError> {
+    pub async fn establish(&mut self, timeout: Duration) -> Result<(), MasqueError> {
         log::debug!("Initializing HTTP/3 connection");
         self.init_h3()?;
 
         // Step 1: Send our SETTINGS frame
-        let sent = self.quic_conn.send()?;
+        let sent = self.quic_conn.send_async().await?;
         log::debug!("SETTINGS frame sent ({} bytes)", sent);
 
         let start = std::time::Instant::now();
@@ -203,9 +181,9 @@ impl MasqueTunnel {
                 return Err(MasqueError::Timeout);
             }
 
-            self.recv_and_process(&mut buf)?;
+            self.recv_and_process_async(&mut buf).await?;
             self.poll_h3_events()?;
-            self.quic_conn.send()?;
+            self.quic_conn.send_async().await?;
 
             if let Some(err) = self.quic_conn.conn.peer_error() {
                 let reason = String::from_utf8_lossy(err.reason.as_slice());
@@ -227,7 +205,7 @@ impl MasqueTunnel {
         let stream_id = self.send_connect_ip_request()?;
         log::debug!("Connect-IP request sent on stream {}", stream_id);
 
-        self.quic_conn.send()?;
+        self.quic_conn.send_async().await?;
 
         // Step 4: Wait for Connect-IP response
         while !self.established {
@@ -235,7 +213,7 @@ impl MasqueTunnel {
                 return Err(MasqueError::Timeout);
             }
 
-            self.recv_and_process(&mut buf)?;
+            self.recv_and_process_async(&mut buf).await?;
 
             if let Some(err) = self.quic_conn.conn.peer_error() {
                 let reason = String::from_utf8_lossy(err.reason.as_slice());
@@ -247,7 +225,7 @@ impl MasqueTunnel {
             }
 
             self.poll_h3_events()?;
-            self.quic_conn.send()?;
+            self.quic_conn.send_async().await?;
 
             if self.quic_conn.is_closed() {
                 return Err(MasqueError::ConnectionError("connection closed".into()));
@@ -258,12 +236,15 @@ impl MasqueTunnel {
         Ok(())
     }
 
-    fn recv_and_process(&mut self, buf: &mut [u8]) -> Result<(), MasqueError> {
-        match self.quic_conn.socket.recv(buf) {
-            Ok(len) => {
+    async fn recv_and_process_async(&mut self, buf: &mut [u8]) -> Result<(), MasqueError> {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            self.quic_conn.socket.recv_from(buf),
+        ).await {
+            Ok(Ok((len, from))) => {
                 let recv_info = quiche::RecvInfo {
-                    from: self.quic_conn.peer_addr,
-                    to: self.quic_conn.socket.local_addr()?,
+                    from,
+                    to: self.quic_conn.local_addr,
                 };
                 match self.quic_conn.conn.recv(&mut buf[..len], recv_info) {
                     Ok(_) => {}
@@ -273,8 +254,8 @@ impl MasqueTunnel {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(MasqueError::IoError(e)),
+            Ok(Err(e)) => return Err(MasqueError::IoError(e)),
+            Err(_) => {} // timeout, continue
         }
         Ok(())
     }

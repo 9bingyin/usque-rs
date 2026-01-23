@@ -3,8 +3,6 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -56,23 +54,19 @@ impl NetworkStack {
         }
     }
 
-    pub fn rx_queue(&self) -> Arc<Mutex<VecDeque<Vec<u8>>>> {
-        self.device.rx_queue()
-    }
-
-    pub fn tx_queue(&self) -> Arc<Mutex<VecDeque<Vec<u8>>>> {
-        self.device.tx_queue()
-    }
-
     pub fn poll(&mut self) {
         let timestamp = Instant::now();
         self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
     }
 
     pub fn create_tcp_socket(&mut self) -> smoltcp::iface::SocketHandle {
-        let rx_buffer = SocketBuffer::new(vec![0; 65535]);
-        let tx_buffer = SocketBuffer::new(vec![0; 65535]);
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let rx_buffer = SocketBuffer::new(vec![0; 262144]); // 256KB
+        let tx_buffer = SocketBuffer::new(vec![0; 262144]); // 256KB
+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+        // Disable Nagle algorithm for lower latency
+        socket.set_nagle_enabled(false);
+        // Disable ACK delay for faster acknowledgments
+        socket.set_ack_delay(None);
         self.sockets.add(socket)
     }
 

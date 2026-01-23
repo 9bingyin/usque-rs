@@ -138,6 +138,7 @@ async fn run_socks_server(
     port: u16,
     config_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
     use std::time::Duration;
 
     let cfg = config::Config::load(config_path)?;
@@ -163,24 +164,23 @@ async fn run_socks_server(
         tunnel::quic::CONNECT_SNI,
         Duration::from_secs(30),
         endpoint_pub_key.as_deref(),
-    )?;
+    ).await?;
     println!("QUIC connection established");
 
     let mut masque_tunnel = tunnel::MasqueTunnel::new(quic_conn);
-    masque_tunnel.establish(Duration::from_secs(30))?;
+    masque_tunnel.establish(Duration::from_secs(30)).await?;
     println!("MASQUE tunnel established");
 
     // Create tunnel manager with userspace TCP/IP stack
-    let tunnel_manager = tunnel::TunnelManager::new(
+    let tunnel_manager = Arc::new(tunnel::TunnelManager::new(
         masque_tunnel,
         &cfg.ipv4,
         Some(&cfg.ipv6),
-    );
-    tunnel_manager.start();
+    ));
     println!("Tunnel manager started");
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
-    let server = proxy::Socks5Server::new(addr, tunnel_manager.stack.clone());
+    let server = proxy::Socks5Server::new(addr, tunnel_manager);
 
     println!("Starting SOCKS5 server on {}:{}", bind, port);
     server.run().await?;

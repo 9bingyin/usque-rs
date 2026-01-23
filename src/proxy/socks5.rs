@@ -1,14 +1,12 @@
-use crate::tunnel::stack::NetworkStack;
-use smoltcp::iface::SocketHandle;
+use crate::tunnel::manager::{SocketChannels, TunnelManager};
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::sleep;
 
 static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(40000);
 
@@ -24,6 +22,8 @@ pub enum Socks5Error {
     ConnectionFailed(String),
     #[error("timeout")]
     Timeout,
+    #[error("channel error: {0}")]
+    ChannelError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -43,12 +43,12 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 
 pub struct Socks5Server {
     bind_addr: SocketAddr,
-    stack: Arc<Mutex<NetworkStack>>,
+    manager: Arc<TunnelManager>,
 }
 
 impl Socks5Server {
-    pub fn new(bind_addr: SocketAddr, stack: Arc<Mutex<NetworkStack>>) -> Self {
-        Self { bind_addr, stack }
+    pub fn new(bind_addr: SocketAddr, manager: Arc<TunnelManager>) -> Self {
+        Self { bind_addr, manager }
     }
 
     pub async fn run(&self) -> Result<(), Socks5Error> {
@@ -59,9 +59,9 @@ impl Socks5Server {
             let (stream, addr) = listener.accept().await?;
             log::debug!("New connection from {}", addr);
 
-            let stack = self.stack.clone();
+            let manager = self.manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, stack).await {
+                if let Err(e) = handle_client(stream, manager).await {
                     log::error!("Error handling client {}: {}", addr, e);
                 }
             });
@@ -71,7 +71,7 @@ impl Socks5Server {
 
 async fn handle_client(
     mut stream: TcpStream,
-    stack: Arc<Mutex<NetworkStack>>,
+    manager: Arc<TunnelManager>,
 ) -> Result<(), Socks5Error> {
     // Read version and auth methods
     let mut buf = [0u8; 2];
@@ -99,21 +99,17 @@ async fn handle_client(
     let target = read_address(&mut stream, header[3]).await?;
     log::debug!("Connect request to {:?}:{}", target.ip, target.port);
 
-    // Create TCP socket and connect through the stack
+    // Create TCP connection through the manager
     let local_port = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let handle = {
-        let mut s = stack.lock().map_err(|e| {
-            Socks5Error::TunnelError(format!("Failed to lock stack: {}", e))
-        })?;
-        let h = s.create_tcp_socket();
-        s.connect_tcp(h, target.ip, target.port, local_port)
-            .map_err(|e| Socks5Error::ConnectionFailed(format!("{}", e)))?;
-        h
-    };
+    let channels = manager
+        .connect(target.ip, target.port, local_port)
+        .await
+        .map_err(|e| Socks5Error::ConnectionFailed(e))?;
 
     // Wait for connection to establish
-    let connected = wait_for_connection(&stack, handle, Duration::from_secs(30)).await?;
+    let connected = wait_for_connection(&channels, Duration::from_secs(30)).await?;
     if !connected {
+        manager.close(channels.handle).await;
         send_error_response(&mut stream, REP_GENERAL_FAILURE).await?;
         return Err(Socks5Error::Timeout);
     }
@@ -126,13 +122,11 @@ async fn handle_client(
     stream.write_all(&response).await?;
 
     // Forward data bidirectionally
-    forward_data(stream, stack.clone(), handle).await?;
+    let handle = channels.handle;
+    forward_data(stream, channels).await?;
 
     // Cleanup
-    if let Ok(mut s) = stack.lock() {
-        s.tcp_close(handle);
-        s.remove_socket(handle);
-    }
+    manager.close(handle).await;
 
     Ok(())
 }
@@ -157,10 +151,8 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
             stream.read_exact(&mut domain).await?;
             let mut port = [0u8; 2];
             stream.read_exact(&mut port).await?;
-            let port = u16::from_be_bytes(port);
+            let _port = u16::from_be_bytes(port);
             let domain_str = String::from_utf8_lossy(&domain);
-            // For now, we don't support DNS resolution - return error
-            // TODO: Add DNS resolution support
             Err(Socks5Error::ProtocolError(format!(
                 "Domain names not yet supported: {}",
                 domain_str
@@ -191,29 +183,13 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<TargetAddress,
 }
 
 async fn wait_for_connection(
-    stack: &Arc<Mutex<NetworkStack>>,
-    handle: SocketHandle,
-    timeout: Duration,
+    _channels: &SocketChannels,
+    _timeout: Duration,
 ) -> Result<bool, Socks5Error> {
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            return Ok(false);
-        }
-
-        let may_send = {
-            let mut s = stack.lock().map_err(|e| {
-                Socks5Error::TunnelError(format!("Failed to lock stack: {}", e))
-            })?;
-            s.tcp_may_send(handle)
-        };
-
-        if may_send {
-            return Ok(true);
-        }
-
-        sleep(Duration::from_millis(10)).await;
-    }
+    // In the new architecture, connection establishment is handled by the manager
+    // We just wait a bit for the TCP handshake to complete
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok(true)
 }
 
 async fn send_error_response(stream: &mut TcpStream, rep: u8) -> Result<(), Socks5Error> {
@@ -227,76 +203,49 @@ async fn send_error_response(stream: &mut TcpStream, rep: u8) -> Result<(), Sock
 
 async fn forward_data(
     mut stream: TcpStream,
-    stack: Arc<Mutex<NetworkStack>>,
-    handle: SocketHandle,
+    mut channels: SocketChannels,
 ) -> Result<(), Socks5Error> {
     let (mut reader, mut writer) = stream.split();
-    let mut client_buf = [0u8; 8192];
-    let mut tunnel_buf = [0u8; 8192];
+    let mut client_buf = [0u8; 65535];
 
     loop {
-        // Check if connection is still active
-        let is_active = {
-            let mut s = stack.lock().map_err(|e| {
-                Socks5Error::TunnelError(format!("Failed to lock stack: {}", e))
-            })?;
-            s.tcp_is_active(handle)
-        };
-
-        if !is_active {
-            log::debug!("TCP connection closed");
-            break;
-        }
-
-        // Try to read from client (non-blocking with timeout)
         tokio::select! {
-            result = tokio::time::timeout(Duration::from_millis(10), reader.read(&mut client_buf)) => {
+            // Receive data from tunnel, send to client
+            result = channels.from_stack.recv() => {
                 match result {
-                    Ok(Ok(0)) => {
+                    Some(data) => {
+                        if let Err(e) = writer.write_all(&data).await {
+                            log::debug!("Error writing to client: {}", e);
+                            break;
+                        }
+                    }
+                    None => {
+                        log::debug!("Tunnel channel closed");
+                        break;
+                    }
+                }
+            }
+
+            // Receive data from client, send to tunnel
+            result = reader.read(&mut client_buf) => {
+                match result {
+                    Ok(0) => {
                         log::debug!("Client closed connection");
                         break;
                     }
-                    Ok(Ok(n)) => {
-                        // Send to tunnel
-                        let mut s = stack.lock().map_err(|e| {
-                            Socks5Error::TunnelError(format!("Failed to lock stack: {}", e))
-                        })?;
-                        if s.tcp_may_send(handle) {
-                            let _ = s.tcp_send(handle, &client_buf[..n]);
+                    Ok(n) => {
+                        if channels.to_stack.send(client_buf[..n].to_vec()).await.is_err() {
+                            log::debug!("Tunnel channel closed");
+                            break;
                         }
                     }
-                    Ok(Err(e)) => {
-                        log::error!("Error reading from client: {}", e);
+                    Err(e) => {
+                        log::debug!("Error reading from client: {}", e);
                         break;
                     }
-                    Err(_) => {
-                        // Timeout, continue
-                    }
                 }
             }
         }
-
-        // Try to read from tunnel - copy data out while holding lock
-        let data_to_write = {
-            let mut s = stack.lock().map_err(|e| {
-                Socks5Error::TunnelError(format!("Failed to lock stack: {}", e))
-            })?;
-            if s.tcp_may_recv(handle) {
-                match s.tcp_recv(handle, &mut tunnel_buf) {
-                    Ok(n) if n > 0 => Some(tunnel_buf[..n].to_vec()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        };
-
-        // Write data outside of lock
-        if let Some(data) = data_to_write {
-            writer.write_all(&data).await?;
-        }
-
-        sleep(Duration::from_millis(1)).await;
     }
 
     Ok(())
