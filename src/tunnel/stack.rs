@@ -6,14 +6,14 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use thiserror::Error;
 
-const DEFAULT_TCP_BUFFER_SIZE: usize = 1048576; // 1MB
-
 #[derive(Error, Debug)]
 pub enum StackError {
     #[error("socket error: {0}")]
     SocketError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("smoltcp poll panicked")]
+    PollPanic,
 }
 
 pub struct NetworkStack {
@@ -77,20 +77,16 @@ impl NetworkStack {
         }
     }
 
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self) -> Result<(), StackError> {
         let timestamp = SmolInstant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
         }));
         if result.is_err() {
             log::error!("smoltcp poll panicked, recovering...");
-            return false;
+            return Err(StackError::PollPanic);
         }
-        true
-    }
-
-    pub fn create_tcp_socket(&mut self) -> smoltcp::iface::SocketHandle {
-        self.create_tcp_socket_with_buffer(DEFAULT_TCP_BUFFER_SIZE)
+        Ok(())
     }
 
     pub fn create_tcp_socket_with_buffer(&mut self, buffer_size: usize) -> smoltcp::iface::SocketHandle {

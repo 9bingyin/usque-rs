@@ -78,6 +78,12 @@ enum Commands {
         /// Congestion control algorithm (reno, cubic, bbr, bbr2)
         #[arg(long = "cc", default_value = "bbr2")]
         congestion_control: String,
+        /// TCP socket buffer size per direction in bytes
+        #[arg(long = "tcp-buffer-size", default_value = "262144")]
+        tcp_buffer_size: usize,
+        /// Tunnel worker count (0 = auto)
+        #[arg(long = "tunnel-workers", default_value = "0")]
+        tunnel_workers: usize,
     },
 }
 
@@ -93,8 +99,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Enroll { config, name, regen_key } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control } => {
-            run_socks_server(&bind, port, &config, username, password, &sni, dns, connect_port, keepalive, initial_packet_size, mtu, &congestion_control).await?;
+        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control, tcp_buffer_size, tunnel_workers } => {
+            run_socks_server(
+                &bind,
+                port,
+                &config,
+                username,
+                password,
+                &sni,
+                dns,
+                connect_port,
+                keepalive,
+                initial_packet_size,
+                mtu,
+                &congestion_control,
+                tcp_buffer_size,
+                tunnel_workers,
+            )
+            .await?;
         }
     }
 
@@ -315,6 +337,8 @@ async fn run_socks_server(
     initial_packet_size: u16,
     mtu: u16,
     congestion_control: &str,
+    tcp_buffer_size: usize,
+    tunnel_workers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
@@ -372,23 +396,33 @@ async fn run_socks_server(
         initial_packet_size,
         mtu,
         congestion_control: cc,
+        tcp_buffer_size,
     };
 
-    let tunnel_manager = Arc::new(tunnel::TunnelManager::new(params));
-    println!("Tunnel manager started (will auto-reconnect)");
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let worker_count = if tunnel_workers == 0 {
+        available.min(4).max(1)
+    } else {
+        tunnel_workers.max(1)
+    };
+
+    let tunnel_pool = Arc::new(tunnel::TunnelManagerPool::new(params, worker_count));
+    println!("Tunnel manager pool started (workers: {})", worker_count);
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
 
     let server = match (username, password) {
         (Some(user), Some(pass)) => {
             println!("SOCKS5 authentication enabled");
-            proxy::Socks5Server::with_auth(addr, tunnel_manager, user, pass)
+            proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
         }
         (Some(_), None) => {
             return Err("Password is required when username is set".into());
         }
         _ => {
-            proxy::Socks5Server::new(addr, tunnel_manager)
+            proxy::Socks5Server::new(addr, tunnel_pool)
         }
     };
 

@@ -1,4 +1,5 @@
-use crate::tunnel::manager::{ManagerCommand, SocketChannels, TcpSocketState, TunnelManager};
+use crate::tunnel::manager::{ManagerCommand, ManagerError, SocketChannels, TcpSocketState, TunnelManager, TunnelManagerPool};
+use bytes::{Bytes, BytesMut};
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{parse_udp_request, new_udp_header, Socks5Command};
@@ -19,6 +20,7 @@ const PORT_RANGE_START: u16 = 49152;
 const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 fn get_local_port() -> u16 {
     let offset = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PORT_RANGE_SIZE;
@@ -71,6 +73,8 @@ pub enum Socks5Error {
     Timeout,
     #[error("channel error: {0}")]
     ChannelError(String),
+    #[error("tunnel error: {0}")]
+    TunnelError(#[from] ManagerError),
     #[error("socks error: {0}")]
     SocksError(#[from] fast_socks5::SocksError),
     #[error("socks server error: {0}")]
@@ -86,19 +90,19 @@ pub struct AuthConfig {
 
 pub struct Socks5Server {
     bind_addr: SocketAddr,
-    manager: Arc<TunnelManager>,
+    manager_pool: Arc<TunnelManagerPool>,
     auth: Option<AuthConfig>,
 }
 
 impl Socks5Server {
-    pub fn new(bind_addr: SocketAddr, manager: Arc<TunnelManager>) -> Self {
-        Self { bind_addr, manager, auth: None }
+    pub fn new(bind_addr: SocketAddr, manager_pool: Arc<TunnelManagerPool>) -> Self {
+        Self { bind_addr, manager_pool, auth: None }
     }
 
-    pub fn with_auth(bind_addr: SocketAddr, manager: Arc<TunnelManager>, username: String, password: String) -> Self {
+    pub fn with_auth(bind_addr: SocketAddr, manager_pool: Arc<TunnelManagerPool>, username: String, password: String) -> Self {
         Self {
             bind_addr,
-            manager,
+            manager_pool,
             auth: Some(AuthConfig { username, password }),
         }
     }
@@ -129,12 +133,12 @@ impl Socks5Server {
                 }
             };
 
-            let manager = self.manager.clone();
+            let manager_pool = self.manager_pool.clone();
             let local_addr = self.bind_addr;
             let auth = self.auth.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = handle_client(stream, manager, local_addr, auth).await {
+                if let Err(e) = handle_client(stream, manager_pool, local_addr, auth).await {
                     log::error!("Error handling client {}: {}", addr, e);
                 }
             });
@@ -144,10 +148,11 @@ impl Socks5Server {
 
 async fn handle_client(
     socket: TcpStream,
-    manager: Arc<TunnelManager>,
+    manager_pool: Arc<TunnelManagerPool>,
     local_addr: SocketAddr,
     auth: Option<AuthConfig>,
 ) -> Result<(), Socks5Error> {
+    let manager = manager_pool.pick();
     // Use fast-socks5 for protocol handling with optional authentication
     let (proto, cmd, target_addr) = if let Some(auth_config) = auth {
         let username = auth_config.username;
@@ -217,10 +222,7 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
 
     // Create connection through tunnel
     let local_port = get_local_port();
-    let channels = manager
-        .connect(remote_ip, remote_port, local_port)
-        .await
-        .map_err(Socks5Error::ConnectionFailed)?;
+    let channels = manager.connect(remote_ip, remote_port, local_port).await?;
 
     // Wait for connection with adaptive polling
     let handle = channels.handle;
@@ -365,7 +367,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
     mut channels: SocketChannels,
 ) -> Result<(), Socks5Error> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut client_buf = [0u8; 65535];
+    let mut client_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
 
     loop {
         tokio::select! {
@@ -384,14 +386,15 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
 
-            result = reader.read(&mut client_buf) => {
+            result = reader.read_buf(&mut client_buf) => {
                 match result {
                     Ok(0) => {
                         log::debug!("Client closed connection");
                         break;
                     }
                     Ok(n) => {
-                        if channels.to_stack.send(client_buf[..n].to_vec()).await.is_err() {
+                        let data = client_buf.split_to(n).freeze();
+                        if channels.to_stack.send(data).await.is_err() {
                             log::debug!("Tunnel channel closed");
                             break;
                         }
@@ -432,8 +435,7 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
 
     let mut from_tunnel = response_rx
         .await
-        .map_err(|_| Socks5Error::ChannelError("Failed to get UDP receiver".into()))?
-        .map_err(Socks5Error::ConnectionFailed)?;
+        .map_err(|_| Socks5Error::ChannelError("Failed to get UDP receiver".into()))??;
 
     // Send success reply with UDP relay address
     let reply_ip = local_addr.ip();
@@ -441,12 +443,10 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
     let mut tcp_stream = proto.reply_success(reply_addr).await?;
 
     // Forward UDP data
-    let cmd_sender = manager.cmd_sender();
     let result = forward_udp_data(
         &mut tcp_stream,
         udp_socket,
         &mut from_tunnel,
-        cmd_sender,
         local_port,
         &manager,
     ).await;
@@ -465,8 +465,7 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
 async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
     tcp_stream: &mut T,
     udp_socket: UdpSocket,
-    from_tunnel: &mut tokio::sync::mpsc::Receiver<(IpAddress, u16, Vec<u8>)>,
-    cmd_sender: tokio::sync::mpsc::Sender<ManagerCommand>,
+    from_tunnel: &mut tokio::sync::mpsc::Receiver<(IpAddress, u16, Bytes)>,
     local_port: u16,
     manager: &TunnelManager,
 ) -> Result<(), Socks5Error> {
@@ -497,15 +496,11 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
                                 log::debug!("UDP fragmentation not supported");
                                 continue;
                             }
-                            if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await
-                                && let Err(e) = cmd_sender.send(ManagerCommand::UdpSend {
-                                    remote_ip,
-                                    remote_port,
-                                    local_port,
-                                    data: payload.to_vec(),
-                                }).await
-                            {
-                                log::debug!("Failed to send UDP data to tunnel: {}", e);
+                            if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
+                                let data = Bytes::copy_from_slice(payload);
+                                if let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, data).await {
+                                    log::debug!("Failed to send UDP data to tunnel: {}", e);
+                                }
                             }
                         }
                     }
@@ -518,7 +513,7 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
             // Receive UDP from tunnel, forward to client
             Some((remote_ip, remote_port, data)) = from_tunnel.recv() => {
                 if let Some(addr) = client_addr
-                    && let Ok(packet) = build_udp_response(remote_ip, remote_port, &data)
+                    && let Ok(packet) = build_udp_response(remote_ip, remote_port, data.as_ref())
                     && let Err(e) = udp_socket.send_to(&packet, addr).await
                 {
                     log::debug!("Failed to send UDP response to client: {}", e);
