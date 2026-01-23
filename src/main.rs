@@ -75,18 +75,6 @@ enum Commands {
         /// MTU for MASQUE connection
         #[arg(short = 'm', long, default_value = "1280")]
         mtu: u16,
-        /// Congestion control algorithm (reno, cubic, bbr, bbr2)
-        #[arg(long = "cc", default_value = "bbr2")]
-        congestion_control: String,
-        /// TCP socket buffer size per direction in bytes (default 1MB for high throughput)
-        #[arg(long = "tcp-buffer-size", default_value = "1048576")]
-        tcp_buffer_size: usize,
-        /// QUIC idle timeout in milliseconds (should be > 2x keepalive period)
-        #[arg(long = "quic-idle-timeout-ms", default_value = "90000")]
-        quic_idle_timeout_ms: u64,
-        /// Tunnel worker count (0 = auto, default 1 to avoid abusing upstream nodes)
-        #[arg(long = "tunnel-workers", default_value = "1")]
-        tunnel_workers: usize,
     },
 }
 
@@ -102,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Enroll { config, name, regen_key } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control, tcp_buffer_size, quic_idle_timeout_ms, tunnel_workers } => {
+        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu } => {
             run_socks_server(
                 &bind,
                 port,
@@ -115,10 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 keepalive,
                 initial_packet_size,
                 mtu,
-                &congestion_control,
-                tcp_buffer_size,
-                quic_idle_timeout_ms,
-                tunnel_workers,
             )
             .await?;
         }
@@ -340,12 +324,27 @@ async fn run_socks_server(
     keepalive: u64,
     initial_packet_size: u16,
     mtu: u16,
-    congestion_control: &str,
-    tcp_buffer_size: usize,
-    quic_idle_timeout_ms: u64,
-    tunnel_workers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
+
+    // Read tuning parameters from environment variables
+    let congestion_control: String = std::env::var("USQUE_CC")
+        .unwrap_or_else(|_| "bbr2".to_string());
+
+    let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1048576);
+
+    let quic_idle_timeout_ms: u64 = std::env::var("USQUE_QUIC_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90000);
+
+    let tunnel_workers: usize = std::env::var("USQUE_TUNNEL_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     let cfg = config::Config::load(config_path)?;
     println!("Config loaded from {}", config_path);
