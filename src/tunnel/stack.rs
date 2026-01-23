@@ -1,6 +1,6 @@
 use crate::tunnel::device::VirtualDevice;
 use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
+use smoltcp::socket::{Socket, tcp::{Socket as TcpSocket, SocketBuffer}};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
@@ -25,6 +25,54 @@ pub struct NetworkStack {
 }
 
 impl NetworkStack {
+    fn socket_snapshot(&self) -> String {
+        const MAX_TCP_DETAILS: usize = 16;
+        let mut total = 0usize;
+        let mut tcp_count = 0usize;
+        let mut udp_count = 0usize;
+        let mut tcp_details = Vec::new();
+
+        for (handle, socket) in self.sockets.iter() {
+            total += 1;
+            match socket {
+                Socket::Tcp(sock) => {
+                    tcp_count += 1;
+                    if tcp_details.len() < MAX_TCP_DETAILS {
+                        tcp_details.push(format!(
+                            "{} state={:?} local={:?} remote={:?} tx={} rx={}",
+                            handle,
+                            sock.state(),
+                            sock.local_endpoint(),
+                            sock.remote_endpoint(),
+                            sock.send_queue(),
+                            sock.recv_queue()
+                        ));
+                    }
+                }
+                Socket::Udp(_) => {
+                    udp_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let mut snapshot = format!(
+            "local_ipv4={:?} local_ipv6={:?} sockets: total={}, tcp={}, udp={}",
+            self.local_ipv4, self.local_ipv6, total, tcp_count, udp_count
+        );
+
+        if !tcp_details.is_empty() {
+            snapshot.push_str("; tcp=[");
+            snapshot.push_str(&tcp_details.join(", "));
+            snapshot.push(']');
+            if tcp_count > MAX_TCP_DETAILS {
+                snapshot.push_str(" (truncated)");
+            }
+        }
+
+        snapshot
+    }
+
     pub fn new(ipv4: Option<&str>, ipv6: Option<&str>, mtu: usize) -> Self {
         let mut device = VirtualDevice::new(mtu);
 
@@ -83,7 +131,7 @@ impl NetworkStack {
             self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
         }));
         if result.is_err() {
-            log::error!("smoltcp poll panicked, recovering...");
+            log::error!("smoltcp poll panicked, snapshot: {}", self.socket_snapshot());
             return Err(StackError::PollPanic);
         }
         Ok(())

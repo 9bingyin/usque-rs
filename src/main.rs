@@ -81,6 +81,9 @@ enum Commands {
         /// TCP socket buffer size per direction in bytes
         #[arg(long = "tcp-buffer-size", default_value = "262144")]
         tcp_buffer_size: usize,
+        /// QUIC idle timeout in milliseconds
+        #[arg(long = "quic-idle-timeout-ms", default_value = "30000")]
+        quic_idle_timeout_ms: u64,
         /// Tunnel worker count (0 = auto)
         #[arg(long = "tunnel-workers", default_value = "0")]
         tunnel_workers: usize,
@@ -99,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Enroll { config, name, regen_key } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control, tcp_buffer_size, tunnel_workers } => {
+        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control, tcp_buffer_size, quic_idle_timeout_ms, tunnel_workers } => {
             run_socks_server(
                 &bind,
                 port,
@@ -114,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mtu,
                 &congestion_control,
                 tcp_buffer_size,
+                quic_idle_timeout_ms,
                 tunnel_workers,
             )
             .await?;
@@ -338,6 +342,7 @@ async fn run_socks_server(
     mtu: u16,
     congestion_control: &str,
     tcp_buffer_size: usize,
+    quic_idle_timeout_ms: u64,
     tunnel_workers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
@@ -383,6 +388,15 @@ async fn run_socks_server(
         .map_err(|e: String| e)?;
     println!("Using congestion control: {}", cc);
 
+    let keepalive_ms = keepalive.saturating_mul(1000);
+    if keepalive_ms >= quic_idle_timeout_ms {
+        log::warn!(
+            "Keepalive period {}ms >= QUIC idle timeout {}ms; connection may time out",
+            keepalive_ms,
+            quic_idle_timeout_ms
+        );
+    }
+
     let params = tunnel::ConnectionParams {
         endpoint,
         cert_der,
@@ -397,6 +411,7 @@ async fn run_socks_server(
         mtu,
         congestion_control: cc,
         tcp_buffer_size,
+        quic_idle_timeout_ms,
     };
 
     let available = std::thread::available_parallelism()

@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant as TokioInstant;
 
 use crate::tunnel::quic::CongestionControl;
 
@@ -67,6 +68,7 @@ pub struct ConnectionParams {
     pub mtu: u16,
     pub congestion_control: CongestionControl,
     pub tcp_buffer_size: usize,
+    pub quic_idle_timeout_ms: u64,
 }
 
 #[derive(Error, Debug)]
@@ -324,7 +326,7 @@ impl TunnelManager {
         params: &ConnectionParams,
     ) -> Result<(MasqueTunnel, NetworkStack), Box<dyn std::error::Error + Send + Sync>> {
         let quic_cfg = quic::QuicConfig {
-            idle_timeout: params.keepalive * 1000,
+            idle_timeout: params.quic_idle_timeout_ms,
             initial_packet_size: params.initial_packet_size,
             congestion_control: params.congestion_control,
             ..Default::default()
@@ -504,6 +506,8 @@ impl TunnelManager {
         let mut last_keepalive = Instant::now();
         let keepalive_interval = Duration::from_secs(keepalive_secs);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+        let poll_timer = tokio::time::sleep(Duration::from_millis(0));
+        tokio::pin!(poll_timer);
 
         loop {
             // Check connection status at the start of each iteration
@@ -519,6 +523,7 @@ impl TunnelManager {
             let has_backpressure = sockets
                 .values()
                 .any(|state| state.pending_to_client_bytes >= MAX_PENDING_TO_CLIENT);
+            poll_timer.as_mut().reset(TokioInstant::now() + poll_timeout);
 
             tokio::select! {
                 biased;
@@ -557,7 +562,7 @@ impl TunnelManager {
                 }
 
                 // Dynamic timeout - replaces fixed interval polling
-                _ = tokio::time::sleep(poll_timeout) => {
+                _ = &mut poll_timer => {
                     tunnel.quic_conn.conn.on_timeout();
                     if !Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, keepalive_interval).await {
                         break;

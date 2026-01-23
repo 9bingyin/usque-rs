@@ -2,9 +2,10 @@ use crate::tunnel::manager::{ManagerCommand, ManagerError, SocketChannels, TcpSo
 use bytes::{Bytes, BytesMut};
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
-use fast_socks5::{parse_udp_request, new_udp_header, Socks5Command};
+use fast_socks5::{parse_udp_request, new_udp_header, ReplyError, Socks5Command};
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,84 @@ const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
+const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(5);
+const UDP_FRAG_MAX_COUNT: usize = 128;
+
+struct FragBuffer {
+    fragments: Vec<Option<Bytes>>,
+    highest_seq: u8,
+    end_seq: Option<u8>,
+    last_update: Instant,
+}
+
+impl FragBuffer {
+    fn new(now: Instant) -> Self {
+        Self {
+            fragments: vec![None; UDP_FRAG_MAX_COUNT],
+            highest_seq: 0,
+            end_seq: None,
+            last_update: now,
+        }
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.last_update) > UDP_FRAG_TIMEOUT
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.fragments.fill(None);
+        self.highest_seq = 0;
+        self.end_seq = None;
+        self.last_update = now;
+    }
+
+    fn insert(&mut self, seq: u8, is_last: bool, data: Bytes, now: Instant) -> Option<Bytes> {
+        if seq == 0 || seq as usize >= self.fragments.len() {
+            return None;
+        }
+
+        if let Some(end_seq) = self.end_seq {
+            if seq > end_seq {
+                self.reset(now);
+            }
+        }
+
+        if seq < self.highest_seq {
+            self.reset(now);
+        }
+
+        self.last_update = now;
+        if self.fragments[seq as usize].is_none() {
+            self.fragments[seq as usize] = Some(data);
+        }
+
+        if seq > self.highest_seq {
+            self.highest_seq = seq;
+        }
+
+        if is_last {
+            self.end_seq = Some(seq);
+        }
+
+        let end_seq = self.end_seq?;
+        for idx in 1..=end_seq {
+            if self.fragments[idx as usize].is_none() {
+                return None;
+            }
+        }
+
+        let total_len: usize = (1..=end_seq)
+            .map(|idx| self.fragments[idx as usize].as_ref().map(|b| b.len()).unwrap_or(0))
+            .sum();
+        let mut merged = BytesMut::with_capacity(total_len);
+        for idx in 1..=end_seq {
+            if let Some(chunk) = self.fragments[idx as usize].as_ref() {
+                merged.extend_from_slice(chunk);
+            }
+        }
+        Some(merged.freeze())
+    }
+}
 
 fn get_local_port() -> u16 {
     let offset = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PORT_RANGE_SIZE;
@@ -222,11 +301,24 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
 
     // Create connection through tunnel
     let local_port = get_local_port();
-    let channels = manager.connect(remote_ip, remote_port, local_port).await?;
+    let channels = match manager.connect(remote_ip, remote_port, local_port).await {
+        Ok(channels) => channels,
+        Err(err) => {
+            let reply = map_manager_error_to_reply(&err);
+            if let Err(rep_err) = proto.reply_error(&reply).await {
+                log::debug!("Failed to send connect error reply: {}", rep_err);
+            }
+            return Err(Socks5Error::TunnelError(err));
+        }
+    };
 
     // Wait for connection with adaptive polling
     let handle = channels.handle;
     if let Err(e) = wait_for_connection(&manager, handle).await {
+        let reply = map_connect_error_to_reply(&e);
+        if let Err(rep_err) = proto.reply_error(&reply).await {
+            log::debug!("Failed to send connect error reply: {}", rep_err);
+        }
         manager.close(handle).await;
         return Err(e);
     }
@@ -472,6 +564,7 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = [0u8; 65535];
     let mut tcp_buf = [0u8; 1];
     let mut client_addr: Option<SocketAddr> = None;
+    let mut frag_buffers: HashMap<TargetAddr, FragBuffer> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -492,14 +585,41 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
                     Ok((len, addr)) => {
                         client_addr = Some(addr);
                         if let Ok((frag, target, payload)) = parse_udp_request(&buf[..len]).await {
-                            if frag != 0 {
-                                log::debug!("UDP fragmentation not supported");
+                            cleanup_fragments(&mut frag_buffers);
+
+                            if frag == 0 {
+                                frag_buffers.remove(&target);
+                                if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
+                                    let data = Bytes::copy_from_slice(payload);
+                                    if let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, data).await {
+                                        log::debug!("Failed to send UDP data to tunnel: {}", e);
+                                    }
+                                }
                                 continue;
                             }
-                            if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
-                                let data = Bytes::copy_from_slice(payload);
-                                if let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, data).await {
-                                    log::debug!("Failed to send UDP data to tunnel: {}", e);
+
+                            let is_last = (frag & 0x80) != 0;
+                            let seq = frag & 0x7f;
+                            if seq == 0 {
+                                log::debug!("Invalid UDP fragment sequence 0");
+                                continue;
+                            }
+
+                            let now = Instant::now();
+                            let buffer = frag_buffers
+                                .entry(target.clone())
+                                .or_insert_with(|| FragBuffer::new(now));
+
+                            if buffer.is_expired(now) {
+                                buffer.reset(now);
+                            }
+
+                            if let Some(assembled) = buffer.insert(seq, is_last, Bytes::copy_from_slice(payload), now) {
+                                frag_buffers.remove(&target);
+                                if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
+                                    if let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, assembled).await {
+                                        log::debug!("Failed to send UDP data to tunnel: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -549,6 +669,30 @@ async fn target_addr_to_ip(target: &TargetAddr, manager: &TunnelManager) -> Opti
                 }
             }
         }
+    }
+}
+
+fn cleanup_fragments(frag_buffers: &mut HashMap<TargetAddr, FragBuffer>) {
+    let now = Instant::now();
+    frag_buffers.retain(|_, buffer| !buffer.is_expired(now));
+}
+
+fn map_manager_error_to_reply(err: &ManagerError) -> ReplyError {
+    match err {
+        ManagerError::NotConnected => ReplyError::GeneralFailure,
+        ManagerError::Dns(_) => ReplyError::HostUnreachable,
+        ManagerError::Stack(_) => ReplyError::GeneralFailure,
+        ManagerError::ChannelClosed => ReplyError::GeneralFailure,
+        ManagerError::ResponseChannelClosed => ReplyError::GeneralFailure,
+    }
+}
+
+fn map_connect_error_to_reply(err: &Socks5Error) -> ReplyError {
+    match err {
+        Socks5Error::Timeout => ReplyError::ConnectionTimeout,
+        Socks5Error::ConnectionFailed(_) => ReplyError::HostUnreachable,
+        Socks5Error::TunnelError(inner) => map_manager_error_to_reply(inner),
+        _ => ReplyError::GeneralFailure,
     }
 }
 
