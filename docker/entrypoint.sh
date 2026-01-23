@@ -5,6 +5,7 @@ CONFIG_FILE="/app/config.json"
 
 SOCKS_BIND="${SOCKS_BIND:-127.0.0.1}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
+DNS_SERVERS="${DNS_SERVERS:-1.1.1.1,1.0.0.1}"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Configuration file not found, starting auto-registration..."
@@ -34,6 +35,11 @@ else
     else
         echo "SOCKS5 authentication: Disabled"
     fi
+
+    for dns in $(echo "$DNS_SERVERS" | tr ',' ' '); do
+        SOCKS_CMD="$SOCKS_CMD --dns $dns"
+    done
+    echo "Using DNS servers: $DNS_SERVERS"
 
     exec $SOCKS_CMD
 fi
