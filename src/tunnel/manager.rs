@@ -209,7 +209,7 @@ impl TunnelManager {
         let mut sockets: HashMap<SocketHandle, SocketState> = HashMap::new();
         let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
-        let mut interval = tokio::time::interval(Duration::from_micros(50));
+        let mut interval = tokio::time::interval(Duration::from_micros(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // KeepAlive timer - send PING frames every 30 seconds to keep connection alive
@@ -229,12 +229,14 @@ impl TunnelManager {
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
                     Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, cmd);
+                    Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
                 }
 
                 // Receive UDP data
                 result = socket.recv_from(&mut buf) => {
                     if let Ok((len, from)) = result {
                         Self::handle_udp_recv(&mut tunnel, &mut stack, &buf[..len], from, local_addr);
+                        Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
                     }
                 }
 
@@ -301,8 +303,8 @@ impl TunnelManager {
             return Err(format!("Connect failed: {}", e));
         }
 
-        let (to_client_tx, to_client_rx) = mpsc::channel(1024);
-        let (from_client_tx, from_client_rx) = mpsc::channel(1024);
+        let (to_client_tx, to_client_rx) = mpsc::channel(8192);
+        let (from_client_tx, from_client_rx) = mpsc::channel(8192);
 
         let state = SocketState {
             handle,
@@ -629,5 +631,34 @@ impl TunnelManager {
         if let Err(e) = tunnel.quic_conn.send_async().await {
             log::warn!("Failed to send QUIC data: {:?}", e);
         }
+    }
+
+    // Lightweight processing after UDP recv: only handle TCP data transfer
+    async fn process_after_recv(
+        tunnel: &mut MasqueTunnel,
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
+    ) {
+        stack.poll();
+
+        let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
+        for handle in handles {
+            if stack.tcp_may_recv(handle) {
+                let mut buf = [0u8; 65535];
+                if let Ok(n) = stack.tcp_recv(handle, &mut buf) {
+                    if n > 0 {
+                        if let Some(state) = sockets.get(&handle) {
+                            let _ = state.to_client.try_send(buf[..n].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+
+        while let Some(packet) = stack.take_packet() {
+            let _ = tunnel.send_datagram(&packet);
+        }
+
+        let _ = tunnel.quic_conn.send_async().await;
     }
 }
