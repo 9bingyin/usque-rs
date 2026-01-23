@@ -104,10 +104,21 @@ impl TunnelManager {
         let mut masque_tunnel = MasqueTunnel::new(quic_conn);
         masque_tunnel.establish(Duration::from_secs(30)).await?;
 
+        // Dynamically get MTU from QUIC datagram max size
+        // Subtract HTTP/3 datagram header (~3 bytes for varint stream ID + context ID)
+        let mtu = masque_tunnel
+            .quic_conn
+            .conn
+            .dgram_max_writable_len()
+            .map(|max| max.saturating_sub(3))
+            .unwrap_or(1280);
+
+        log::info!("Using MTU {} based on QUIC datagram limit", mtu);
+
         let stack = NetworkStack::new(
             &params.ipv4,
             params.ipv6.as_deref(),
-            1280,
+            mtu,
         );
 
         Ok((masque_tunnel, stack))
@@ -345,8 +356,16 @@ impl TunnelManager {
         }
 
         while let Some(packet) = stack.take_packet() {
-            if let Err(e) = tunnel.send_datagram(&packet) {
-                log::warn!("Failed to send datagram: {:?}", e);
+            match tunnel.send_datagram(&packet) {
+                Ok(Some(icmp)) => {
+                    // Inject ICMP Packet Too Big message back to stack
+                    log::debug!("Injecting ICMP Packet Too Big ({} bytes)", icmp.len());
+                    stack.inject_packet(icmp);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("Failed to send datagram: {:?}", e);
+                }
             }
         }
 

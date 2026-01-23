@@ -89,7 +89,7 @@ impl MasqueTunnel {
         Ok(stream_id)
     }
 
-    pub fn send_datagram(&mut self, data: &[u8]) -> Result<(), MasqueError> {
+    pub fn send_datagram(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>, MasqueError> {
         let stream_id = self.connect_stream_id
             .ok_or_else(|| MasqueError::ConnectionError("No connect stream".into()))?;
 
@@ -97,7 +97,7 @@ impl MasqueTunnel {
         let mut packet = data.to_vec();
         if !process_outgoing_ip_packet(&mut packet)? {
             // Packet should be dropped (TTL too small, etc.)
-            return Ok(());
+            return Ok(None);
         }
 
         // Build HTTP/3 Datagram: [Quarter Stream ID (varint)] [Context ID (varint)] [IP Packet]
@@ -110,9 +110,32 @@ impl MasqueTunnel {
         offset += 1;
         buf[offset..].copy_from_slice(&packet);
 
-        self.quic_conn.conn.dgram_send(&buf)
-            .map_err(|e| MasqueError::QuicError(QuicError::QuicError(e)))?;
-        Ok(())
+        // Check if datagram exceeds maximum writable length
+        let max_dgram_len = self.quic_conn.conn.dgram_max_writable_len();
+        if let Some(max_len) = max_dgram_len {
+            if buf.len() > max_len {
+                log::debug!(
+                    "Datagram too large: {} bytes > max {} bytes, generating ICMP Packet Too Big",
+                    buf.len(),
+                    max_len
+                );
+                let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
+                return Ok(icmp);
+            }
+        }
+
+        match self.quic_conn.conn.dgram_send(&buf) {
+            Ok(()) => Ok(None),
+            Err(quiche::Error::BufferTooShort) => {
+                log::debug!("dgram_send BufferTooShort ({} bytes), generating ICMP", buf.len());
+                let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
+                Ok(icmp)
+            }
+            Err(e) => {
+                log::warn!("dgram_send error: {:?}, buf len: {}", e, buf.len());
+                Err(MasqueError::QuicError(QuicError::QuicError(e)))
+            }
+        }
     }
 
     /// Process QUIC data that has already been received.
@@ -410,6 +433,14 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), MasqueError> {
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 
+// ICMP constants
+const ICMP_DEST_UNREACHABLE: u8 = 3;
+const ICMP_CODE_FRAG_NEEDED: u8 = 4;
+const ICMPV6_PACKET_TOO_BIG: u8 = 2;
+
+// Minimum MTU for ICMP Packet Too Big
+const MIN_MTU: u16 = 1280;
+
 // Process outgoing IP packet: decrement TTL/Hop Limit, recalculate checksum
 // Returns false if packet should be dropped
 fn process_outgoing_ip_packet(packet: &mut [u8]) -> Result<bool, MasqueError> {
@@ -481,5 +512,213 @@ fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
     }
 
     // One's complement
+    !sum as u16
+}
+
+// Compose ICMP Packet Too Big message for the given original packet
+// Returns a complete IP packet containing the ICMP message
+pub fn compose_icmp_packet_too_big(original_packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if original_packet.is_empty() {
+        return None;
+    }
+
+    let version = original_packet[0] >> 4;
+    match version {
+        4 => compose_icmpv4_packet_too_big(original_packet, mtu),
+        6 => compose_icmpv6_packet_too_big(original_packet, mtu),
+        _ => None,
+    }
+}
+
+// Compose ICMPv4 Destination Unreachable (Fragmentation Needed) message
+// ICMP Type 3, Code 4
+fn compose_icmpv4_packet_too_big(original_packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if original_packet.len() < IPV4_HEADER_LEN {
+        return None;
+    }
+
+    // Extract source and destination from original packet
+    let orig_src = &original_packet[12..16];
+    let orig_dst = &original_packet[16..20];
+
+    // ICMP payload: original IP header + first 8 bytes of original data
+    let icmp_payload_len = std::cmp::min(original_packet.len(), IPV4_HEADER_LEN + 8);
+    let icmp_payload = &original_packet[..icmp_payload_len];
+
+    // ICMP header: Type(1) + Code(1) + Checksum(2) + Unused(2) + Next-Hop MTU(2) = 8 bytes
+    let icmp_len = 8 + icmp_payload_len;
+    let total_len = IPV4_HEADER_LEN + icmp_len;
+
+    let mut packet = vec![0u8; total_len];
+
+    // Build IPv4 header
+    packet[0] = 0x45; // Version 4, IHL 5 (20 bytes)
+    packet[1] = 0x00; // DSCP/ECN
+    packet[2] = (total_len >> 8) as u8;
+    packet[3] = total_len as u8;
+    packet[4] = 0x00; // Identification
+    packet[5] = 0x00;
+    packet[6] = 0x00; // Flags + Fragment Offset
+    packet[7] = 0x00;
+    packet[8] = 64; // TTL
+    packet[9] = 1; // Protocol: ICMP
+    // Checksum at [10..12] - calculated later
+    // Source: original destination (we are the "router" sending ICMP)
+    packet[12..16].copy_from_slice(orig_dst);
+    // Destination: original source
+    packet[16..20].copy_from_slice(orig_src);
+
+    // Calculate IPv4 header checksum
+    let ip_checksum = calculate_ipv4_checksum(&packet[..IPV4_HEADER_LEN]);
+    packet[10] = (ip_checksum >> 8) as u8;
+    packet[11] = ip_checksum as u8;
+
+    // Build ICMP header
+    let icmp_start = IPV4_HEADER_LEN;
+    packet[icmp_start] = ICMP_DEST_UNREACHABLE; // Type 3
+    packet[icmp_start + 1] = ICMP_CODE_FRAG_NEEDED; // Code 4
+    // Checksum at [icmp_start + 2..4] - calculated later
+    packet[icmp_start + 4] = 0x00; // Unused
+    packet[icmp_start + 5] = 0x00;
+    packet[icmp_start + 6] = (mtu >> 8) as u8; // Next-Hop MTU
+    packet[icmp_start + 7] = mtu as u8;
+
+    // Copy original packet data as ICMP payload
+    packet[icmp_start + 8..].copy_from_slice(icmp_payload);
+
+    // Calculate ICMP checksum
+    let icmp_checksum = calculate_icmp_checksum(&packet[icmp_start..]);
+    packet[icmp_start + 2] = (icmp_checksum >> 8) as u8;
+    packet[icmp_start + 3] = icmp_checksum as u8;
+
+    Some(packet)
+}
+
+// Compose ICMPv6 Packet Too Big message
+// ICMPv6 Type 2, Code 0
+fn compose_icmpv6_packet_too_big(original_packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if original_packet.len() < IPV6_HEADER_LEN {
+        return None;
+    }
+
+    // Extract source and destination from original packet
+    let orig_src = &original_packet[8..24];
+    let orig_dst = &original_packet[24..40];
+
+    // ICMPv6 payload: as much of the original packet as possible
+    // without exceeding minimum IPv6 MTU (1280)
+    let max_icmp_payload = 1280 - IPV6_HEADER_LEN - 8; // 8 = ICMPv6 header
+    let icmp_payload_len = std::cmp::min(original_packet.len(), max_icmp_payload);
+    let icmp_payload = &original_packet[..icmp_payload_len];
+
+    // ICMPv6 header: Type(1) + Code(1) + Checksum(2) + MTU(4) = 8 bytes
+    let icmp_len = 8 + icmp_payload_len;
+    let total_len = IPV6_HEADER_LEN + icmp_len;
+
+    let mut packet = vec![0u8; total_len];
+
+    // Build IPv6 header
+    packet[0] = 0x60; // Version 6
+    packet[1] = 0x00; // Traffic Class / Flow Label
+    packet[2] = 0x00;
+    packet[3] = 0x00;
+    // Payload length (ICMPv6 header + payload)
+    packet[4] = (icmp_len >> 8) as u8;
+    packet[5] = icmp_len as u8;
+    packet[6] = 58; // Next Header: ICMPv6
+    packet[7] = 64; // Hop Limit
+    // Source: original destination
+    packet[8..24].copy_from_slice(orig_dst);
+    // Destination: original source
+    packet[24..40].copy_from_slice(orig_src);
+
+    // Build ICMPv6 header
+    let icmp_start = IPV6_HEADER_LEN;
+    packet[icmp_start] = ICMPV6_PACKET_TOO_BIG; // Type 2
+    packet[icmp_start + 1] = 0; // Code 0
+    // Checksum at [icmp_start + 2..4] - calculated later
+    // MTU (4 bytes)
+    packet[icmp_start + 4] = 0;
+    packet[icmp_start + 5] = 0;
+    packet[icmp_start + 6] = (mtu >> 8) as u8;
+    packet[icmp_start + 7] = mtu as u8;
+
+    // Copy original packet data as ICMPv6 payload
+    packet[icmp_start + 8..].copy_from_slice(icmp_payload);
+
+    // Calculate ICMPv6 checksum (includes pseudo-header)
+    let checksum = calculate_icmpv6_checksum(
+        &packet[8..24],   // source
+        &packet[24..40],  // destination
+        &packet[icmp_start..],
+    );
+    packet[icmp_start + 2] = (checksum >> 8) as u8;
+    packet[icmp_start + 3] = checksum as u8;
+
+    Some(packet)
+}
+
+// Calculate ICMP checksum (same algorithm as IPv4 header checksum)
+fn calculate_icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    for i in (0..data.len()).step_by(2) {
+        if i == 2 {
+            continue; // Skip checksum field
+        }
+        let word = if i + 1 < data.len() {
+            ((data[i] as u32) << 8) | (data[i + 1] as u32)
+        } else {
+            (data[i] as u32) << 8
+        };
+        sum += word;
+    }
+
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    !sum as u16
+}
+
+// Calculate ICMPv6 checksum with pseudo-header
+fn calculate_icmpv6_checksum(src: &[u8], dst: &[u8], icmp_data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header: source address
+    for i in (0..16).step_by(2) {
+        sum += ((src[i] as u32) << 8) | (src[i + 1] as u32);
+    }
+
+    // Pseudo-header: destination address
+    for i in (0..16).step_by(2) {
+        sum += ((dst[i] as u32) << 8) | (dst[i + 1] as u32);
+    }
+
+    // Pseudo-header: ICMPv6 length
+    let len = icmp_data.len() as u32;
+    sum += (len >> 16) as u32;
+    sum += (len & 0xffff) as u32;
+
+    // Pseudo-header: Next Header (58 for ICMPv6)
+    sum += 58;
+
+    // ICMPv6 data (skip checksum field at offset 2)
+    for i in (0..icmp_data.len()).step_by(2) {
+        if i == 2 {
+            continue;
+        }
+        let word = if i + 1 < icmp_data.len() {
+            ((icmp_data[i] as u32) << 8) | (icmp_data[i + 1] as u32)
+        } else {
+            (icmp_data[i] as u32) << 8
+        };
+        sum += word;
+    }
+
+    while (sum >> 16) > 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
     !sum as u16
 }

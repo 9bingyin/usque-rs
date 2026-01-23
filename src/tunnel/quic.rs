@@ -109,6 +109,9 @@ pub fn create_quiche_config(
     // Disable GREASE to avoid potential issues with Cloudflare's server
     config.grease(false);
 
+    // Set max UDP payload size (same as Go's InitialPacketSize: 1242)
+    config.set_max_send_udp_payload_size(1242);
+
     Ok(config)
 }
 
