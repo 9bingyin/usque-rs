@@ -11,16 +11,26 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 
 static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
 const PORT_RANGE_START: u16 = 49152;
 const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 fn get_local_port() -> u16 {
     let offset = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PORT_RANGE_SIZE;
     PORT_RANGE_START + offset
+}
+
+fn max_concurrent_connections() -> usize {
+    std::env::var("USQUE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .filter(|val| *val > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_CONNECTIONS)
 }
 
 async fn wait_for_connection(
@@ -100,14 +110,30 @@ impl Socks5Server {
             log::info!("SOCKS5 authentication enabled");
         }
 
+        let max_conns = max_concurrent_connections();
+        let semaphore = Arc::new(Semaphore::new(max_conns));
+
         loop {
             let (stream, addr) = listener.accept().await?;
             log::debug!("New connection from {}", addr);
+
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::warn!(
+                        "Connection limit reached ({}), dropping {}",
+                        max_conns,
+                        addr
+                    );
+                    continue;
+                }
+            };
 
             let manager = self.manager.clone();
             let local_addr = self.bind_addr;
             let auth = self.auth.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_client(stream, manager, local_addr, auth).await {
                     log::error!("Error handling client {}: {}", addr, e);
                 }

@@ -8,7 +8,7 @@ use crate::tunnel::stack::NetworkStack;
 use rand::Rng;
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -126,6 +126,8 @@ struct SocketState {
     to_client: mpsc::Sender<Vec<u8>>,
     from_client: mpsc::Receiver<Vec<u8>>,
     pending_data: Vec<u8>,
+    pending_to_client: VecDeque<Vec<u8>>,
+    pending_to_client_bytes: usize,
 }
 
 // DNS query state for a single query (A or AAAA)
@@ -141,6 +143,7 @@ struct DnsQueryGroup {
     ipv4_result: Option<Result<Vec<IpAddress>, DnsError>>,
     ipv6_result: Option<Result<Vec<IpAddress>, DnsError>>,
     created_at: Instant,
+    prefer_ipv6: bool,
 }
 
 // UDP session state for SOCKS5 UDP ASSOCIATE
@@ -152,8 +155,10 @@ struct UdpSessionState {
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const MAX_PENDING_DATA: usize = 4 * 1024 * 1024; // 4MB per socket
+const MAX_PENDING_TO_CLIENT: usize = 4 * 1024 * 1024; // 4MB per socket
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static DNS_SERVER_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub struct TunnelManager {
     cmd_tx: mpsc::Sender<ManagerCommand>,
@@ -276,11 +281,13 @@ impl TunnelManager {
             configured_mtu
         );
 
-        let stack = NetworkStack::new(
-            &params.ipv4,
-            params.ipv6.as_deref(),
-            mtu,
-        );
+        let ipv4 = if params.ipv4.trim().is_empty() {
+            None
+        } else {
+            Some(params.ipv4.as_str())
+        };
+        let ipv6 = params.ipv6.as_deref().filter(|s| !s.trim().is_empty());
+        let stack = NetworkStack::new(ipv4, ipv6, mtu);
 
         Ok((masque_tunnel, stack))
     }
@@ -504,6 +511,8 @@ impl TunnelManager {
             to_client: to_client_tx,
             from_client: from_client_rx,
             pending_data: Vec::new(),
+            pending_to_client: VecDeque::new(),
+            pending_to_client_bytes: 0,
         };
 
         sockets.insert(handle, state);
@@ -549,7 +558,7 @@ impl TunnelManager {
         local_port: u16,
         response: oneshot::Sender<Result<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>, String>>,
     ) {
-        let handle = match stack.create_udp_socket(local_port) {
+        let handle = match stack.create_udp_socket_default(local_port) {
             Ok(handle) => handle,
             Err(e) => {
                 let _ = response.send(Err(format!("Failed to bind UDP socket: {}", e)));
@@ -623,7 +632,7 @@ impl TunnelManager {
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         domain: &str,
-        _prefer_ipv6: bool,
+        prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, DnsError>>,
         dns_servers: &[IpAddress],
     ) {
@@ -639,19 +648,18 @@ impl TunnelManager {
                 ipv4_result: None,
                 ipv6_result: None,
                 created_at: Instant::now(),
+                prefer_ipv6,
             },
         );
 
-        // Use first DNS server or default
-        let dns_server = dns_servers.first()
-            .copied()
-            .unwrap_or(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(1, 1, 1, 1)));
+        // Select DNS server with round-robin and preferred address family
+        let dns_server = Self::select_dns_server(dns_servers, prefer_ipv6);
 
         // Send A query (IPv4)
         match build_dns_query(domain, DnsRecordType::A) {
             Ok((tx_id_a, packet_a)) => {
                 let local_port = get_dns_local_port();
-                match stack.create_udp_socket(local_port) {
+                match stack.create_udp_socket_for(local_port, dns_server) {
                     Ok(handle) => {
                         if stack.udp_send(handle, dns_server, dns_port(), &packet_a).is_ok() {
                             dns_queries.insert(
@@ -695,7 +703,7 @@ impl TunnelManager {
         match build_dns_query(domain, DnsRecordType::AAAA) {
             Ok((tx_id_aaaa, packet_aaaa)) => {
                 let local_port = get_dns_local_port();
-                match stack.create_udp_socket(local_port) {
+                match stack.create_udp_socket_for(local_port, dns_server) {
                     Ok(handle) => {
                         if stack.udp_send(handle, dns_server, dns_port(), &packet_aaaa).is_ok() {
                             dns_queries.insert(
@@ -830,30 +838,48 @@ impl TunnelManager {
             None => return,
         };
 
-        // Happy Eyeballs: prefer IPv6 if available, fallback to IPv4
-        let result = match (&group.ipv6_result, &group.ipv4_result) {
-            // IPv6 succeeded with addresses
-            (Some(Ok(v6_addrs)), _) if !v6_addrs.is_empty() => {
-                log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
-                Some(Ok(v6_addrs[0]))
-            }
-            // IPv4 succeeded with addresses
-            (_, Some(Ok(v4_addrs))) if !v4_addrs.is_empty() => {
-                log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
-                Some(Ok(v4_addrs[0]))
-            }
-            // Both completed (success or failure), surface a meaningful error
-            (Some(_), Some(_)) => {
-                let err = match (&group.ipv6_result, &group.ipv4_result) {
-                    (Some(Err(e6)), _) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
-                    (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
-                    _ => DnsError::NoRecords,
-                };
-                log::debug!("DNS resolution failed: {:?}", err);
-                Some(Err(err))
-            }
-            // Still waiting for one response
-            _ => None,
+        // Happy Eyeballs: select based on preference, then fallback
+        let result = match group.prefer_ipv6 {
+            true => match (&group.ipv6_result, &group.ipv4_result) {
+                (Some(Ok(v6_addrs)), _) if !v6_addrs.is_empty() => {
+                    log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
+                    Some(Ok(v6_addrs[0]))
+                }
+                (_, Some(Ok(v4_addrs))) if !v4_addrs.is_empty() => {
+                    log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
+                    Some(Ok(v4_addrs[0]))
+                }
+                (Some(_), Some(_)) => {
+                    let err = match (&group.ipv6_result, &group.ipv4_result) {
+                        (Some(Err(e6)), _) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                        (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                        _ => DnsError::NoRecords,
+                    };
+                    log::debug!("DNS resolution failed: {:?}", err);
+                    Some(Err(err))
+                }
+                _ => None,
+            },
+            false => match (&group.ipv4_result, &group.ipv6_result) {
+                (Some(Ok(v4_addrs)), _) if !v4_addrs.is_empty() => {
+                    log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
+                    Some(Ok(v4_addrs[0]))
+                }
+                (_, Some(Ok(v6_addrs))) if !v6_addrs.is_empty() => {
+                    log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
+                    Some(Ok(v6_addrs[0]))
+                }
+                (Some(_), Some(_)) => {
+                    let err = match (&group.ipv4_result, &group.ipv6_result) {
+                        (Some(Err(e4)), _) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                        (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                        _ => DnsError::NoRecords,
+                    };
+                    log::debug!("DNS resolution failed: {:?}", err);
+                    Some(Err(err))
+                }
+                _ => None,
+            },
         };
 
         if let Some(res) = result {
@@ -989,18 +1015,26 @@ impl TunnelManager {
                 continue;
             }
 
-            if stack.tcp_may_recv(handle) {
+            let mut should_close = false;
+            let blocked = if let Some(state) = sockets.get_mut(&handle) {
+                Self::flush_pending_to_client(state);
+                !state.pending_to_client.is_empty()
+            } else {
+                false
+            };
+
+            if !blocked && stack.tcp_may_recv(handle) {
                 let mut buf = [0u8; 65535];
                 if let Ok(n) = stack.tcp_recv(handle, &mut buf)
                     && n > 0
-                    && let Some(state) = sockets.get(&handle)
-                    && state.to_client.try_send(buf[..n].to_vec()).is_err()
+                    && let Some(state) = sockets.get_mut(&handle)
+                    && Self::deliver_to_client(handle, state, buf[..n].to_vec()).is_err()
                 {
-                    log::debug!("TCP channel full or closed for socket {:?}", handle);
+                    log::debug!("TCP channel closed or backpressure overflow for socket {:?}", handle);
+                    should_close = true;
                 }
             }
 
-            let mut should_close = false;
             if let Some(state) = sockets.get_mut(&handle) {
                 if !state.pending_data.is_empty() && stack.tcp_may_send(handle)
                     && let Ok(sent) = stack.tcp_send(handle, &state.pending_data)
@@ -1078,15 +1112,25 @@ impl TunnelManager {
 
         let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
         for handle in handles {
-            if stack.tcp_may_recv(handle) {
-                let mut buf = [0u8; 65535];
-                if let Ok(n) = stack.tcp_recv(handle, &mut buf)
-                    && n > 0
-                    && let Some(state) = sockets.get(&handle)
-                    && state.to_client.try_send(buf[..n].to_vec()).is_err()
-                {
-                    log::debug!("TCP channel full or closed for socket {:?}", handle);
-                }
+            let blocked = if let Some(state) = sockets.get_mut(&handle) {
+                Self::flush_pending_to_client(state);
+                !state.pending_to_client.is_empty()
+            } else {
+                false
+            };
+
+            if blocked || !stack.tcp_may_recv(handle) {
+                continue;
+            }
+
+            let mut buf = [0u8; 65535];
+            if let Ok(n) = stack.tcp_recv(handle, &mut buf)
+                && n > 0
+                && let Some(state) = sockets.get_mut(&handle)
+                && Self::deliver_to_client(handle, state, buf[..n].to_vec()).is_err()
+            {
+                log::debug!("TCP channel closed or backpressure overflow for socket {:?}", handle);
+                stack.tcp_close(handle);
             }
         }
 
@@ -1100,5 +1144,66 @@ impl TunnelManager {
             log::debug!("Failed to send QUIC data in process_after_recv: {:?}", e);
         }
         true
+    }
+
+    fn flush_pending_to_client(state: &mut SocketState) {
+        while let Some(data) = state.pending_to_client.pop_front() {
+            let len = data.len();
+            match state.to_client.try_send(data) {
+                Ok(()) => {
+                    state.pending_to_client_bytes = state.pending_to_client_bytes.saturating_sub(len);
+                }
+                Err(err) => {
+                    let data = err.into_inner();
+                    state.pending_to_client.push_front(data);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn deliver_to_client(
+        handle: SocketHandle,
+        state: &mut SocketState,
+        data: Vec<u8>,
+    ) -> Result<(), ()> {
+        match state.to_client.try_send(data) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                if state.pending_to_client_bytes + data.len() > MAX_PENDING_TO_CLIENT {
+                    log::warn!(
+                        "Pending to-client data exceeded limit for socket {:?} ({} bytes), closing",
+                        handle,
+                        state.pending_to_client_bytes + data.len()
+                    );
+                    return Err(());
+                }
+                state.pending_to_client_bytes += data.len();
+                state.pending_to_client.push_back(data);
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    fn select_dns_server(dns_servers: &[IpAddress], prefer_ipv6: bool) -> IpAddress {
+        if dns_servers.is_empty() {
+            return IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(1, 1, 1, 1));
+        }
+
+        let start = DNS_SERVER_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let len = dns_servers.len();
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let server = dns_servers[idx];
+            if prefer_ipv6 && matches!(server, IpAddress::Ipv6(_)) {
+                return server;
+            }
+            if !prefer_ipv6 && matches!(server, IpAddress::Ipv4(_)) {
+                return server;
+            }
+        }
+
+        dns_servers[start % len]
     }
 }

@@ -207,7 +207,7 @@ pub async fn connect(
     let local_addr = socket.local_addr()?;
     let socket = Arc::new(socket);
 
-    let scid = generate_scid();
+    let scid = generate_scid()?;
     let conn = quiche::connect(Some(sni), &scid, local_addr, endpoint, &mut config)?;
 
     let max_datagram_size = std::cmp::max(quic_cfg.initial_packet_size as usize, 1350);
@@ -305,12 +305,12 @@ fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool
     cert_spki_der == expected_pub_key_spki
 }
 
-fn generate_scid() -> quiche::ConnectionId<'static> {
+fn generate_scid() -> Result<quiche::ConnectionId<'static>, QuicError> {
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SystemRandom::new()
         .fill(&mut scid)
-        .expect("failed to generate connection ID");
-    quiche::ConnectionId::from_vec(scid.to_vec())
+        .map_err(|e| QuicError::ConnectionError(format!("random generation failed: {}", e)))?;
+    Ok(quiche::ConnectionId::from_vec(scid.to_vec()))
 }
 
 use ring::rand::SecureRandom;

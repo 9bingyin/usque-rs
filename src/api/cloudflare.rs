@@ -10,6 +10,7 @@ pub const KEY_TYPE_WG: &str = "curve25519";
 pub const TUN_TYPE_WG: &str = "wireguard";
 pub const KEY_TYPE_MASQUE: &str = "secp256r1";
 pub const TUN_TYPE_MASQUE: &str = "masque";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Error, Debug)]
 pub enum ApiClientError {
@@ -89,7 +90,11 @@ impl CloudflareClient {
             req = req.header("CF-Access-Jwt-Assertion", token);
         }
 
-        let resp = req.json(&registration).send().await?;
+        let resp = req
+            .timeout(REQUEST_TIMEOUT)
+            .json(&registration)
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -126,6 +131,7 @@ impl CloudflareClient {
             .patch(&url)
             .headers(default_headers())
             .header("Authorization", format!("Bearer {}", access_token))
+            .timeout(REQUEST_TIMEOUT)
             .json(&device_update)
             .send()
             .await?;

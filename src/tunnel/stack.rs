@@ -20,36 +20,47 @@ pub struct NetworkStack {
     device: VirtualDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    local_ipv4: Ipv4Address,
+    local_ipv4: Option<Ipv4Address>,
+    local_ipv6: Option<Ipv6Address>,
 }
 
 impl NetworkStack {
-    pub fn new(ipv4: &str, ipv6: Option<&str>, mtu: usize) -> Self {
+    pub fn new(ipv4: Option<&str>, ipv6: Option<&str>, mtu: usize) -> Self {
         let mut device = VirtualDevice::new(mtu);
 
-        let local_ipv4: Ipv4Address = match ipv4.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                log::warn!("Invalid IPv4 address '{}': {}", ipv4, e);
-                Ipv4Address::new(10, 0, 0, 1)
-            }
+        let mut local_ipv4 = match ipv4.filter(|s| !s.trim().is_empty()) {
+            Some(s) => match s.parse() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    log::warn!("Invalid IPv4 address '{}': {}", s, e);
+                    Some(Ipv4Address::new(10, 0, 0, 1))
+                }
+            },
+            None => None,
         };
-        let local_ipv6: Option<Ipv6Address> = ipv6.and_then(|s| {
-            match s.parse() {
+        let local_ipv6: Option<Ipv6Address> = ipv6
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| match s.parse() {
                 Ok(addr) => Some(addr),
                 Err(e) => {
                     log::warn!("Invalid IPv6 address '{}': {}", s, e);
                     None
                 }
-            }
-        });
+            });
+
+        if local_ipv4.is_none() && local_ipv6.is_none() {
+            log::warn!("No valid IP addresses configured, using fallback IPv4 10.0.0.1");
+            local_ipv4 = Some(Ipv4Address::new(10, 0, 0, 1));
+        }
 
         let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         // Use the same device instance for Interface creation
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
         iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(IpAddress::Ipv4(local_ipv4), 32)).ok();
+            if let Some(v4) = local_ipv4 {
+                addrs.push(IpCidr::new(IpAddress::Ipv4(v4), 32)).ok();
+            }
             if let Some(v6) = local_ipv6 {
                 addrs.push(IpCidr::new(IpAddress::Ipv6(v6), 128)).ok();
             }
@@ -62,6 +73,7 @@ impl NetworkStack {
             iface,
             sockets,
             local_ipv4,
+            local_ipv6,
         }
     }
 
@@ -158,8 +170,32 @@ impl NetworkStack {
         self.device.take_packet()
     }
 
-    // UDP socket methods for DNS resolution
-    pub fn create_udp_socket(&mut self, local_port: u16) -> Result<smoltcp::iface::SocketHandle, StackError> {
+    fn local_addr_for_remote(&self, remote_ip: IpAddress) -> Result<IpAddress, StackError> {
+        match remote_ip {
+            IpAddress::Ipv4(_) => self.local_ipv4
+                .map(IpAddress::Ipv4)
+                .ok_or_else(|| StackError::SocketError("No IPv4 address configured".into())),
+            IpAddress::Ipv6(_) => self.local_ipv6
+                .map(IpAddress::Ipv6)
+                .ok_or_else(|| StackError::SocketError("No IPv6 address configured".into())),
+        }
+    }
+
+    fn local_addr_default(&self) -> Result<IpAddress, StackError> {
+        if let Some(v4) = self.local_ipv4 {
+            return Ok(IpAddress::Ipv4(v4));
+        }
+        if let Some(v6) = self.local_ipv6 {
+            return Ok(IpAddress::Ipv6(v6));
+        }
+        Err(StackError::SocketError("No IP address configured".into()))
+    }
+
+    fn bind_udp_socket(
+        &mut self,
+        local_addr: IpAddress,
+        local_port: u16,
+    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
         let rx_buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; 16],
             vec![0; 8192],
@@ -170,12 +206,30 @@ impl NetworkStack {
         );
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
-        let local_endpoint = IpEndpoint::new(IpAddress::Ipv4(self.local_ipv4), local_port);
+        let local_endpoint = IpEndpoint::new(local_addr, local_port);
         socket
             .bind(local_endpoint)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))?;
 
         Ok(self.sockets.add(socket))
+    }
+
+    // UDP socket methods for DNS resolution and UDP associate
+    pub fn create_udp_socket_for(
+        &mut self,
+        local_port: u16,
+        remote_ip: IpAddress,
+    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
+        let local_addr = self.local_addr_for_remote(remote_ip)?;
+        self.bind_udp_socket(local_addr, local_port)
+    }
+
+    pub fn create_udp_socket_default(
+        &mut self,
+        local_port: u16,
+    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
+        let local_addr = self.local_addr_default()?;
+        self.bind_udp_socket(local_addr, local_port)
     }
 
     pub fn udp_send(

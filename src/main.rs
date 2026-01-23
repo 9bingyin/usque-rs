@@ -143,44 +143,55 @@ async fn register_device(
     let endpoint_v4 = updated.config.peers.as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
-        .and_then(|e| e.v4.clone())
-        .unwrap_or_default();
+        .and_then(|e| e.v4.clone());
 
     let endpoint_v6 = updated.config.peers.as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
-        .and_then(|e| e.v6.clone())
-        .unwrap_or_default();
+        .and_then(|e| e.v6.clone());
 
     let endpoint_pub_key = updated.config.peers.as_ref()
         .and_then(|p| p.first())
-        .map(|p| p.public_key.clone())
-        .unwrap_or_default();
+        .map(|p| p.public_key.clone());
 
     let ipv4 = updated.config.interface_config.as_ref()
         .and_then(|i| i.addresses.as_ref())
-        .and_then(|a| a.v4.clone())
-        .unwrap_or_default();
+        .and_then(|a| a.v4.clone());
 
     let ipv6 = updated.config.interface_config.as_ref()
         .and_then(|i| i.addresses.as_ref())
-        .and_then(|a| a.v6.clone())
-        .unwrap_or_default();
+        .and_then(|a| a.v6.clone());
 
     let license = updated.account.license.clone()
         .unwrap_or_default();
 
+    if endpoint_v4.as_deref().unwrap_or("").is_empty()
+        && endpoint_v6.as_deref().unwrap_or("").is_empty()
+    {
+        return Err("No endpoint info in response".into());
+    }
+
+    let endpoint_pub_key = endpoint_pub_key
+        .filter(|k| !k.trim().is_empty())
+        .ok_or("No endpoint public key in response")?;
+
+    if ipv4.as_deref().unwrap_or("").is_empty()
+        && ipv6.as_deref().unwrap_or("").is_empty()
+    {
+        return Err("No interface addresses in response".into());
+    }
+
     let cfg = config::Config {
         private_key: base64::engine::general_purpose::STANDARD
             .encode(&key_pair.private_key_der),
-        endpoint_v4,
-        endpoint_v6,
+        endpoint_v4: endpoint_v4.unwrap_or_default(),
+        endpoint_v6: endpoint_v6.unwrap_or_default(),
         endpoint_pub_key,
         license,
         id: updated.id.clone(),
         access_token: token,
-        ipv4,
-        ipv6,
+        ipv4: ipv4.unwrap_or_default(),
+        ipv6: ipv6.unwrap_or_default(),
     };
 
     cfg.save(config_path)?;
@@ -232,32 +243,45 @@ async fn enroll_device(
     let endpoint_v4 = updated.config.peers.as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
-        .and_then(|e| e.v4.clone())
-        .unwrap_or(cfg.endpoint_v4.clone());
+        .and_then(|e| e.v4.clone());
 
     let endpoint_v6 = updated.config.peers.as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
-        .and_then(|e| e.v6.clone())
-        .unwrap_or(cfg.endpoint_v6.clone());
+        .and_then(|e| e.v6.clone());
 
     let endpoint_pub_key = updated.config.peers.as_ref()
         .and_then(|p| p.first())
-        .map(|p| p.public_key.clone())
-        .unwrap_or(cfg.endpoint_pub_key.clone());
+        .map(|p| p.public_key.clone());
 
     let ipv4 = updated.config.interface_config.as_ref()
         .and_then(|i| i.addresses.as_ref())
-        .and_then(|a| a.v4.clone())
-        .unwrap_or(cfg.ipv4.clone());
+        .and_then(|a| a.v4.clone());
 
     let ipv6 = updated.config.interface_config.as_ref()
         .and_then(|i| i.addresses.as_ref())
-        .and_then(|a| a.v6.clone())
-        .unwrap_or(cfg.ipv6.clone());
+        .and_then(|a| a.v6.clone());
 
     let license = updated.account.license.clone()
         .unwrap_or(cfg.license.clone());
+
+    let endpoint_v4 = endpoint_v4.unwrap_or(cfg.endpoint_v4.clone());
+    let endpoint_v6 = endpoint_v6.unwrap_or(cfg.endpoint_v6.clone());
+    if endpoint_v4.trim().is_empty() && endpoint_v6.trim().is_empty() {
+        return Err("No endpoint info in response or existing config".into());
+    }
+
+    let endpoint_pub_key = endpoint_pub_key
+        .unwrap_or(cfg.endpoint_pub_key.clone());
+    if endpoint_pub_key.trim().is_empty() {
+        return Err("No endpoint public key in response or existing config".into());
+    }
+
+    let ipv4 = ipv4.unwrap_or(cfg.ipv4.clone());
+    let ipv6 = ipv6.unwrap_or(cfg.ipv6.clone());
+    if ipv4.trim().is_empty() && ipv6.trim().is_empty() {
+        return Err("No interface addresses in response or existing config".into());
+    }
 
     let new_cfg = config::Config {
         private_key: base64::engine::general_purpose::STANDARD
@@ -301,15 +325,30 @@ async fn run_socks_server(
     let (cert_der, key_der) = crypto::generate_self_signed_cert(&signing_key)?;
     println!("Generated self-signed certificate");
 
-    let endpoint_ip = cfg.endpoint_v4
-        .split(':')
-        .next()
-        .unwrap_or(&cfg.endpoint_v4);
-    let endpoint: SocketAddr = format!("{}:{}", endpoint_ip, connect_port).parse()?;
+    let endpoint_raw = if !cfg.endpoint_v4.trim().is_empty() {
+        cfg.endpoint_v4.as_str()
+    } else {
+        cfg.endpoint_v6.as_str()
+    };
+    if endpoint_raw.trim().is_empty() {
+        return Err("No endpoint configured".into());
+    }
+    let endpoint = if let Ok(addr) = endpoint_raw.parse::<SocketAddr>() {
+        SocketAddr::new(addr.ip(), connect_port)
+    } else if let Ok(ip) = endpoint_raw.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, connect_port)
+    } else {
+        return Err(format!("Invalid endpoint address: {}", endpoint_raw).into());
+    };
     println!("Will connect to endpoint: {}", endpoint);
     println!("Using SNI: {}", sni);
 
-    let endpoint_pub_key = cfg.get_endpoint_pub_key_der().ok();
+    let endpoint_pub_key = if cfg.endpoint_pub_key.trim().is_empty() {
+        log::warn!("Endpoint public key missing, pinning disabled");
+        None
+    } else {
+        Some(cfg.get_endpoint_pub_key_der()?)
+    };
 
     // Parse DNS servers
     let dns_addrs = tunnel::dns::parse_dns_servers(&dns_servers)?;
@@ -327,7 +366,7 @@ async fn run_socks_server(
         sni: sni.to_string(),
         endpoint_pub_key,
         ipv4: cfg.ipv4.clone(),
-        ipv6: Some(cfg.ipv6.clone()),
+        ipv6: if cfg.ipv6.trim().is_empty() { None } else { Some(cfg.ipv6.clone()) },
         dns_servers: dns_addrs,
         keepalive,
         initial_packet_size,

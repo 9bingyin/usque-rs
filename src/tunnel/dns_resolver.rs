@@ -1,4 +1,4 @@
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::Resolver;
 use std::net::IpAddr;
@@ -11,14 +11,21 @@ pub struct CachingDnsResolver {
 }
 
 impl CachingDnsResolver {
-    pub fn new(_dns_servers: &[IpAddr]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(dns_servers: &[IpAddr]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut opts = ResolverOpts::default();
         opts.cache_size = 1024;
         opts.timeout = Duration::from_secs(5);
         opts.attempts = 2;
 
+        let config = if dns_servers.is_empty() {
+            ResolverConfig::cloudflare()
+        } else {
+            let name_servers = NameServerConfigGroup::from_ips_clear(dns_servers, 53, true);
+            ResolverConfig::from_parts(None, vec![], name_servers)
+        };
+
         let resolver = Resolver::builder_with_config(
-            ResolverConfig::cloudflare(),
+            config,
             TokioConnectionProvider::default(),
         )
         .with_options(opts)
