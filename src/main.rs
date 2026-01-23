@@ -32,6 +32,12 @@ enum Commands {
         port: u16,
         #[arg(short, long, default_value = "config.json")]
         config: String,
+        /// Username for SOCKS5 authentication (optional)
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Password for SOCKS5 authentication (required if username is set)
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 
@@ -44,8 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Register { config, model, locale } => {
             register_device(&config, &model, &locale).await?;
         }
-        Commands::Socks { bind, port, config } => {
-            run_socks_server(&bind, port, &config).await?;
+        Commands::Socks { bind, port, config, username, password } => {
+            run_socks_server(&bind, port, &config, username, password).await?;
         }
     }
 
@@ -137,6 +143,8 @@ async fn run_socks_server(
     bind: &str,
     port: u16,
     config_path: &str,
+    username: Option<String>,
+    password: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
@@ -170,7 +178,19 @@ async fn run_socks_server(
     println!("Tunnel manager started (will auto-reconnect)");
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
-    let server = proxy::Socks5Server::new(addr, tunnel_manager);
+
+    let server = match (username, password) {
+        (Some(user), Some(pass)) => {
+            println!("SOCKS5 authentication enabled");
+            proxy::Socks5Server::with_auth(addr, tunnel_manager, user, pass)
+        }
+        (Some(_), None) => {
+            return Err("Password is required when username is set".into());
+        }
+        _ => {
+            proxy::Socks5Server::new(addr, tunnel_manager)
+        }
+    };
 
     println!("Starting SOCKS5 server on {}:{}", bind, port);
     server.run().await?;
