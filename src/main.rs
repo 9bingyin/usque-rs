@@ -78,8 +78,8 @@ enum Commands {
         /// Congestion control algorithm (reno, cubic, bbr, bbr2)
         #[arg(long = "cc", default_value = "bbr2")]
         congestion_control: String,
-        /// TCP socket buffer size per direction in bytes
-        #[arg(long = "tcp-buffer-size", default_value = "262144")]
+        /// TCP socket buffer size per direction in bytes (default 1MB for high throughput)
+        #[arg(long = "tcp-buffer-size", default_value = "1048576")]
         tcp_buffer_size: usize,
         /// QUIC idle timeout in milliseconds
         #[arg(long = "quic-idle-timeout-ms", default_value = "30000")]

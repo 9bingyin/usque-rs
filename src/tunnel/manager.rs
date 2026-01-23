@@ -218,13 +218,15 @@ struct IncomingDatagram {
 
 const CMD_CHANNEL_CAPACITY: usize = 256;
 const UDP_DATA_CHANNEL_CAPACITY: usize = 2048;
-const INCOMING_DGRAM_CAPACITY: usize = 1024;
+// Increased for high-concurrency scenarios (64+ parallel connections)
+const INCOMING_DGRAM_CAPACITY: usize = 4096;
 const UDP_RECV_BUFFER_SIZE: usize = 65535;
 const MAX_TCP_READ_CHUNK: usize = 64 * 1024;
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-const MAX_PENDING_DATA: usize = 512 * 1024; // 512KB per socket
-const MAX_PENDING_TO_CLIENT: usize = 512 * 1024; // 512KB per socket
+// Backpressure limits per socket (1MB each for high throughput, ref: quic-go recommends 7.5MB system buffer)
+const MAX_PENDING_DATA: usize = 1024 * 1024; // 1MB per socket
+const MAX_PENDING_TO_CLIENT: usize = 1024 * 1024; // 1MB per socket
 
 enum DeliverError {
     Backpressure,
