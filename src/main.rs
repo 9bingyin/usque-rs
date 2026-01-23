@@ -81,11 +81,11 @@ enum Commands {
         /// TCP socket buffer size per direction in bytes (default 1MB for high throughput)
         #[arg(long = "tcp-buffer-size", default_value = "1048576")]
         tcp_buffer_size: usize,
-        /// QUIC idle timeout in milliseconds
-        #[arg(long = "quic-idle-timeout-ms", default_value = "30000")]
+        /// QUIC idle timeout in milliseconds (should be > 2x keepalive period)
+        #[arg(long = "quic-idle-timeout-ms", default_value = "90000")]
         quic_idle_timeout_ms: u64,
-        /// Tunnel worker count (0 = auto)
-        #[arg(long = "tunnel-workers", default_value = "0")]
+        /// Tunnel worker count (0 = auto, default 1 to avoid abusing upstream nodes)
+        #[arg(long = "tunnel-workers", default_value = "1")]
         tunnel_workers: usize,
     },
 }
