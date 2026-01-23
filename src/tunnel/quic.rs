@@ -36,7 +36,7 @@ impl std::fmt::Display for CongestionControl {
 }
 
 impl CongestionControl {
-    fn to_quiche(&self) -> quiche::CongestionControlAlgorithm {
+    fn to_quiche(self) -> quiche::CongestionControlAlgorithm {
         match self {
             CongestionControl::Reno => quiche::CongestionControlAlgorithm::Reno,
             CongestionControl::Cubic => quiche::CongestionControlAlgorithm::CUBIC,

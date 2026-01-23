@@ -5,6 +5,7 @@ use crate::tunnel::dns::{
 use crate::tunnel::masque::MasqueTunnel;
 use crate::tunnel::quic;
 use crate::tunnel::stack::NetworkStack;
+use rand::Rng;
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
 use std::collections::HashMap;
@@ -13,6 +14,38 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::tunnel::quic::CongestionControl;
+
+// Exponential backoff with jitter for reconnection
+struct ExponentialBackoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+    jitter_factor: f64,
+}
+
+impl ExponentialBackoff {
+    fn new() -> Self {
+        Self {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+            current: Duration::from_secs(1),
+            jitter_factor: 0.5,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = std::cmp::min(self.current * 2, self.max);
+        let mut rng = rand::rng();
+        let jitter = rng.random_range(-self.jitter_factor..self.jitter_factor);
+        let jittered = delay.as_secs_f64() * (1.0 + jitter);
+        Duration::from_secs_f64(jittered.max(0.1))
+    }
+
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
 
 // Connection parameters for establishing and reconnecting tunnel
 pub struct ConnectionParams {
@@ -65,6 +98,19 @@ pub enum ManagerCommand {
     UdpUnregister {
         local_port: u16,
     },
+    // Get TCP socket state
+    GetSocketState {
+        handle: SocketHandle,
+        response: oneshot::Sender<TcpSocketState>,
+    },
+}
+
+// TCP socket connection state
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TcpSocketState {
+    Connecting,
+    Established,
+    Closed,
 }
 
 // Channels for a single TCP socket
@@ -76,7 +122,6 @@ pub struct SocketChannels {
 
 // Internal state for each socket
 struct SocketState {
-    handle: SocketHandle,
     to_client: mpsc::Sender<Vec<u8>>,
     from_client: mpsc::Receiver<Vec<u8>>,
     pending_data: Vec<u8>,
@@ -101,7 +146,10 @@ struct DnsQueryGroup {
 struct UdpSessionState {
     handle: SocketHandle,
     to_client: mpsc::Sender<(IpAddress, u16, Vec<u8>)>,
+    last_activity: Instant,
 }
+
+const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -122,7 +170,7 @@ impl TunnelManager {
         params: ConnectionParams,
         mut cmd_rx: mpsc::Receiver<ManagerCommand>,
     ) {
-        let reconnect_delay = Duration::from_secs(1);
+        let mut backoff = ExponentialBackoff::new();
 
         loop {
             log::info!("Establishing MASQUE connection to {}", params.endpoint);
@@ -130,9 +178,9 @@ impl TunnelManager {
             match Self::establish_connection(&params).await {
                 Ok((tunnel, stack)) => {
                     log::info!("Tunnel connected successfully");
+                    backoff.reset();
 
-                    // Run main loop until connection is closed
-                    Self::run_loop(tunnel, stack, &mut cmd_rx, &params.dns_servers).await;
+                    Self::run_loop(tunnel, stack, &mut cmd_rx, &params.dns_servers, params.keepalive).await;
 
                     log::warn!("Connection lost, reconnecting...");
                 }
@@ -141,7 +189,9 @@ impl TunnelManager {
                 }
             }
 
-            tokio::time::sleep(reconnect_delay).await;
+            let delay = backoff.next_delay();
+            log::info!("Reconnecting in {:?}", delay);
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -212,7 +262,23 @@ impl TunnelManager {
     }
 
     pub async fn close(&self, handle: SocketHandle) {
-        let _ = self.cmd_tx.send(ManagerCommand::Close { handle }).await;
+        if let Err(e) = self.cmd_tx.send(ManagerCommand::Close { handle }).await {
+            log::debug!("Failed to send close command: {}", e);
+        }
+    }
+
+    pub async fn get_socket_state(&self, handle: SocketHandle) -> TcpSocketState {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        if self.cmd_tx
+            .send(ManagerCommand::GetSocketState { handle, response: response_tx })
+            .await
+            .is_err()
+        {
+            return TcpSocketState::Closed;
+        }
+
+        response_rx.await.unwrap_or(TcpSocketState::Closed)
     }
 
     pub fn cmd_sender(&self) -> mpsc::Sender<ManagerCommand> {
@@ -239,6 +305,7 @@ impl TunnelManager {
         mut stack: NetworkStack,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         dns_servers: &[IpAddress],
+        keepalive_secs: u64,
     ) {
         let socket = tunnel.quic_conn.socket.clone();
         let local_addr = tunnel.quic_conn.local_addr;
@@ -249,9 +316,9 @@ impl TunnelManager {
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
         let mut udp_sessions: HashMap<u16, UdpSessionState> = HashMap::new(); // local_port -> session
 
-        // Keepalive tracking - send PING frames every 30 seconds
+        // Keepalive tracking
         let mut last_keepalive = Instant::now();
-        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        let keepalive_interval = Duration::from_secs(keepalive_secs);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
         loop {
@@ -267,8 +334,6 @@ impl TunnelManager {
             let poll_timeout = quic_timeout.min(MAX_POLL_INTERVAL);
 
             tokio::select! {
-                biased;
-
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
                     Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, dns_servers, cmd);
@@ -286,7 +351,7 @@ impl TunnelManager {
                 // Dynamic timeout - replaces fixed interval polling
                 _ = tokio::time::sleep(poll_timeout) => {
                     tunnel.quic_conn.conn.on_timeout();
-                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, KEEPALIVE_INTERVAL).await;
+                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, keepalive_interval).await;
                 }
             }
         }
@@ -311,7 +376,9 @@ impl TunnelManager {
                 response,
             } => {
                 let result = Self::create_connection(stack, sockets, remote_ip, remote_port, local_port);
-                let _ = response.send(result);
+                if response.send(result).is_err() {
+                    log::warn!("Failed to send connect response: receiver dropped");
+                }
             }
             ManagerCommand::Close { handle } => {
                 Self::close_connection(stack, sockets, handle);
@@ -331,6 +398,12 @@ impl TunnelManager {
             }
             ManagerCommand::UdpUnregister { local_port } => {
                 Self::unregister_udp_session(stack, udp_sessions, local_port);
+            }
+            ManagerCommand::GetSocketState { handle, response } => {
+                let state = Self::get_tcp_socket_state(stack, sockets, handle);
+                if response.send(state).is_err() {
+                    log::debug!("Failed to send socket state response: receiver dropped");
+                }
             }
         }
     }
@@ -353,7 +426,6 @@ impl TunnelManager {
         let (from_client_tx, from_client_rx) = mpsc::channel(8192);
 
         let state = SocketState {
-            handle,
             to_client: to_client_tx,
             from_client: from_client_rx,
             pending_data: Vec::new(),
@@ -378,6 +450,24 @@ impl TunnelManager {
         sockets.remove(&handle);
     }
 
+    fn get_tcp_socket_state(
+        stack: &mut NetworkStack,
+        sockets: &HashMap<SocketHandle, SocketState>,
+        handle: SocketHandle,
+    ) -> TcpSocketState {
+        if !sockets.contains_key(&handle) {
+            return TcpSocketState::Closed;
+        }
+        if !stack.tcp_is_active(handle) {
+            return TcpSocketState::Closed;
+        }
+        if stack.tcp_may_send(handle) && stack.tcp_may_recv(handle) {
+            TcpSocketState::Established
+        } else {
+            TcpSocketState::Connecting
+        }
+    }
+
     fn register_udp_session(
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
@@ -390,10 +480,13 @@ impl TunnelManager {
         udp_sessions.insert(local_port, UdpSessionState {
             handle,
             to_client: tx,
+            last_activity: Instant::now(),
         });
 
         log::debug!("UDP session registered on port {}", local_port);
-        let _ = response.send(rx);
+        if response.send(rx).is_err() {
+            log::warn!("Failed to send UDP register response: receiver dropped");
+        }
     }
 
     fn send_udp_data(
@@ -404,7 +497,8 @@ impl TunnelManager {
         local_port: u16,
         data: &[u8],
     ) {
-        if let Some(session) = udp_sessions.get(&local_port) {
+        if let Some(session) = udp_sessions.get_mut(&local_port) {
+            session.last_activity = Instant::now();
             if let Err(e) = stack.udp_send(session.handle, remote_ip, remote_port, data) {
                 log::warn!("UDP send failed: {:?}", e);
             }
@@ -555,17 +649,20 @@ impl TunnelManager {
             }
 
             let mut buf = [0u8; 65535];
-            if let Ok((len, endpoint)) = stack.udp_recv(handle, &mut buf) {
-                if len > 0 {
-                    let remote_ip = endpoint.endpoint.addr;
-                    let remote_port = endpoint.endpoint.port;
+            if let Ok((len, endpoint)) = stack.udp_recv(handle, &mut buf)
+                && len > 0
+            {
+                let remote_ip = endpoint.endpoint.addr;
+                let remote_port = endpoint.endpoint.port;
 
-                    if let Some(session) = udp_sessions.get(&local_port) {
-                        let _ = session.to_client.try_send((
-                            remote_ip,
-                            remote_port,
-                            buf[..len].to_vec(),
-                        ));
+                if let Some(session) = udp_sessions.get_mut(&local_port) {
+                    session.last_activity = Instant::now();
+                    if session.to_client.try_send((
+                        remote_ip,
+                        remote_port,
+                        buf[..len].to_vec(),
+                    )).is_err() {
+                        log::debug!("UDP session channel full or closed for port {}", local_port);
                     }
                 }
             }
@@ -618,8 +715,10 @@ impl TunnelManager {
             }
 
             // Send response and remove group
-            if let Some(group) = dns_groups.remove(&group_id) {
-                let _ = group.response.send(res);
+            if let Some(group) = dns_groups.remove(&group_id)
+                && group.response.send(res).is_err()
+            {
+                log::debug!("Failed to send DNS response: receiver dropped");
             }
         }
     }
@@ -647,7 +746,7 @@ impl TunnelManager {
         loop {
             match tunnel.recv_datagram(&mut dgram_buf) {
                 Ok(len) if len > 0 => {
-                    stack.inject_packet(dgram_buf[..len].to_vec());
+                    stack.inject_packet(&dgram_buf[..len]);
                 }
                 _ => break,
             }
@@ -674,7 +773,10 @@ impl TunnelManager {
             *last_keepalive = Instant::now();
         }
 
-        stack.poll();
+        if !stack.poll() {
+            // smoltcp panicked, skip this poll cycle
+            return;
+        }
 
         // Process DNS responses
         Self::process_dns_responses(stack, dns_queries, dns_groups);
@@ -703,8 +805,23 @@ impl TunnelManager {
                 }
             }
             // Send timeout error
-            if let Some(group) = dns_groups.remove(&group_id) {
-                let _ = group.response.send(Err(DnsError::Timeout));
+            if let Some(group) = dns_groups.remove(&group_id)
+                && group.response.send(Err(DnsError::Timeout)).is_err()
+            {
+                log::debug!("Failed to send DNS timeout response: receiver dropped");
+            }
+        }
+
+        // Cleanup stale UDP sessions
+        let stale_ports: Vec<u16> = udp_sessions
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_activity) > UDP_SESSION_TIMEOUT)
+            .map(|(port, _)| *port)
+            .collect();
+        for port in stale_ports {
+            if let Some(session) = udp_sessions.remove(&port) {
+                stack.remove_socket(session.handle);
+                log::debug!("Cleaned up stale UDP session on port {}", port);
             }
         }
 
@@ -719,22 +836,21 @@ impl TunnelManager {
 
             if stack.tcp_may_recv(handle) {
                 let mut buf = [0u8; 65535];
-                if let Ok(n) = stack.tcp_recv(handle, &mut buf) {
-                    if n > 0 {
-                        if let Some(state) = sockets.get(&handle) {
-                            let _ = state.to_client.try_send(buf[..n].to_vec());
-                        }
-                    }
+                if let Ok(n) = stack.tcp_recv(handle, &mut buf)
+                    && n > 0
+                    && let Some(state) = sockets.get(&handle)
+                    && state.to_client.try_send(buf[..n].to_vec()).is_err()
+                {
+                    log::debug!("TCP channel full or closed for socket {:?}", handle);
                 }
             }
 
             if let Some(state) = sockets.get_mut(&handle) {
-                if !state.pending_data.is_empty() && stack.tcp_may_send(handle) {
-                    if let Ok(sent) = stack.tcp_send(handle, &state.pending_data) {
-                        if sent > 0 {
-                            state.pending_data.drain(..sent);
-                        }
-                    }
+                if !state.pending_data.is_empty() && stack.tcp_may_send(handle)
+                    && let Ok(sent) = stack.tcp_send(handle, &state.pending_data)
+                    && sent > 0
+                {
+                    state.pending_data.drain(..sent);
                 }
 
                 while let Ok(data) = state.from_client.try_recv() {
@@ -763,9 +879,8 @@ impl TunnelManager {
         while let Some(packet) = stack.take_packet() {
             match tunnel.send_datagram(&packet) {
                 Ok(Some(icmp)) => {
-                    // Inject ICMP Packet Too Big message back to stack
                     log::debug!("Injecting ICMP Packet Too Big ({} bytes)", icmp.len());
-                    stack.inject_packet(icmp);
+                    stack.inject_packet(&icmp);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -785,26 +900,32 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
     ) {
-        stack.poll();
+        if !stack.poll() {
+            return;
+        }
 
         let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
         for handle in handles {
             if stack.tcp_may_recv(handle) {
                 let mut buf = [0u8; 65535];
-                if let Ok(n) = stack.tcp_recv(handle, &mut buf) {
-                    if n > 0 {
-                        if let Some(state) = sockets.get(&handle) {
-                            let _ = state.to_client.try_send(buf[..n].to_vec());
-                        }
-                    }
+                if let Ok(n) = stack.tcp_recv(handle, &mut buf)
+                    && n > 0
+                    && let Some(state) = sockets.get(&handle)
+                    && state.to_client.try_send(buf[..n].to_vec()).is_err()
+                {
+                    log::debug!("TCP channel full or closed for socket {:?}", handle);
                 }
             }
         }
 
         while let Some(packet) = stack.take_packet() {
-            let _ = tunnel.send_datagram(&packet);
+            if let Err(e) = tunnel.send_datagram(&packet) {
+                log::debug!("Failed to send datagram in process_after_recv: {:?}", e);
+            }
         }
 
-        let _ = tunnel.quic_conn.send_async().await;
+        if let Err(e) = tunnel.quic_conn.send_async().await {
+            log::debug!("Failed to send QUIC data in process_after_recv: {:?}", e);
+        }
     }
 }

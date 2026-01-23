@@ -6,6 +6,8 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use thiserror::Error;
 
+const DEFAULT_TCP_BUFFER_SIZE: usize = 1048576; // 1MB
+
 #[derive(Error, Debug)]
 pub enum StackError {
     #[error("socket error: {0}")]
@@ -19,7 +21,6 @@ pub struct NetworkStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     local_ipv4: Ipv4Address,
-    local_ipv6: Option<Ipv6Address>,
 }
 
 impl NetworkStack {
@@ -47,23 +48,30 @@ impl NetworkStack {
             iface,
             sockets,
             local_ipv4,
-            local_ipv6,
         }
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
         let timestamp = Instant::now();
-        self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+        }));
+        if result.is_err() {
+            log::error!("smoltcp poll panicked, recovering...");
+            return false;
+        }
+        true
     }
 
     pub fn create_tcp_socket(&mut self) -> smoltcp::iface::SocketHandle {
-        // BDP: 1Gbps * 10ms RTT = 1.25MB, use 1MB for low latency scenario
-        let rx_buffer = SocketBuffer::new(vec![0; 1048576]); // 1MB
-        let tx_buffer = SocketBuffer::new(vec![0; 1048576]); // 1MB
+        self.create_tcp_socket_with_buffer(DEFAULT_TCP_BUFFER_SIZE)
+    }
+
+    pub fn create_tcp_socket_with_buffer(&mut self, buffer_size: usize) -> smoltcp::iface::SocketHandle {
+        let rx_buffer = SocketBuffer::new(vec![0; buffer_size]);
+        let tx_buffer = SocketBuffer::new(vec![0; buffer_size]);
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
-        // Disable Nagle algorithm for lower latency
         socket.set_nagle_enabled(false);
-        // Disable ACK delay for faster acknowledgments
         socket.set_ack_delay(None);
         self.sockets.add(socket)
     }
@@ -128,7 +136,7 @@ impl NetworkStack {
         self.sockets.remove(handle);
     }
 
-    pub fn inject_packet(&mut self, packet: Vec<u8>) {
+    pub fn inject_packet(&mut self, packet: &[u8]) {
         self.device.inject_packet(packet);
     }
 

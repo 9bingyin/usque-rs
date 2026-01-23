@@ -11,9 +11,11 @@ pub use hickory_proto::rr::RecordType as DnsRecordType;
 
 // DNS constants
 const DNS_PORT: u16 = 53;
+const DNS_PORT_RANGE_START: u16 = 49152;
+const DNS_PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 
 static DNS_TRANSACTION_ID: AtomicU16 = AtomicU16::new(1);
-static DNS_LOCAL_PORT: AtomicU16 = AtomicU16::new(50000);
+static DNS_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
 #[derive(Error, Debug)]
 pub enum DnsError {
@@ -137,7 +139,8 @@ pub fn parse_dns_response(data: &[u8], expected_id: u16) -> Result<Vec<IpAddress
 }
 
 pub fn get_dns_local_port() -> u16 {
-    DNS_LOCAL_PORT.fetch_add(1, Ordering::Relaxed)
+    let offset = DNS_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % DNS_PORT_RANGE_SIZE;
+    DNS_PORT_RANGE_START + offset
 }
 
 pub fn dns_port() -> u16 {

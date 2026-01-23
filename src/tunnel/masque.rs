@@ -110,16 +110,16 @@ impl MasqueTunnel {
 
         // Check if datagram exceeds maximum writable length
         let max_dgram_len = self.quic_conn.conn.dgram_max_writable_len();
-        if let Some(max_len) = max_dgram_len {
-            if buf.len() > max_len {
-                log::debug!(
-                    "Datagram too large: {} bytes > max {} bytes, generating ICMP Packet Too Big",
-                    buf.len(),
-                    max_len
-                );
-                let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
-                return Ok(icmp);
-            }
+        if let Some(max_len) = max_dgram_len
+            && buf.len() > max_len
+        {
+            log::debug!(
+                "Datagram too large: {} bytes > max {} bytes, generating ICMP Packet Too Big",
+                buf.len(),
+                max_len
+            );
+            let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
+            return Ok(icmp);
         }
 
         match self.quic_conn.conn.dgram_send(&buf) {
@@ -399,27 +399,22 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), MasqueError> {
 
     let value = match len {
         1 => (buf[0] & 0x3f) as u64,
-        2 => {
-            let v = ((buf[0] & 0x3f) as u64) << 8 | buf[1] as u64;
-            v
-        }
+        2 => ((buf[0] & 0x3f) as u64) << 8 | buf[1] as u64,
         4 => {
-            let v = ((buf[0] & 0x3f) as u64) << 24
+            ((buf[0] & 0x3f) as u64) << 24
                 | (buf[1] as u64) << 16
                 | (buf[2] as u64) << 8
-                | buf[3] as u64;
-            v
+                | buf[3] as u64
         }
         8 => {
-            let v = ((buf[0] & 0x3f) as u64) << 56
+            ((buf[0] & 0x3f) as u64) << 56
                 | (buf[1] as u64) << 48
                 | (buf[2] as u64) << 40
                 | (buf[3] as u64) << 32
                 | (buf[4] as u64) << 24
                 | (buf[5] as u64) << 16
                 | (buf[6] as u64) << 8
-                | buf[7] as u64;
-            v
+                | buf[7] as u64
         }
         _ => unreachable!(),
     };
@@ -695,8 +690,8 @@ fn calculate_icmpv6_checksum(src: &[u8], dst: &[u8], icmp_data: &[u8]) -> u16 {
 
     // Pseudo-header: ICMPv6 length
     let len = icmp_data.len() as u32;
-    sum += (len >> 16) as u32;
-    sum += (len & 0xffff) as u32;
+    sum += len >> 16;
+    sum += len & 0xffff;
 
     // Pseudo-header: Next Header (58 for ICMPv6)
     sum += 58;

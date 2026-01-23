@@ -13,7 +13,7 @@ pub enum ConfigError {
     CryptoError(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub private_key: String,
     pub endpoint_v4: String,
@@ -83,21 +83,5 @@ impl Config {
         // Fallback to PKCS#8 format
         SigningKey::from_pkcs8_der(&der)
             .map_err(|e| ConfigError::CryptoError(e.to_string()))
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            private_key: String::new(),
-            endpoint_v4: String::new(),
-            endpoint_v6: String::new(),
-            endpoint_pub_key: String::new(),
-            license: String::new(),
-            id: String::new(),
-            access_token: String::new(),
-            ipv4: String::new(),
-            ipv6: String::new(),
-        }
     }
 }

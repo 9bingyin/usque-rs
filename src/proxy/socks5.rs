@@ -1,17 +1,53 @@
-use crate::tunnel::manager::{ManagerCommand, SocketChannels, TunnelManager};
+use crate::tunnel::manager::{ManagerCommand, SocketChannels, TcpSocketState, TunnelManager};
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{parse_udp_request, new_udp_header, Socks5Command};
+use smoltcp::iface::SocketHandle;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(40000);
+static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+const PORT_RANGE_START: u16 = 49152;
+const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn get_local_port() -> u16 {
+    let offset = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PORT_RANGE_SIZE;
+    PORT_RANGE_START + offset
+}
+
+async fn wait_for_connection(
+    manager: &TunnelManager,
+    handle: SocketHandle,
+) -> Result<(), Socks5Error> {
+    let start = Instant::now();
+
+    loop {
+        let state = manager.get_socket_state(handle).await;
+
+        match state {
+            TcpSocketState::Established => return Ok(()),
+            TcpSocketState::Closed => {
+                return Err(Socks5Error::ConnectionFailed("Connection closed".into()));
+            }
+            TcpSocketState::Connecting => {
+                if start.elapsed() > CONNECT_TIMEOUT {
+                    return Err(Socks5Error::Timeout);
+                }
+                let elapsed = start.elapsed().as_millis() as u64;
+                let wait = if elapsed < 1000 { 10 } else { 50 };
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum Socks5Error {
@@ -154,21 +190,24 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
     log::debug!("TCP CONNECT to {:?}:{}", remote_ip, remote_port);
 
     // Create connection through tunnel
-    let local_port = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let local_port = get_local_port();
     let channels = manager
         .connect(remote_ip, remote_port, local_port)
         .await
-        .map_err(|e| Socks5Error::ConnectionFailed(e))?;
+        .map_err(Socks5Error::ConnectionFailed)?;
 
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for connection with adaptive polling
+    let handle = channels.handle;
+    if let Err(e) = wait_for_connection(&manager, handle).await {
+        manager.close(handle).await;
+        return Err(e);
+    }
 
     // Send success reply
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut stream = proto.reply_success(reply_addr).await?;
 
     // Forward data
-    let handle = channels.handle;
     let result = forward_tcp_data(&mut stream, channels).await;
 
     // Cleanup
@@ -354,7 +393,7 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
     log::debug!("UDP ASSOCIATE: relay socket bound to {}", udp_addr);
 
     // Register UDP session with manager
-    let local_port = LOCAL_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let local_port = get_local_port();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
     manager.cmd_sender()
@@ -386,9 +425,12 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
     ).await;
 
     // Cleanup
-    let _ = manager.cmd_sender()
+    if let Err(e) = manager.cmd_sender()
         .send(ManagerCommand::UdpUnregister { local_port })
-        .await;
+        .await
+    {
+        log::debug!("Failed to unregister UDP session: {}", e);
+    }
 
     result
 }
@@ -428,13 +470,15 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
                                 log::debug!("UDP fragmentation not supported");
                                 continue;
                             }
-                            if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
-                                let _ = cmd_sender.send(ManagerCommand::UdpSend {
+                            if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await
+                                && let Err(e) = cmd_sender.send(ManagerCommand::UdpSend {
                                     remote_ip,
                                     remote_port,
                                     local_port,
                                     data: payload.to_vec(),
-                                }).await;
+                                }).await
+                            {
+                                log::debug!("Failed to send UDP data to tunnel: {}", e);
                             }
                         }
                     }
@@ -446,10 +490,11 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
 
             // Receive UDP from tunnel, forward to client
             Some((remote_ip, remote_port, data)) = from_tunnel.recv() => {
-                if let Some(addr) = client_addr {
-                    if let Ok(packet) = build_udp_response(remote_ip, remote_port, &data) {
-                        let _ = udp_socket.send_to(&packet, addr).await;
-                    }
+                if let Some(addr) = client_addr
+                    && let Ok(packet) = build_udp_response(remote_ip, remote_port, &data)
+                    && let Err(e) = udp_socket.send_to(&packet, addr).await
+                {
+                    log::debug!("Failed to send UDP response to client: {}", e);
                 }
             }
         }
