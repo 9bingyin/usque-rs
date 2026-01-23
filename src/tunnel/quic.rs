@@ -59,8 +59,6 @@ pub enum QuicError {
     PublicKeyMismatch,
 }
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
-
 pub struct QuicConfig {
     pub idle_timeout: u64,
     pub initial_max_data: u64,
@@ -160,21 +158,21 @@ pub struct QuicConnection {
     pub socket: Arc<UdpSocket>,
     pub peer_addr: SocketAddr,
     pub local_addr: SocketAddr,
+    send_buf: Vec<u8>,
 }
 
 impl QuicConnection {
     pub async fn send_async(&mut self) -> Result<usize, QuicError> {
-        let mut out = [0u8; MAX_DATAGRAM_SIZE];
         let mut total_sent = 0;
 
         loop {
-            let (write, _send_info) = match self.conn.send(&mut out) {
+            let (write, _send_info) = match self.conn.send(&mut self.send_buf) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
                 Err(e) => return Err(QuicError::QuicError(e)),
             };
 
-            self.socket.send_to(&out[..write], self.peer_addr).await?;
+            self.socket.send_to(&self.send_buf[..write], self.peer_addr).await?;
             total_sent += write;
         }
 
@@ -212,11 +210,13 @@ pub async fn connect(
     let scid = generate_scid();
     let conn = quiche::connect(Some(sni), &scid, local_addr, endpoint, &mut config)?;
 
+    let max_datagram_size = std::cmp::max(quic_cfg.initial_packet_size as usize, 1350);
     let mut quic_conn = QuicConnection {
         conn,
         socket,
         peer_addr: endpoint,
         local_addr,
+        send_buf: vec![0u8; max_datagram_size],
     };
 
     let start = std::time::Instant::now();

@@ -48,6 +48,7 @@ impl ExponentialBackoff {
 }
 
 // Connection parameters for establishing and reconnecting tunnel
+#[derive(Clone)]
 pub struct ConnectionParams {
     pub endpoint: SocketAddr,
     pub cert_der: Vec<u8>,
@@ -85,7 +86,7 @@ pub enum ManagerCommand {
     // Register UDP session for receiving data from tunnel
     UdpRegister {
         local_port: u16,
-        response: oneshot::Sender<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>>,
+        response: oneshot::Sender<Result<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>, String>>,
     },
     // Send UDP data through tunnel
     UdpSend {
@@ -150,6 +151,7 @@ struct UdpSessionState {
 }
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const MAX_PENDING_DATA: usize = 4 * 1024 * 1024; // 4MB per socket
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -175,23 +177,56 @@ impl TunnelManager {
         loop {
             log::info!("Establishing MASQUE connection to {}", params.endpoint);
 
-            match Self::establish_connection(&params).await {
-                Ok((tunnel, stack)) => {
-                    log::info!("Tunnel connected successfully");
-                    backoff.reset();
+            let (conn_tx, mut conn_rx) = oneshot::channel();
+            let params_clone = params.clone();
+            tokio::spawn(async move {
+                let res = Self::establish_connection(&params_clone).await;
+                let _ = conn_tx.send(res);
+            });
 
-                    Self::run_loop(tunnel, stack, &mut cmd_rx, &params.dns_servers, params.keepalive).await;
-
-                    log::warn!("Connection lost, reconnecting...");
-                }
-                Err(e) => {
-                    log::error!("Failed to connect: {}", e);
+            loop {
+                tokio::select! {
+                    res = &mut conn_rx => {
+                        match res {
+                            Ok(Ok((tunnel, stack))) => {
+                                log::info!("Tunnel connected successfully");
+                                backoff.reset();
+                                Self::run_loop(tunnel, stack, &mut cmd_rx, &params.dns_servers, params.keepalive).await;
+                                log::warn!("Connection lost, reconnecting...");
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("Failed to connect: {}", e);
+                            }
+                            Err(_) => {
+                                log::error!("Connection task cancelled");
+                            }
+                        }
+                        break;
+                    }
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(cmd) => Self::handle_command_disconnected(cmd),
+                            None => return,
+                        }
+                    }
                 }
             }
 
             let delay = backoff.next_delay();
             log::info!("Reconnecting in {:?}", delay);
-            tokio::time::sleep(delay).await;
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(cmd) => Self::handle_command_disconnected(cmd),
+                            None => return,
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -220,14 +255,26 @@ impl TunnelManager {
 
         // Dynamically get MTU from QUIC datagram max size
         // Subtract HTTP/3 datagram header (~3 bytes for varint stream ID + context ID)
-        let mtu = masque_tunnel
+        let dynamic_mtu = masque_tunnel
             .quic_conn
             .conn
             .dgram_max_writable_len()
             .map(|max| max.saturating_sub(3))
             .unwrap_or(1280);
 
-        log::info!("Using MTU {} based on QUIC datagram limit", mtu);
+        let configured_mtu = params.mtu as usize;
+        let mtu = if configured_mtu == 0 {
+            dynamic_mtu
+        } else {
+            dynamic_mtu.min(configured_mtu)
+        };
+
+        log::info!(
+            "Using MTU {} (QUIC limit {}, configured {})",
+            mtu,
+            dynamic_mtu,
+            configured_mtu
+        );
 
         let stack = NetworkStack::new(
             &params.ipv4,
@@ -337,21 +384,27 @@ impl TunnelManager {
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
                     Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, dns_servers, cmd);
-                    Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
+                    if !Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await {
+                        break;
+                    }
                 }
 
                 // Receive UDP data
                 result = socket.recv_from(&mut buf) => {
                     if let Ok((len, from)) = result {
-                        Self::handle_udp_recv(&mut tunnel, &mut stack, &buf[..len], from, local_addr);
-                        Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
+                        Self::handle_udp_recv(&mut tunnel, &mut stack, &mut buf[..len], from, local_addr);
+                        if !Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await {
+                            break;
+                        }
                     }
                 }
 
                 // Dynamic timeout - replaces fixed interval polling
                 _ = tokio::time::sleep(poll_timeout) => {
                     tunnel.quic_conn.conn.on_timeout();
-                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, keepalive_interval).await;
+                    if !Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, keepalive_interval).await {
+                        break;
+                    }
                 }
             }
         }
@@ -404,6 +457,28 @@ impl TunnelManager {
                 if response.send(state).is_err() {
                     log::debug!("Failed to send socket state response: receiver dropped");
                 }
+            }
+        }
+    }
+
+    fn handle_command_disconnected(cmd: ManagerCommand) {
+        match cmd {
+            ManagerCommand::Connect { response, .. } => {
+                let _ = response.send(Err("Tunnel not connected".to_string()));
+            }
+            ManagerCommand::Close { .. } => {}
+            ManagerCommand::DnsResolve { response, .. } => {
+                let _ = response.send(Err(DnsError::NotConnected));
+            }
+            ManagerCommand::UdpRegister { response, .. } => {
+                let _ = response.send(Err("Tunnel not connected".to_string()));
+            }
+            ManagerCommand::UdpSend { .. } => {
+                log::debug!("Dropping UDP send: tunnel not connected");
+            }
+            ManagerCommand::UdpUnregister { .. } => {}
+            ManagerCommand::GetSocketState { response, .. } => {
+                let _ = response.send(TcpSocketState::Closed);
             }
         }
     }
@@ -472,9 +547,15 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         local_port: u16,
-        response: oneshot::Sender<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>>,
+        response: oneshot::Sender<Result<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>, String>>,
     ) {
-        let handle = stack.create_udp_socket(local_port);
+        let handle = match stack.create_udp_socket(local_port) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = response.send(Err(format!("Failed to bind UDP socket: {}", e)));
+                return;
+            }
+        };
         let (tx, rx) = mpsc::channel(1024);
 
         udp_sessions.insert(local_port, UdpSessionState {
@@ -484,7 +565,7 @@ impl TunnelManager {
         });
 
         log::debug!("UDP session registered on port {}", local_port);
-        if response.send(rx).is_err() {
+        if response.send(Ok(rx)).is_err() {
             log::warn!("Failed to send UDP register response: receiver dropped");
         }
     }
@@ -518,6 +599,25 @@ impl TunnelManager {
         }
     }
 
+    fn record_dns_error(
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        group_id: u32,
+        query_type: DnsRecordType,
+        err: DnsError,
+    ) {
+        if let Some(group) = dns_groups.get_mut(&group_id) {
+            match query_type {
+                DnsRecordType::A => {
+                    group.ipv4_result = Some(Err(err));
+                }
+                DnsRecordType::AAAA => {
+                    group.ipv6_result = Some(Err(err));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn start_dns_query(
         stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
@@ -548,40 +648,90 @@ impl TunnelManager {
             .unwrap_or(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(1, 1, 1, 1)));
 
         // Send A query (IPv4)
-        if let Ok((tx_id_a, packet_a)) = build_dns_query(domain, DnsRecordType::A) {
-            let local_port = get_dns_local_port();
-            let handle = stack.create_udp_socket(local_port);
-            if stack.udp_send(handle, dns_server, dns_port(), &packet_a).is_ok() {
-                dns_queries.insert(
-                    tx_id_a,
-                    DnsQueryState {
-                        handle,
-                        group_id,
-                        query_type: DnsRecordType::A,
-                    },
-                );
-                log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
-            } else {
-                stack.remove_socket(handle);
+        match build_dns_query(domain, DnsRecordType::A) {
+            Ok((tx_id_a, packet_a)) => {
+                let local_port = get_dns_local_port();
+                match stack.create_udp_socket(local_port) {
+                    Ok(handle) => {
+                        if stack.udp_send(handle, dns_server, dns_port(), &packet_a).is_ok() {
+                            dns_queries.insert(
+                                tx_id_a,
+                                DnsQueryState {
+                                    handle,
+                                    group_id,
+                                    query_type: DnsRecordType::A,
+                                },
+                            );
+                            log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
+                        } else {
+                            stack.remove_socket(handle);
+                            Self::record_dns_error(
+                                dns_groups,
+                                group_id,
+                                DnsRecordType::A,
+                                DnsError::SocketError("DNS A send failed".into()),
+                            );
+                            Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                        }
+                    }
+                    Err(e) => {
+                        Self::record_dns_error(
+                            dns_groups,
+                            group_id,
+                            DnsRecordType::A,
+                            DnsError::SocketError(format!("DNS A socket error: {}", e)),
+                        );
+                        Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                    }
+                }
+            }
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e);
+                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
             }
         }
 
         // Send AAAA query (IPv6)
-        if let Ok((tx_id_aaaa, packet_aaaa)) = build_dns_query(domain, DnsRecordType::AAAA) {
-            let local_port = get_dns_local_port();
-            let handle = stack.create_udp_socket(local_port);
-            if stack.udp_send(handle, dns_server, dns_port(), &packet_aaaa).is_ok() {
-                dns_queries.insert(
-                    tx_id_aaaa,
-                    DnsQueryState {
-                        handle,
-                        group_id,
-                        query_type: DnsRecordType::AAAA,
-                    },
-                );
-                log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
-            } else {
-                stack.remove_socket(handle);
+        match build_dns_query(domain, DnsRecordType::AAAA) {
+            Ok((tx_id_aaaa, packet_aaaa)) => {
+                let local_port = get_dns_local_port();
+                match stack.create_udp_socket(local_port) {
+                    Ok(handle) => {
+                        if stack.udp_send(handle, dns_server, dns_port(), &packet_aaaa).is_ok() {
+                            dns_queries.insert(
+                                tx_id_aaaa,
+                                DnsQueryState {
+                                    handle,
+                                    group_id,
+                                    query_type: DnsRecordType::AAAA,
+                                },
+                            );
+                            log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
+                        } else {
+                            stack.remove_socket(handle);
+                            Self::record_dns_error(
+                                dns_groups,
+                                group_id,
+                                DnsRecordType::AAAA,
+                                DnsError::SocketError("DNS AAAA send failed".into()),
+                            );
+                            Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                        }
+                    }
+                    Err(e) => {
+                        Self::record_dns_error(
+                            dns_groups,
+                            group_id,
+                            DnsRecordType::AAAA,
+                            DnsError::SocketError(format!("DNS AAAA socket error: {}", e)),
+                        );
+                        Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
+                    }
+                }
+            }
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
+                Self::try_resolve_dns_group(stack, dns_queries, dns_groups, group_id);
             }
         }
     }
@@ -603,7 +753,7 @@ impl TunnelManager {
                 continue;
             }
 
-            let mut buf = [0u8; 512];
+            let mut buf = [0u8; 4096];
             let result = stack.udp_recv(handle, &mut buf);
 
             if let Ok((len, _endpoint)) = result {
@@ -692,10 +842,15 @@ impl TunnelManager {
                 log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
                 Some(Ok(v4_addrs[0]))
             }
-            // Both failed or returned no records
+            // Both completed (success or failure), surface a meaningful error
             (Some(_), Some(_)) => {
-                log::debug!("DNS resolution failed: no records from both A and AAAA");
-                Some(Err(DnsError::NoRecords))
+                let err = match (&group.ipv6_result, &group.ipv4_result) {
+                    (Some(Err(e6)), _) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                    (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                    _ => DnsError::NoRecords,
+                };
+                log::debug!("DNS resolution failed: {:?}", err);
+                Some(Err(err))
             }
             // Still waiting for one response
             _ => None,
@@ -726,7 +881,7 @@ impl TunnelManager {
     fn handle_udp_recv(
         tunnel: &mut MasqueTunnel,
         stack: &mut NetworkStack,
-        data: &[u8],
+        data: &mut [u8],
         from: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
     ) {
@@ -735,7 +890,7 @@ impl TunnelManager {
             to: local_addr,
         };
 
-        if let Err(e) = tunnel.quic_conn.conn.recv(&mut data.to_vec(), recv_info) {
+        if let Err(e) = tunnel.quic_conn.conn.recv(data, recv_info) {
             log::warn!("QUIC recv error: {:?}", e);
             return;
         }
@@ -762,7 +917,7 @@ impl TunnelManager {
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         last_keepalive: &mut Instant,
         keepalive_interval: Duration,
-    ) {
+    ) -> bool {
         // Send keepalive PING if interval elapsed
         if last_keepalive.elapsed() >= keepalive_interval {
             if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
@@ -774,8 +929,8 @@ impl TunnelManager {
         }
 
         if !stack.poll() {
-            // smoltcp panicked, skip this poll cycle
-            return;
+            log::error!("smoltcp poll panicked, restarting tunnel");
+            return false;
         }
 
         // Process DNS responses
@@ -845,6 +1000,7 @@ impl TunnelManager {
                 }
             }
 
+            let mut should_close = false;
             if let Some(state) = sockets.get_mut(&handle) {
                 if !state.pending_data.is_empty() && stack.tcp_may_send(handle)
                     && let Ok(sent) = stack.tcp_send(handle, &state.pending_data)
@@ -867,7 +1023,21 @@ impl TunnelManager {
                     } else {
                         state.pending_data.extend_from_slice(&data);
                     }
+                    if state.pending_data.len() > MAX_PENDING_DATA {
+                        log::warn!(
+                            "Pending data exceeded limit for socket {:?} ({} bytes), closing",
+                            handle,
+                            state.pending_data.len()
+                        );
+                        should_close = true;
+                        break;
+                    }
                 }
+            }
+
+            if should_close {
+                stack.tcp_close(handle);
+                closed_handles.push(handle);
             }
         }
 
@@ -892,6 +1062,7 @@ impl TunnelManager {
         if let Err(e) = tunnel.quic_conn.send_async().await {
             log::warn!("Failed to send QUIC data: {:?}", e);
         }
+        true
     }
 
     // Lightweight processing after UDP recv: only handle TCP data transfer
@@ -899,9 +1070,10 @@ impl TunnelManager {
         tunnel: &mut MasqueTunnel,
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
-    ) {
+    ) -> bool {
         if !stack.poll() {
-            return;
+            log::error!("smoltcp poll panicked, restarting tunnel");
+            return false;
         }
 
         let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
@@ -927,5 +1099,6 @@ impl TunnelManager {
         if let Err(e) = tunnel.quic_conn.send_async().await {
             log::debug!("Failed to send QUIC data in process_after_recv: {:?}", e);
         }
+        true
     }
 }

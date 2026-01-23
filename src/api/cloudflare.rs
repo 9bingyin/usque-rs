@@ -1,6 +1,7 @@
 use crate::api::models::*;
 use crate::crypto::{generate_random_serial, generate_random_wg_pubkey, time_as_cf_string};
 use reqwest::header::{HeaderMap, HeaderValue};
+use std::time::Duration;
 use thiserror::Error;
 
 pub const API_URL: &str = "https://api.cloudflareclient.com";
@@ -42,8 +43,17 @@ fn default_headers() -> HeaderMap {
 
 impl CloudflareClient {
     pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to build HTTP client with timeouts: {}", e);
+                reqwest::Client::new()
+            });
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: format!("{}/{}", API_URL, API_VERSION),
         }
     }

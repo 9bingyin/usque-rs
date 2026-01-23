@@ -2,7 +2,7 @@ use crate::tunnel::device::VirtualDevice;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
-use smoltcp::time::Instant;
+use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use thiserror::Error;
 
@@ -27,12 +27,26 @@ impl NetworkStack {
     pub fn new(ipv4: &str, ipv6: Option<&str>, mtu: usize) -> Self {
         let mut device = VirtualDevice::new(mtu);
 
-        let local_ipv4: Ipv4Address = ipv4.parse().unwrap_or(Ipv4Address::new(10, 0, 0, 1));
-        let local_ipv6: Option<Ipv6Address> = ipv6.and_then(|s| s.parse().ok());
+        let local_ipv4: Ipv4Address = match ipv4.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::warn!("Invalid IPv4 address '{}': {}", ipv4, e);
+                Ipv4Address::new(10, 0, 0, 1)
+            }
+        };
+        let local_ipv6: Option<Ipv6Address> = ipv6.and_then(|s| {
+            match s.parse() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    log::warn!("Invalid IPv6 address '{}': {}", s, e);
+                    None
+                }
+            }
+        });
 
         let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         // Use the same device instance for Interface creation
-        let mut iface = Interface::new(config, &mut device, Instant::now());
+        let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
         iface.update_ip_addrs(|addrs| {
             addrs.push(IpCidr::new(IpAddress::Ipv4(local_ipv4), 32)).ok();
@@ -52,7 +66,7 @@ impl NetworkStack {
     }
 
     pub fn poll(&mut self) -> bool {
-        let timestamp = Instant::now();
+        let timestamp = SmolInstant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
         }));
@@ -145,7 +159,7 @@ impl NetworkStack {
     }
 
     // UDP socket methods for DNS resolution
-    pub fn create_udp_socket(&mut self, local_port: u16) -> smoltcp::iface::SocketHandle {
+    pub fn create_udp_socket(&mut self, local_port: u16) -> Result<smoltcp::iface::SocketHandle, StackError> {
         let rx_buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; 16],
             vec![0; 8192],
@@ -157,9 +171,11 @@ impl NetworkStack {
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
         let local_endpoint = IpEndpoint::new(IpAddress::Ipv4(self.local_ipv4), local_port);
-        socket.bind(local_endpoint).ok();
+        socket
+            .bind(local_endpoint)
+            .map_err(|e| StackError::SocketError(format!("{:?}", e)))?;
 
-        self.sockets.add(socket)
+        Ok(self.sockets.add(socket))
     }
 
     pub fn udp_send(

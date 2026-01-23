@@ -406,7 +406,8 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
 
     let mut from_tunnel = response_rx
         .await
-        .map_err(|_| Socks5Error::ChannelError("Failed to get UDP receiver".into()))?;
+        .map_err(|_| Socks5Error::ChannelError("Failed to get UDP receiver".into()))?
+        .map_err(Socks5Error::ConnectionFailed)?;
 
     // Send success reply with UDP relay address
     let reply_ip = local_addr.ip();

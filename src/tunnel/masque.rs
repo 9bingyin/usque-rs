@@ -27,6 +27,9 @@ pub struct MasqueTunnel {
     pub h3_conn: Option<quiche::h3::Connection>,
     pub connect_stream_id: Option<u64>,
     pub established: bool,
+    dgram_recv_buf: Vec<u8>,
+    dgram_send_buf: Vec<u8>,
+    packet_buf: Vec<u8>,
 }
 
 impl MasqueTunnel {
@@ -36,6 +39,9 @@ impl MasqueTunnel {
             h3_conn: None,
             connect_stream_id: None,
             established: false,
+            dgram_recv_buf: Vec::new(),
+            dgram_send_buf: Vec::new(),
+            packet_buf: Vec::new(),
         }
     }
 
@@ -92,8 +98,9 @@ impl MasqueTunnel {
             .ok_or_else(|| MasqueError::ConnectionError("No connect stream".into()))?;
 
         // Process IP packet (decrement TTL/Hop Limit, recalculate checksum)
-        let mut packet = data.to_vec();
-        if !process_outgoing_ip_packet(&mut packet)? {
+        self.packet_buf.clear();
+        self.packet_buf.extend_from_slice(data);
+        if !process_outgoing_ip_packet(&mut self.packet_buf)? {
             // Packet should be dropped (TTL too small, etc.)
             return Ok(None);
         }
@@ -102,35 +109,40 @@ impl MasqueTunnel {
         let quarter_stream_id = stream_id / 4;
         let qsid_len = varint_len(quarter_stream_id);
 
-        let mut buf = vec![0u8; qsid_len + 1 + packet.len()];
-        let mut offset = encode_varint(quarter_stream_id, &mut buf);
-        buf[offset] = CONTEXT_ID_ZERO;
+        let dgram_len = qsid_len + 1 + self.packet_buf.len();
+        if self.dgram_send_buf.len() < dgram_len {
+            self.dgram_send_buf.resize(dgram_len, 0);
+        } else {
+            self.dgram_send_buf.truncate(dgram_len);
+        }
+        let mut offset = encode_varint(quarter_stream_id, &mut self.dgram_send_buf);
+        self.dgram_send_buf[offset] = CONTEXT_ID_ZERO;
         offset += 1;
-        buf[offset..].copy_from_slice(&packet);
+        self.dgram_send_buf[offset..].copy_from_slice(&self.packet_buf);
 
         // Check if datagram exceeds maximum writable length
         let max_dgram_len = self.quic_conn.conn.dgram_max_writable_len();
         if let Some(max_len) = max_dgram_len
-            && buf.len() > max_len
+            && self.dgram_send_buf.len() > max_len
         {
             log::debug!(
                 "Datagram too large: {} bytes > max {} bytes, generating ICMP Packet Too Big",
-                buf.len(),
+                self.dgram_send_buf.len(),
                 max_len
             );
-            let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
+            let icmp = compose_icmp_packet_too_big(&self.packet_buf, MIN_MTU);
             return Ok(icmp);
         }
 
-        match self.quic_conn.conn.dgram_send(&buf) {
+        match self.quic_conn.conn.dgram_send(&self.dgram_send_buf) {
             Ok(()) => Ok(None),
             Err(quiche::Error::BufferTooShort) => {
-                log::debug!("dgram_send BufferTooShort ({} bytes), generating ICMP", buf.len());
-                let icmp = compose_icmp_packet_too_big(&packet, MIN_MTU);
+                log::debug!("dgram_send BufferTooShort ({} bytes), generating ICMP", self.dgram_send_buf.len());
+                let icmp = compose_icmp_packet_too_big(&self.packet_buf, MIN_MTU);
                 Ok(icmp)
             }
             Err(e) => {
-                log::warn!("dgram_send error: {:?}, buf len: {}", e, buf.len());
+                log::warn!("dgram_send error: {:?}, buf len: {}", e, self.dgram_send_buf.len());
                 Err(MasqueError::QuicError(QuicError::QuicError(e)))
             }
         }
@@ -156,13 +168,16 @@ impl MasqueTunnel {
     }
 
     pub fn recv_datagram(&mut self, buf: &mut [u8]) -> Result<usize, MasqueError> {
-        let mut temp_buf = vec![0u8; buf.len() + 10]; // Extra space for headers
+        let needed = buf.len() + 10; // Extra space for headers
+        if self.dgram_recv_buf.len() < needed {
+            self.dgram_recv_buf.resize(needed, 0);
+        }
 
-        match self.quic_conn.conn.dgram_recv(&mut temp_buf) {
+        match self.quic_conn.conn.dgram_recv(&mut self.dgram_recv_buf) {
             Ok(len) => {
                 // Parse HTTP/3 Datagram: [Quarter Stream ID (varint)] [Context ID (varint)] [IP Packet]
-                let (_, qsid_len) = decode_varint(&temp_buf[..len])?;
-                let (context_id, ctx_len) = decode_varint(&temp_buf[qsid_len..len])?;
+                let (_, qsid_len) = decode_varint(&self.dgram_recv_buf[..len])?;
+                let (context_id, ctx_len) = decode_varint(&self.dgram_recv_buf[qsid_len..len])?;
 
                 // Only accept Context ID = 0 (IP packets)
                 if context_id != 0 {
@@ -176,7 +191,7 @@ impl MasqueTunnel {
                     return Err(MasqueError::ConnectionError("Buffer too small".into()));
                 }
 
-                buf[..payload_len].copy_from_slice(&temp_buf[header_len..len]);
+                buf[..payload_len].copy_from_slice(&self.dgram_recv_buf[header_len..len]);
                 Ok(payload_len)
             }
             Err(quiche::Error::Done) => Ok(0),

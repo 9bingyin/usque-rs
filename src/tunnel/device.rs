@@ -1,16 +1,46 @@
 use bytes::BytesMut;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::time::Instant;
+use smoltcp::time::Instant as SmolInstant;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant as StdInstant};
 
 const MAX_QUEUE_SIZE: usize = 4096;
 const BUFFER_POOL_SIZE: usize = 256;
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+struct DropLogger {
+    label: &'static str,
+    count: u64,
+    last_log: StdInstant,
+}
+
+impl DropLogger {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            count: 0,
+            last_log: StdInstant::now(),
+        }
+    }
+
+    fn log_drop(&mut self) {
+        self.count += 1;
+        let now = StdInstant::now();
+        if now.duration_since(self.last_log) >= DROP_LOG_INTERVAL {
+            log::warn!("{} queue full, dropped {} packets", self.label, self.count);
+            self.count = 0;
+            self.last_log = now;
+        }
+    }
+}
 
 pub struct VirtualDevice {
     rx_queue: VecDeque<BytesMut>,
     tx_queue: VecDeque<BytesMut>,
     buffer_pool: Vec<BytesMut>,
     mtu: usize,
+    rx_drop_logger: DropLogger,
+    tx_drop_logger: DropLogger,
 }
 
 impl VirtualDevice {
@@ -24,6 +54,8 @@ impl VirtualDevice {
             tx_queue: VecDeque::with_capacity(1024),
             buffer_pool,
             mtu,
+            rx_drop_logger: DropLogger::new("RX"),
+            tx_drop_logger: DropLogger::new("TX"),
         }
     }
 
@@ -45,7 +77,7 @@ impl VirtualDevice {
             if let Some(old) = self.rx_queue.pop_front() {
                 self.return_buffer(old);
             }
-            log::warn!("RX queue full, dropping oldest packet");
+            self.rx_drop_logger.log_drop();
         }
         let mut buf = self.get_buffer();
         buf.extend_from_slice(data);
@@ -65,21 +97,23 @@ impl Device for VirtualDevice {
     type RxToken<'a> = VirtualRxToken where Self: 'a;
     type TxToken<'a> = VirtualTxToken<'a> where Self: 'a;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx_queue.pop_front()?;
         Some((
             VirtualRxToken { data: packet },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
                 mtu: self.mtu,
+                drop_logger: &mut self.tx_drop_logger,
             },
         ))
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(VirtualTxToken {
             queue: &mut self.tx_queue,
             mtu: self.mtu,
+            drop_logger: &mut self.tx_drop_logger,
         })
     }
 
@@ -107,6 +141,7 @@ impl RxToken for VirtualRxToken {
 pub struct VirtualTxToken<'a> {
     queue: &'a mut VecDeque<BytesMut>,
     mtu: usize,
+    drop_logger: &'a mut DropLogger,
 }
 
 impl<'a> TxToken for VirtualTxToken<'a> {
@@ -119,7 +154,7 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         let result = f(&mut buffer);
         while self.queue.len() >= MAX_QUEUE_SIZE {
             let _ = self.queue.pop_front();
-            log::warn!("TX queue full, dropping oldest packet");
+            self.drop_logger.log_drop();
         }
         self.queue.push_back(buffer);
         result

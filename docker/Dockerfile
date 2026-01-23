@@ -1,6 +1,14 @@
 FROM rust:1.93 AS builder
 
-RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    cmake \
+    git \
+    libclang-dev \
+    pkg-config \
+    perl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

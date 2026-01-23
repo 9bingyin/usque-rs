@@ -17,7 +17,7 @@ const DNS_PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 static DNS_TRANSACTION_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum DnsError {
     #[error("query failed: {0}")]
     QueryFailed(String),
@@ -35,6 +35,10 @@ pub enum DnsError {
     DecodeError(String),
     #[error("parse error: {0}")]
     ParseError(String),
+    #[error("socket error: {0}")]
+    SocketError(String),
+    #[error("tunnel not connected")]
+    NotConnected,
 }
 
 /// Parse DNS server addresses from string list
