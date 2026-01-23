@@ -373,8 +373,7 @@ async fn run_socks_server(
     println!("Using SNI: {}", sni);
 
     let endpoint_pub_key = if cfg.endpoint_pub_key.trim().is_empty() {
-        log::warn!("Endpoint public key missing, pinning disabled");
-        None
+        return Err("Endpoint public key is required for security".into());
     } else {
         Some(cfg.get_endpoint_pub_key_der()?)
     };

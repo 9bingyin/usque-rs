@@ -516,13 +516,14 @@ impl TunnelManager {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, from)) => {
-                                let mut data = std::mem::take(&mut buf);
-                                data.truncate(len);
+                                if len == 0 {
+                                    continue;
+                                }
+                                let data = buf[..len].to_vec();
                                 if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
                                     log::trace!("Incoming datagram channel closed");
                                     break;
                                 }
-                                buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
                             }
                             Err(e) => {
                                 log::warn!("UDP recv error: {}", e);
