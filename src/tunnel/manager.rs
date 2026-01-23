@@ -42,6 +42,22 @@ pub enum ManagerCommand {
         prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, DnsError>>,
     },
+    // Register UDP session for receiving data from tunnel
+    UdpRegister {
+        local_port: u16,
+        response: oneshot::Sender<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>>,
+    },
+    // Send UDP data through tunnel
+    UdpSend {
+        remote_ip: IpAddress,
+        remote_port: u16,
+        local_port: u16,
+        data: Vec<u8>,
+    },
+    // Unregister UDP session
+    UdpUnregister {
+        local_port: u16,
+    },
 }
 
 // Channels for a single TCP socket
@@ -72,6 +88,12 @@ struct DnsQueryGroup {
     ipv4_result: Option<Result<Vec<IpAddress>, DnsError>>,
     ipv6_result: Option<Result<Vec<IpAddress>, DnsError>>,
     created_at: Instant,
+}
+
+// UDP session state for SOCKS5 UDP ASSOCIATE
+struct UdpSessionState {
+    handle: SocketHandle,
+    to_client: mpsc::Sender<(IpAddress, u16, Vec<u8>)>,
 }
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -209,6 +231,7 @@ impl TunnelManager {
         let mut sockets: HashMap<SocketHandle, SocketState> = HashMap::new();
         let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
+        let mut udp_sessions: HashMap<u16, UdpSessionState> = HashMap::new(); // local_port -> session
         let mut interval = tokio::time::interval(Duration::from_micros(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -228,7 +251,7 @@ impl TunnelManager {
 
                 // Handle commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, cmd);
+                    Self::handle_command(&mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, cmd);
                     Self::process_after_recv(&mut tunnel, &mut stack, &mut sockets).await;
                 }
 
@@ -242,7 +265,7 @@ impl TunnelManager {
 
                 // Periodic poll
                 _ = interval.tick() => {
-                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups).await;
+                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions).await;
                 }
 
                 // KeepAlive - send PING frame to keep connection alive
@@ -264,6 +287,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
         cmd: ManagerCommand,
     ) {
         match cmd {
@@ -285,6 +309,15 @@ impl TunnelManager {
                 response,
             } => {
                 Self::start_dns_query(stack, dns_queries, dns_groups, &domain, prefer_ipv6, response);
+            }
+            ManagerCommand::UdpRegister { local_port, response } => {
+                Self::register_udp_session(stack, udp_sessions, local_port, response);
+            }
+            ManagerCommand::UdpSend { remote_ip, remote_port, local_port, data } => {
+                Self::send_udp_data(stack, udp_sessions, remote_ip, remote_port, local_port, &data);
+            }
+            ManagerCommand::UdpUnregister { local_port } => {
+                Self::unregister_udp_session(stack, udp_sessions, local_port);
             }
         }
     }
@@ -330,6 +363,52 @@ impl TunnelManager {
         stack.tcp_close(handle);
         stack.remove_socket(handle);
         sockets.remove(&handle);
+    }
+
+    fn register_udp_session(
+        stack: &mut NetworkStack,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        local_port: u16,
+        response: oneshot::Sender<mpsc::Receiver<(IpAddress, u16, Vec<u8>)>>,
+    ) {
+        let handle = stack.create_udp_socket(local_port);
+        let (tx, rx) = mpsc::channel(1024);
+
+        udp_sessions.insert(local_port, UdpSessionState {
+            handle,
+            to_client: tx,
+        });
+
+        log::debug!("UDP session registered on port {}", local_port);
+        let _ = response.send(rx);
+    }
+
+    fn send_udp_data(
+        stack: &mut NetworkStack,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        remote_ip: IpAddress,
+        remote_port: u16,
+        local_port: u16,
+        data: &[u8],
+    ) {
+        if let Some(session) = udp_sessions.get(&local_port) {
+            if let Err(e) = stack.udp_send(session.handle, remote_ip, remote_port, data) {
+                log::warn!("UDP send failed: {:?}", e);
+            }
+        } else {
+            log::warn!("UDP session not found for port {}", local_port);
+        }
+    }
+
+    fn unregister_udp_session(
+        stack: &mut NetworkStack,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        local_port: u16,
+    ) {
+        if let Some(session) = udp_sessions.remove(&local_port) {
+            stack.remove_socket(session.handle);
+            log::debug!("UDP session unregistered on port {}", local_port);
+        }
     }
 
     fn start_dns_query(
@@ -440,6 +519,40 @@ impl TunnelManager {
         }
     }
 
+    fn process_udp_responses(
+        stack: &mut NetworkStack,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
+    ) {
+        let ports: Vec<u16> = udp_sessions.keys().copied().collect();
+
+        for local_port in ports {
+            let handle = match udp_sessions.get(&local_port) {
+                Some(session) => session.handle,
+                None => continue,
+            };
+
+            if !stack.udp_can_recv(handle) {
+                continue;
+            }
+
+            let mut buf = [0u8; 65535];
+            if let Ok((len, endpoint)) = stack.udp_recv(handle, &mut buf) {
+                if len > 0 {
+                    let remote_ip = endpoint.endpoint.addr;
+                    let remote_port = endpoint.endpoint.port;
+
+                    if let Some(session) = udp_sessions.get(&local_port) {
+                        let _ = session.to_client.try_send((
+                            remote_ip,
+                            remote_port,
+                            buf[..len].to_vec(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn try_resolve_dns_group(
         stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
@@ -528,6 +641,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        udp_sessions: &mut HashMap<u16, UdpSessionState>,
     ) {
         tunnel.quic_conn.conn.on_timeout();
 
@@ -535,6 +649,9 @@ impl TunnelManager {
 
         // Process DNS responses
         Self::process_dns_responses(stack, dns_queries, dns_groups);
+
+        // Process UDP session responses
+        Self::process_udp_responses(stack, udp_sessions);
 
         // Cleanup timed out DNS groups (5 second timeout)
         let now = Instant::now();
