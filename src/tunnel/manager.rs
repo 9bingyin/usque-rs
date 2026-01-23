@@ -1339,7 +1339,9 @@ impl TunnelManager {
         }
 
         while let Some(packet) = stack.take_packet() {
-            match tunnel.send_datagram(&packet) {
+            let send_result = tunnel.send_datagram(packet.as_ref());
+            stack.recycle_tx_buffer(packet);
+            match send_result {
                 Ok(Some(icmp)) => {
                     log::debug!("Injecting ICMP Packet Too Big ({} bytes)", icmp.len());
                     stack.inject_packet(&icmp);
@@ -1406,7 +1408,9 @@ impl TunnelManager {
         }
 
         while let Some(packet) = stack.take_packet() {
-            if let Err(e) = tunnel.send_datagram(&packet) {
+            let send_result = tunnel.send_datagram(packet.as_ref());
+            stack.recycle_tx_buffer(packet);
+            if let Err(e) = send_result {
                 log::debug!("Failed to send datagram in process_after_recv: {:?}", e);
             }
         }

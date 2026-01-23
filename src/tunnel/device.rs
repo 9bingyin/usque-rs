@@ -84,12 +84,12 @@ impl VirtualDevice {
         self.rx_queue.push_back(buf);
     }
 
-    pub fn take_packet(&mut self) -> Option<Vec<u8>> {
-        self.tx_queue.pop_front().map(|buf| {
-            let data = buf.to_vec();
-            self.return_buffer(buf);
-            data
-        })
+    pub fn take_packet(&mut self) -> Option<BytesMut> {
+        self.tx_queue.pop_front()
+    }
+
+    pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
+        self.return_buffer(buf);
     }
 }
 

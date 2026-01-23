@@ -1,4 +1,5 @@
 use crate::tunnel::device::VirtualDevice;
+use bytes::BytesMut;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::{Socket, tcp::{Socket as TcpSocket, SocketBuffer}};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
@@ -210,8 +211,12 @@ impl NetworkStack {
         self.device.inject_packet(packet);
     }
 
-    pub fn take_packet(&mut self) -> Option<Vec<u8>> {
+    pub fn take_packet(&mut self) -> Option<BytesMut> {
         self.device.take_packet()
+    }
+
+    pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
+        self.device.recycle_tx_buffer(buf);
     }
 
     fn local_addr_for_remote(&self, remote_ip: IpAddress) -> Result<IpAddress, StackError> {
