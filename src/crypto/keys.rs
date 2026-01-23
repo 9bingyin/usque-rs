@@ -1,6 +1,7 @@
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
-use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use p256::pkcs8::EncodePublicKey;
+use sec1::EncodeEcPrivateKey;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -21,7 +22,7 @@ pub fn generate_ec_key_pair() -> Result<EcKeyPair, CryptoError> {
     let signing_key = SigningKey::random(&mut OsRng);
 
     let private_key_der = signing_key
-        .to_pkcs8_der()
+        .to_sec1_der()
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?
         .as_bytes()
         .to_vec();
@@ -108,7 +109,7 @@ pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, V
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
 
     let private_key_der = signing_key
-        .to_pkcs8_der()
+        .to_sec1_der()
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?
         .as_bytes()
         .to_vec();

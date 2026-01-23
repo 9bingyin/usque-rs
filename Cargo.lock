@@ -2520,6 +2520,7 @@ dependencies = [
  "rand_core 0.9.5",
  "reqwest",
  "ring",
+ "sec1",
  "serde",
  "serde_json",
  "signature",

@@ -99,6 +99,7 @@ pub fn create_quiche_config(
     key_der: &[u8],
     _sni: &str,
 ) -> Result<quiche::Config, QuicError> {
+    use boring::ec::EcKey;
     use boring::pkey::PKey;
     use boring::ssl::{SslContextBuilder, SslMethod};
     use boring::x509::X509;
@@ -106,8 +107,11 @@ pub fn create_quiche_config(
     // Load certificate and private key from memory
     let cert = X509::from_der(cert_der)
         .map_err(|e| QuicError::ConnectionError(format!("cert error: {}", e)))?;
-    let pkey = PKey::private_key_from_der(key_der)
-        .map_err(|e| QuicError::ConnectionError(format!("key error: {}", e)))?;
+    // Parse SEC1 format EC private key (same as Go's x509.MarshalECPrivateKey)
+    let ec_key = EcKey::private_key_from_der(key_der)
+        .map_err(|e| QuicError::ConnectionError(format!("ec key error: {}", e)))?;
+    let pkey = PKey::from_ec_key(ec_key)
+        .map_err(|e| QuicError::ConnectionError(format!("pkey error: {}", e)))?;
 
     let mut builder = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| QuicError::ConnectionError(format!("ssl context error: {}", e)))?;
