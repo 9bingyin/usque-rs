@@ -75,6 +75,9 @@ enum Commands {
         /// MTU for MASQUE connection
         #[arg(short = 'm', long, default_value = "1280")]
         mtu: u16,
+        /// Congestion control algorithm (reno, cubic, bbr, bbr2)
+        #[arg(long = "cc", default_value = "bbr2")]
+        congestion_control: String,
     },
 }
 
@@ -90,8 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Enroll { config, name, regen_key } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu } => {
-            run_socks_server(&bind, port, &config, username, password, &sni, dns, connect_port, keepalive, initial_packet_size, mtu).await?;
+        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu, congestion_control } => {
+            run_socks_server(&bind, port, &config, username, password, &sni, dns, connect_port, keepalive, initial_packet_size, mtu, &congestion_control).await?;
         }
     }
 
@@ -287,6 +290,7 @@ async fn run_socks_server(
     keepalive: u64,
     initial_packet_size: u16,
     mtu: u16,
+    congestion_control: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
@@ -311,6 +315,11 @@ async fn run_socks_server(
     let dns_addrs = tunnel::dns::parse_dns_servers(&dns_servers)?;
     println!("Using DNS servers: {:?}", dns_servers);
 
+    // Parse congestion control algorithm
+    let cc: tunnel::CongestionControl = congestion_control.parse()
+        .map_err(|e: String| e)?;
+    println!("Using congestion control: {}", cc);
+
     let params = tunnel::ConnectionParams {
         endpoint,
         cert_der,
@@ -323,6 +332,7 @@ async fn run_socks_server(
         keepalive,
         initial_packet_size,
         mtu,
+        congestion_control: cc,
     };
 
     let tunnel_manager = Arc::new(tunnel::TunnelManager::new(params));

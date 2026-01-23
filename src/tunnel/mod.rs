@@ -6,3 +6,4 @@ pub mod quic;
 pub mod stack;
 
 pub use manager::*;
+pub use quic::CongestionControl;

@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::tunnel::quic::CongestionControl;
+
 // Connection parameters for establishing and reconnecting tunnel
 pub struct ConnectionParams {
     pub endpoint: SocketAddr,
@@ -25,6 +27,7 @@ pub struct ConnectionParams {
     pub keepalive: u64,
     pub initial_packet_size: u16,
     pub mtu: u16,
+    pub congestion_control: CongestionControl,
 }
 
 // Commands sent from SOCKS5 connections to the manager
@@ -148,6 +151,7 @@ impl TunnelManager {
         let quic_cfg = quic::QuicConfig {
             idle_timeout: params.keepalive * 1000,
             initial_packet_size: params.initial_packet_size,
+            congestion_control: params.congestion_control,
             ..Default::default()
         };
 
@@ -244,12 +248,11 @@ impl TunnelManager {
         let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
         let mut udp_sessions: HashMap<u16, UdpSessionState> = HashMap::new(); // local_port -> session
-        let mut interval = tokio::time::interval(Duration::from_micros(100));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // KeepAlive timer - send PING frames every 30 seconds to keep connection alive
-        let mut keepalive_interval = tokio::time::interval(Duration::from_secs(30));
-        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Keepalive tracking - send PING frames every 30 seconds
+        let mut last_keepalive = Instant::now();
+        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+        const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
         loop {
             // Check connection status at the start of each iteration
@@ -257,6 +260,11 @@ impl TunnelManager {
                 log::error!("QUIC connection closed");
                 break;
             }
+
+            // Dynamic timeout based on quiche's internal timer
+            let quic_timeout = tunnel.quic_conn.conn.timeout()
+                .unwrap_or(Duration::from_millis(100));
+            let poll_timeout = quic_timeout.min(MAX_POLL_INTERVAL);
 
             tokio::select! {
                 biased;
@@ -275,18 +283,10 @@ impl TunnelManager {
                     }
                 }
 
-                // Periodic poll
-                _ = interval.tick() => {
-                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions).await;
-                }
-
-                // KeepAlive - send PING frame to keep connection alive
-                _ = keepalive_interval.tick() => {
-                    if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
-                        log::warn!("Failed to send keepalive PING: {:?}", e);
-                    } else {
-                        log::debug!("Sent keepalive PING frame");
-                    }
+                // Dynamic timeout - replaces fixed interval polling
+                _ = tokio::time::sleep(poll_timeout) => {
+                    tunnel.quic_conn.conn.on_timeout();
+                    Self::poll_all(&mut tunnel, &mut stack, &mut sockets, &mut dns_queries, &mut dns_groups, &mut udp_sessions, &mut last_keepalive, KEEPALIVE_INTERVAL).await;
                 }
             }
         }
@@ -661,8 +661,18 @@ impl TunnelManager {
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        last_keepalive: &mut Instant,
+        keepalive_interval: Duration,
     ) {
-        tunnel.quic_conn.conn.on_timeout();
+        // Send keepalive PING if interval elapsed
+        if last_keepalive.elapsed() >= keepalive_interval {
+            if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
+                log::warn!("Failed to send keepalive PING: {:?}", e);
+            } else {
+                log::debug!("Sent keepalive PING frame");
+            }
+            *last_keepalive = Instant::now();
+        }
 
         stack.poll();
 

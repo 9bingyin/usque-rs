@@ -57,8 +57,9 @@ impl NetworkStack {
     }
 
     pub fn create_tcp_socket(&mut self) -> smoltcp::iface::SocketHandle {
-        let rx_buffer = SocketBuffer::new(vec![0; 262144]); // 256KB
-        let tx_buffer = SocketBuffer::new(vec![0; 262144]); // 256KB
+        // BDP: 1Gbps * 10ms RTT = 1.25MB, use 1MB for low latency scenario
+        let rx_buffer = SocketBuffer::new(vec![0; 1048576]); // 1MB
+        let tx_buffer = SocketBuffer::new(vec![0; 1048576]); // 1MB
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
         // Disable Nagle algorithm for lower latency
         socket.set_nagle_enabled(false);

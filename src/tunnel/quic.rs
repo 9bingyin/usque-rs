@@ -4,6 +4,46 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CongestionControl {
+    Reno,
+    Cubic,
+    #[default]
+    Bbr2,
+}
+
+impl std::str::FromStr for CongestionControl {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "reno" => Ok(CongestionControl::Reno),
+            "cubic" => Ok(CongestionControl::Cubic),
+            "bbr" | "bbr2" | "bbrv2" => Ok(CongestionControl::Bbr2),
+            _ => Err(format!("Unknown congestion control algorithm: {}. Valid options: reno, cubic, bbr2", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CongestionControl::Reno => write!(f, "reno"),
+            CongestionControl::Cubic => write!(f, "cubic"),
+            CongestionControl::Bbr2 => write!(f, "bbr2"),
+        }
+    }
+}
+
+impl CongestionControl {
+    fn to_quiche(&self) -> quiche::CongestionControlAlgorithm {
+        match self {
+            CongestionControl::Reno => quiche::CongestionControlAlgorithm::Reno,
+            CongestionControl::Cubic => quiche::CongestionControlAlgorithm::CUBIC,
+            CongestionControl::Bbr2 => quiche::CongestionControlAlgorithm::Bbr2Gcongestion,
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum QuicError {
@@ -33,6 +73,7 @@ pub struct QuicConfig {
     pub dgram_recv_max_queue_len: u64,
     pub dgram_send_max_queue_len: u64,
     pub initial_packet_size: u16,
+    pub congestion_control: CongestionControl,
 }
 
 impl Default for QuicConfig {
@@ -49,6 +90,7 @@ impl Default for QuicConfig {
             dgram_recv_max_queue_len: 10000,
             dgram_send_max_queue_len: 10000,
             initial_packet_size: 1242,
+            congestion_control: CongestionControl::Bbr2,
         }
     }
 }
@@ -109,6 +151,9 @@ pub fn create_quiche_config(
 
     // Set max UDP payload size (same as Go's InitialPacketSize: 1242)
     config.set_max_send_udp_payload_size(quic_cfg.initial_packet_size as usize);
+
+    // Set congestion control algorithm (default: BBR2)
+    config.set_cc_algorithm(quic_cfg.congestion_control.to_quiche());
 
     Ok(config)
 }
