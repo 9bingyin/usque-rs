@@ -69,9 +69,19 @@ impl Config {
     }
 
     pub fn get_signing_key(&self) -> Result<p256::ecdsa::SigningKey, ConfigError> {
+        use p256::ecdsa::SigningKey;
         use p256::pkcs8::DecodePrivateKey;
+        use p256::SecretKey;
+
         let der = self.get_private_key_der()?;
-        p256::ecdsa::SigningKey::from_pkcs8_der(&der)
+
+        // Try SEC1 format first (Go version compatibility)
+        if let Ok(secret_key) = SecretKey::from_sec1_der(&der) {
+            return Ok(SigningKey::from(&secret_key));
+        }
+
+        // Fallback to PKCS#8 format
+        SigningKey::from_pkcs8_der(&der)
             .map_err(|e| ConfigError::CryptoError(e.to_string()))
     }
 }

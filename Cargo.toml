@@ -5,18 +5,20 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22.1"
+boring = "4"
 bytes = "1.11.0"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive"] }
 der = "0.7.10"
 env_logger = "0.11.8"
 fast-socks5 = "1.0.0"
+foreign-types-shared = "0.3"
 hex = "0.4.3"
 hickory-proto = "0.25.2"
 log = "0.4.29"
 mio = { version = "1.1.1", features = ["net", "os-poll"] }
 p256 = { version = "0.13.2", features = ["ecdsa"] }
-quiche = "0.24.8"
+quiche = { version = "0.24.8", features = ["boringssl-boring-crate"] }
 rand_core = { version = "0.9.5", features = ["std", "os_rng"] }
 reqwest = { version = "0.13.1", features = ["json", "rustls"] }
 ring = "0.17.14"

@@ -101,9 +101,27 @@ pub fn create_quiche_config(
     key_der: &[u8],
     _sni: &str,
 ) -> Result<quiche::Config, QuicError> {
-    use base64::Engine;
+    use boring::pkey::PKey;
+    use boring::ssl::{SslContextBuilder, SslMethod};
+    use boring::x509::X509;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    // Load certificate and private key from memory
+    let cert = X509::from_der(cert_der)
+        .map_err(|e| QuicError::ConnectionError(format!("cert error: {}", e)))?;
+    let pkey = PKey::private_key_from_der(key_der)
+        .map_err(|e| QuicError::ConnectionError(format!("key error: {}", e)))?;
+
+    let mut builder = SslContextBuilder::new(SslMethod::tls())
+        .map_err(|e| QuicError::ConnectionError(format!("ssl context error: {}", e)))?;
+    builder
+        .set_certificate(&cert)
+        .map_err(|e| QuicError::ConnectionError(format!("set cert error: {}", e)))?;
+    builder
+        .set_private_key(&pkey)
+        .map_err(|e| QuicError::ConnectionError(format!("set key error: {}", e)))?;
+
+    let mut config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)?;
 
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
 
@@ -122,27 +140,6 @@ pub fn create_quiche_config(
     config.set_initial_max_stream_data_uni(quic_cfg.initial_max_stream_data_uni);
     config.set_initial_max_streams_bidi(quic_cfg.initial_max_streams_bidi);
     config.set_initial_max_streams_uni(quic_cfg.initial_max_streams_uni);
-
-    let cert_pem = format!(
-        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-        base64::engine::general_purpose::STANDARD.encode(cert_der)
-    );
-    let key_pem = format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        base64::engine::general_purpose::STANDARD.encode(key_der)
-    );
-
-    let cert_file = std::env::temp_dir().join(format!("usque_cert_{}.pem", std::process::id()));
-    let key_file = std::env::temp_dir().join(format!("usque_key_{}.pem", std::process::id()));
-
-    std::fs::write(&cert_file, &cert_pem)?;
-    std::fs::write(&key_file, &key_pem)?;
-
-    config.load_cert_chain_from_pem_file(cert_file.to_str().unwrap())?;
-    config.load_priv_key_from_pem_file(key_file.to_str().unwrap())?;
-
-    let _ = std::fs::remove_file(&cert_file);
-    let _ = std::fs::remove_file(&key_file);
 
     config.verify_peer(false);
 
