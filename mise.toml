@@ -1,0 +1,3 @@
+[tools]
+cmake = "latest"
+rust = "latest"
