@@ -9,6 +9,13 @@ use thiserror::Error;
 // Re-export RecordType for use in manager.rs
 pub use hickory_proto::rr::RecordType as DnsRecordType;
 
+// DNS record with TTL
+#[derive(Debug, Clone)]
+pub struct DnsRecord {
+    pub address: IpAddress,
+    pub ttl: u32,
+}
+
 // DNS constants
 const DNS_PORT: u16 = 53;
 const DNS_PORT_RANGE_START: u16 = 49152;
@@ -91,12 +98,12 @@ pub fn build_dns_query(domain: &str, record_type: RecordType) -> Result<(u16, Ve
 
 pub fn parse_dns_response_with_id(
     data: &[u8],
-) -> Result<(u16, Result<Vec<IpAddress>, DnsError>), DnsError> {
+) -> Result<(u16, Result<Vec<DnsRecord>, DnsError>), DnsError> {
     let message = Message::from_bytes(data)
         .map_err(|e| DnsError::DecodeError(format!("{}", e)))?;
     let id = message.id();
     let result = match validate_dns_response(&message) {
-        Ok(()) => extract_dns_addresses(&message),
+        Ok(()) => extract_dns_records(&message),
         Err(e) => Err(e),
     };
     Ok((id, result))
@@ -115,32 +122,39 @@ fn validate_dns_response(message: &Message) -> Result<(), DnsError> {
     Ok(())
 }
 
-fn extract_dns_addresses(message: &Message) -> Result<Vec<IpAddress>, DnsError> {
-    let mut addresses = Vec::new();
+fn extract_dns_records(message: &Message) -> Result<Vec<DnsRecord>, DnsError> {
+    let mut records = Vec::new();
 
     for answer in message.answers() {
+        let ttl = answer.ttl();
         match answer.data() {
             RData::A(a) => {
                 let octets = a.0.octets();
-                addresses.push(IpAddress::Ipv4(Ipv4Address::new(
-                    octets[0], octets[1], octets[2], octets[3],
-                )));
+                records.push(DnsRecord {
+                    address: IpAddress::Ipv4(Ipv4Address::new(
+                        octets[0], octets[1], octets[2], octets[3],
+                    )),
+                    ttl,
+                });
             }
             RData::AAAA(aaaa) => {
                 let segments = aaaa.0.segments();
-                addresses.push(IpAddress::Ipv6(Ipv6Address::new(
-                    segments[0], segments[1], segments[2], segments[3],
-                    segments[4], segments[5], segments[6], segments[7],
-                )));
+                records.push(DnsRecord {
+                    address: IpAddress::Ipv6(Ipv6Address::new(
+                        segments[0], segments[1], segments[2], segments[3],
+                        segments[4], segments[5], segments[6], segments[7],
+                    )),
+                    ttl,
+                });
             }
             _ => {}
         }
     }
 
-    if addresses.is_empty() {
+    if records.is_empty() {
         Err(DnsError::NoRecords)
     } else {
-        Ok(addresses)
+        Ok(records)
     }
 }
 

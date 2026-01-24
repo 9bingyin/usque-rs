@@ -1,7 +1,8 @@
 use crate::tunnel::dns::{
     build_dns_query, dns_port, get_dns_local_port, parse_dns_response_with_id, DnsError,
-    DnsRecordType,
+    DnsRecord, DnsRecordType,
 };
+use quick_cache::unsync::Cache;
 use crate::tunnel::masque::MasqueTunnel;
 use crate::tunnel::quic;
 use crate::tunnel::stack::{NetworkStack, StackError};
@@ -190,11 +191,77 @@ impl DnsSockets {
 
 // Happy Eyeballs: tracks paired A/AAAA queries
 struct DnsQueryGroup {
-    response: oneshot::Sender<Result<IpAddress, ManagerError>>,
-    ipv4_result: Option<Result<Vec<IpAddress>, DnsError>>,
-    ipv6_result: Option<Result<Vec<IpAddress>, DnsError>>,
+    domain: String,
+    response: Option<oneshot::Sender<Result<IpAddress, ManagerError>>>, // Option to allow early response
+    ipv4_result: Option<Result<Vec<DnsRecord>, DnsError>>,
+    ipv6_result: Option<Result<Vec<DnsRecord>, DnsError>>,
     created_at: Instant,
     prefer_ipv6: bool,
+}
+
+// DNS cache value: stores multiple IPs with their expiration times
+struct DnsCacheValue {
+    records: Vec<(IpAddress, Instant)>, // (ip, expires_at)
+}
+
+// DNS cache capacity
+const DNS_CACHE_CAPACITY: usize = 1024;
+
+// Helper functions for DNS cache operations
+fn dns_cache_get(cache: &Cache<String, DnsCacheValue>, domain: &str, prefer_ipv6: bool) -> Option<IpAddress> {
+    let value = cache.get(domain)?;
+    let now = Instant::now();
+
+    // Count valid records by type without allocation
+    let mut v6_count = 0usize;
+    let mut v4_count = 0usize;
+    for (ip, exp) in &value.records {
+        if *exp > now {
+            match ip {
+                IpAddress::Ipv6(_) => v6_count += 1,
+                IpAddress::Ipv4(_) => v4_count += 1,
+            }
+        }
+    }
+
+    let total = v6_count + v4_count;
+    if total == 0 {
+        return None;
+    }
+
+    // Select target type and index for load balancing
+    let (target_v6, target_count) = if prefer_ipv6 {
+        if v6_count > 0 { (true, v6_count) } else { (false, v4_count) }
+    } else {
+        if v4_count > 0 { (false, v4_count) } else { (true, v6_count) }
+    };
+
+    let target_idx = rand::rng().random_range(0..target_count);
+
+    // Find the target record
+    let mut idx = 0usize;
+    for (ip, exp) in &value.records {
+        if *exp > now {
+            let is_v6 = matches!(ip, IpAddress::Ipv6(_));
+            if is_v6 == target_v6 {
+                if idx == target_idx {
+                    return Some(*ip);
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    None
+}
+
+fn dns_cache_insert(cache: &mut Cache<String, DnsCacheValue>, domain: String, records: &[DnsRecord]) {
+    let now = Instant::now();
+    let entries: Vec<(IpAddress, Instant)> = records
+        .iter()
+        .map(|r| (r.address, now + Duration::from_secs(r.ttl as u64)))
+        .collect();
+    cache.insert(domain, DnsCacheValue { records: entries });
 }
 
 // UDP session state for SOCKS5 UDP ASSOCIATE
@@ -540,6 +607,7 @@ impl TunnelManager {
         let mut dns_queries: HashMap<u16, DnsQueryState> = HashMap::new(); // transaction_id -> state
         let mut dns_groups: HashMap<u32, DnsQueryGroup> = HashMap::new(); // group_id -> group
         let mut dns_sockets = DnsSockets::new();
+        let mut dns_cache: Cache<String, DnsCacheValue> = Cache::new(DNS_CACHE_CAPACITY);
         let mut udp_sessions: HashMap<u16, UdpSessionState> = HashMap::new(); // local_port -> session
 
         // Keepalive tracking
@@ -575,6 +643,7 @@ impl TunnelManager {
                         &mut dns_queries,
                         &mut dns_groups,
                         &mut dns_sockets,
+                        &mut dns_cache,
                         &mut udp_sessions,
                         dns_servers,
                         tcp_buffer_size,
@@ -611,6 +680,7 @@ impl TunnelManager {
                         &mut sockets,
                         &mut dns_queries,
                         &mut dns_groups,
+                        &mut dns_cache,
                         &dns_sockets,
                         &mut udp_sessions,
                         &mut last_keepalive,
@@ -633,6 +703,7 @@ impl TunnelManager {
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         dns_sockets: &mut DnsSockets,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         dns_servers: &[IpAddress],
         tcp_buffer_size: usize,
@@ -665,16 +736,25 @@ impl TunnelManager {
                 prefer_ipv6,
                 response,
             } => {
-                Self::start_dns_query(
-                    stack,
-                    dns_queries,
-                    dns_groups,
-                    dns_sockets,
-                    &domain,
-                    prefer_ipv6,
-                    response,
-                    dns_servers,
-                );
+                // Check cache first
+                if let Some(ip) = dns_cache_get(dns_cache, &domain, prefer_ipv6) {
+                    log::debug!("DNS cache hit: {} -> {:?}", domain, ip);
+                    if response.send(Ok(ip)).is_err() {
+                        log::trace!("Failed to send cached DNS response: receiver dropped");
+                    }
+                } else {
+                    Self::start_dns_query(
+                        stack,
+                        dns_queries,
+                        dns_groups,
+                        dns_sockets,
+                        dns_cache,
+                        &domain,
+                        prefer_ipv6,
+                        response,
+                        dns_servers,
+                    );
+                }
             }
             ManagerCommand::UdpRegister { local_port, response } => {
                 Self::register_udp_session(stack, udp_sessions, local_port, response);
@@ -904,6 +984,7 @@ impl TunnelManager {
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
         dns_sockets: &mut DnsSockets,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
         domain: &str,
         prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, ManagerError>>,
@@ -917,7 +998,8 @@ impl TunnelManager {
         dns_groups.insert(
             group_id,
             DnsQueryGroup {
-                response,
+                domain: domain.to_string(),
+                response: Some(response),
                 ipv4_result: None,
                 ipv6_result: None,
                 created_at: Instant::now(),
@@ -933,7 +1015,7 @@ impl TunnelManager {
             Err(e) => {
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e.clone());
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
-                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
                 return;
             }
         };
@@ -957,12 +1039,12 @@ impl TunnelManager {
                         DnsRecordType::A,
                         DnsError::SocketError("DNS A send failed".into()),
                     );
-                    Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
                 }
             }
             Err(e) => {
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e);
-                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
             }
         }
 
@@ -988,12 +1070,12 @@ impl TunnelManager {
                         DnsRecordType::AAAA,
                         DnsError::SocketError("DNS AAAA send failed".into()),
                     );
-                    Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
                 }
             }
             Err(e) => {
                 Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
-                Self::try_resolve_dns_group(dns_queries, dns_groups, group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
             }
         }
     }
@@ -1002,6 +1084,7 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
         dns_sockets: &DnsSockets,
     ) {
         for handle in dns_sockets.handles() {
@@ -1044,7 +1127,7 @@ impl TunnelManager {
                     }
                 }
 
-                Self::try_resolve_dns_group(dns_queries, dns_groups, state.group_id);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, state.group_id);
             }
         }
     }
@@ -1089,75 +1172,89 @@ impl TunnelManager {
     fn try_resolve_dns_group(
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
         group_id: u32,
     ) {
-        let group = match dns_groups.get(&group_id) {
+        let group = match dns_groups.get_mut(&group_id) {
             Some(g) => g,
             None => return,
         };
 
-        // Happy Eyeballs: select based on preference, then fallback
-        let result = match group.prefer_ipv6 {
-            true => match (&group.ipv6_result, &group.ipv4_result) {
-                (Some(Ok(v6_addrs)), _) if !v6_addrs.is_empty() => {
-                    log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
-                    Some(Ok(v6_addrs[0]))
-                }
-                (_, Some(Ok(v4_addrs))) if !v4_addrs.is_empty() => {
-                    log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
-                    Some(Ok(v4_addrs[0]))
-                }
-                (Some(_), Some(_)) => {
-                    let err = match (&group.ipv6_result, &group.ipv4_result) {
-                        (Some(Err(e6)), _) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
-                        (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
-                        _ => DnsError::NoRecords,
-                    };
-                    log::debug!("DNS resolution failed: {:?}", err);
-                    Some(Err(err))
-                }
-                _ => None,
-            },
-            false => match (&group.ipv4_result, &group.ipv6_result) {
-                (Some(Ok(v4_addrs)), _) if !v4_addrs.is_empty() => {
-                    log::debug!("DNS resolved (IPv4): {:?}", v4_addrs[0]);
-                    Some(Ok(v4_addrs[0]))
-                }
-                (_, Some(Ok(v6_addrs))) if !v6_addrs.is_empty() => {
-                    log::debug!("DNS resolved (IPv6): {:?}", v6_addrs[0]);
-                    Some(Ok(v6_addrs[0]))
-                }
-                (Some(_), Some(_)) => {
-                    let err = match (&group.ipv4_result, &group.ipv6_result) {
-                        (Some(Err(e4)), _) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
-                        (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
-                        _ => DnsError::NoRecords,
-                    };
-                    log::debug!("DNS resolution failed: {:?}", err);
-                    Some(Err(err))
-                }
-                _ => None,
-            },
-        };
+        // Happy Eyeballs: send response early if we have a usable result
+        if group.response.is_some() {
+            let result = match group.prefer_ipv6 {
+                true => match (&group.ipv6_result, &group.ipv4_result) {
+                    (Some(Ok(v6_records)), _) if !v6_records.is_empty() => {
+                        log::debug!("DNS resolved (IPv6): {:?}", v6_records[0].address);
+                        Some(Ok(v6_records[0].address))
+                    }
+                    (_, Some(Ok(v4_records))) if !v4_records.is_empty() => {
+                        log::debug!("DNS resolved (IPv4): {:?}", v4_records[0].address);
+                        Some(Ok(v4_records[0].address))
+                    }
+                    (Some(_), Some(_)) => {
+                        let err = match (&group.ipv6_result, &group.ipv4_result) {
+                            (Some(Err(e6)), _) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                            (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                            _ => DnsError::NoRecords,
+                        };
+                        log::debug!("DNS resolution failed: {:?}", err);
+                        Some(Err(err))
+                    }
+                    _ => None,
+                },
+                false => match (&group.ipv4_result, &group.ipv6_result) {
+                    (Some(Ok(v4_records)), _) if !v4_records.is_empty() => {
+                        log::debug!("DNS resolved (IPv4): {:?}", v4_records[0].address);
+                        Some(Ok(v4_records[0].address))
+                    }
+                    (_, Some(Ok(v6_records))) if !v6_records.is_empty() => {
+                        log::debug!("DNS resolved (IPv6): {:?}", v6_records[0].address);
+                        Some(Ok(v6_records[0].address))
+                    }
+                    (Some(_), Some(_)) => {
+                        let err = match (&group.ipv4_result, &group.ipv6_result) {
+                            (Some(Err(e4)), _) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                            (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                            _ => DnsError::NoRecords,
+                        };
+                        log::debug!("DNS resolution failed: {:?}", err);
+                        Some(Err(err))
+                    }
+                    _ => None,
+                },
+            };
 
-        if let Some(res) = result {
-            // Cleanup remaining queries for this group
-            let remaining: Vec<u16> = dns_queries
-                .iter()
-                .filter(|(_, s)| s.group_id == group_id)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in remaining {
-                dns_queries.remove(&id);
+            // Send response early (Happy Eyeballs), but keep group for cache update
+            if let Some(res) = result {
+                let mapped = res.map_err(ManagerError::Dns);
+                if let Some(response) = group.response.take() {
+                    if response.send(mapped).is_err() {
+                        log::trace!("Failed to send DNS response: receiver dropped");
+                    }
+                }
+            }
+        }
+
+        // Check if both queries completed - then update cache and cleanup
+        if group.ipv4_result.is_some() && group.ipv6_result.is_some() {
+            // Update cache with all records
+            let mut all_records: Vec<DnsRecord> = Vec::new();
+            if let Some(Ok(v4)) = &group.ipv4_result {
+                all_records.extend(v4.iter().cloned());
+            }
+            if let Some(Ok(v6)) = &group.ipv6_result {
+                all_records.extend(v6.iter().cloned());
+            }
+            if !all_records.is_empty() {
+                let domain = group.domain.clone();
+                dns_cache_insert(dns_cache, domain.clone(), &all_records);
+                log::debug!("DNS cache updated: {} ({} records)", domain, all_records.len());
             }
 
-            // Send response and remove group
-            let mapped = res.map_err(ManagerError::Dns);
-            if let Some(group) = dns_groups.remove(&group_id)
-                && group.response.send(mapped).is_err()
-            {
-                log::trace!("Failed to send DNS response: receiver dropped");
-            }
+            // Remove group and cleanup queries
+            dns_groups.remove(&group_id);
+            dns_queries.retain(|_, s| s.group_id != group_id);
         }
     }
 
@@ -1197,6 +1294,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         dns_queries: &mut HashMap<u16, DnsQueryState>,
         dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
         dns_sockets: &DnsSockets,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         last_keepalive: &mut Instant,
@@ -1218,7 +1316,7 @@ impl TunnelManager {
         }
 
         // Process DNS responses
-        Self::process_dns_responses(stack, dns_queries, dns_groups, dns_sockets);
+        Self::process_dns_responses(stack, dns_queries, dns_groups, dns_cache, dns_sockets);
 
         // Process UDP session responses
         Self::process_udp_responses(stack, udp_sessions);
@@ -1242,13 +1340,12 @@ impl TunnelManager {
                 dns_queries.remove(&id);
             }
             // Send timeout error
-            if let Some(group) = dns_groups.remove(&group_id)
-                && group
-                    .response
-                    .send(Err(ManagerError::Dns(DnsError::Timeout)))
-                    .is_err()
-            {
-                log::trace!("Failed to send DNS timeout response: receiver dropped");
+            if let Some(mut group) = dns_groups.remove(&group_id) {
+                if let Some(response) = group.response.take() {
+                    if response.send(Err(ManagerError::Dns(DnsError::Timeout))).is_err() {
+                        log::trace!("Failed to send DNS timeout response: receiver dropped");
+                    }
+                }
             }
         }
 

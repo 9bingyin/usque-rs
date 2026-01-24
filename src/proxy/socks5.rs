@@ -283,7 +283,7 @@ async fn resolve_target_addr(
         }
         TargetAddr::Domain(domain, port) => {
             log::debug!("Resolving {} through tunnel", domain);
-            let ip = manager.resolve(domain, false).await
+            let ip = manager.resolve(domain, true).await
                 .map_err(|e| Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e)))?;
             log::debug!("Resolved {} -> {:?}", domain, ip);
             Ok((ip, *port))
@@ -661,7 +661,7 @@ async fn target_addr_to_ip(target: &TargetAddr, manager: &TunnelManager) -> Opti
             Some((ip, addr.port()))
         }
         TargetAddr::Domain(domain, port) => {
-            match manager.resolve(domain, false).await {
+            match manager.resolve(domain, true).await {
                 Ok(ip) => Some((ip, *port)),
                 Err(e) => {
                     log::warn!("UDP DNS resolution failed for {}: {:?}", domain, e);
