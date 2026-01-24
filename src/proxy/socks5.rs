@@ -25,6 +25,47 @@ const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_FRAG_MAX_COUNT: usize = 128;
 
+// RFC 8305 Happy Eyeballs parameters
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+// RFC 8305 Section 4: Interleave addresses (IPv6, IPv4, IPv6, IPv4, ...)
+// In-place sorting to avoid extra allocations
+fn interleave_addresses(mut addresses: Vec<IpAddress>) -> Vec<IpAddress> {
+    if addresses.len() <= 1 {
+        return addresses;
+    }
+
+    // Count IPv6 addresses
+    let v6_count = addresses.iter().filter(|ip| matches!(ip, IpAddress::Ipv6(_))).count();
+    let v4_count = addresses.len() - v6_count;
+
+    // If all same type, no interleaving needed
+    if v6_count == 0 || v4_count == 0 {
+        return addresses;
+    }
+
+    // Partition: move all IPv6 to front, IPv4 to back (stable partition)
+    addresses.sort_by_key(|ip| matches!(ip, IpAddress::Ipv4(_)));
+
+    // Now addresses = [v6_0, v6_1, ..., v4_0, v4_1, ...]
+    // Interleave in-place using a simple algorithm
+    let mut result = Vec::with_capacity(addresses.len());
+    let mut v6_idx = 0;
+    let mut v4_idx = v6_count;
+
+    while v6_idx < v6_count || v4_idx < addresses.len() {
+        if v6_idx < v6_count {
+            result.push(addresses[v6_idx]);
+            v6_idx += 1;
+        }
+        if v4_idx < addresses.len() {
+            result.push(addresses[v4_idx]);
+            v4_idx += 1;
+        }
+    }
+    result
+}
+
 struct FragBuffer {
     fragments: Vec<Option<Bytes>>,
     highest_seq: u8,
@@ -247,14 +288,12 @@ async fn handle_client(
     .read_command()
     .await?;
 
-    // Resolve DNS through tunnel if needed
-    let resolved_addr = resolve_target_addr(&manager, &target_addr).await?;
-
     match cmd {
         Socks5Command::TCPConnect => {
-            handle_tcp_connect(proto, manager, resolved_addr).await
+            handle_tcp_connect(proto, manager, &target_addr).await
         }
         Socks5Command::TCPBind => {
+            let resolved_addr = resolve_target_addr(&manager, &target_addr).await?;
             handle_tcp_bind(proto, manager, local_addr, resolved_addr).await
         }
         Socks5Command::UDPAssociate => {
@@ -294,12 +333,58 @@ async fn resolve_target_addr(
 async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
     proto: Socks5ServerProtocol<T, fast_socks5::server::states::CommandRead>,
     manager: Arc<TunnelManager>,
-    target: (IpAddress, u16),
+    target: &TargetAddr,
 ) -> Result<(), Socks5Error> {
-    let (remote_ip, remote_port) = target;
+    // Resolve addresses and get port
+    let (addresses, remote_port) = match target {
+        TargetAddr::Ip(addr) => {
+            let ip = match addr.ip() {
+                IpAddr::V4(v4) => {
+                    let o = v4.octets();
+                    IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+                }
+                IpAddr::V6(v6) => {
+                    let s = v6.segments();
+                    IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                }
+            };
+            (vec![ip], addr.port())
+        }
+        TargetAddr::Domain(domain, port) => {
+            log::debug!("Resolving all addresses for {} through tunnel", domain);
+            let ips = manager.resolve_all(domain).await
+                .map_err(|e| Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e)))?;
+            let sorted = interleave_addresses(ips);
+            log::debug!("Resolved {} -> {} addresses (sorted)", domain, sorted.len());
+            (sorted, *port)
+        }
+    };
+
+    if addresses.is_empty() {
+        if let Err(e) = proto.reply_error(&ReplyError::HostUnreachable).await {
+            log::debug!("Failed to send error reply: {}", e);
+        }
+        return Err(Socks5Error::ProtocolError("No addresses resolved".into()));
+    }
+
+    // Single address: use simple connection logic
+    if addresses.len() == 1 {
+        return handle_tcp_connect_single(proto, manager, addresses[0], remote_port).await;
+    }
+
+    // Multiple addresses: use Happy Eyeballs connection racing
+    handle_tcp_connect_racing(proto, manager, addresses, remote_port).await
+}
+
+// Single address connection (no racing needed)
+async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
+    proto: Socks5ServerProtocol<T, fast_socks5::server::states::CommandRead>,
+    manager: Arc<TunnelManager>,
+    remote_ip: IpAddress,
+    remote_port: u16,
+) -> Result<(), Socks5Error> {
     log::debug!("TCP CONNECT to {:?}:{}", remote_ip, remote_port);
 
-    // Create connection through tunnel
     let local_port = get_local_port();
     let channels = match manager.connect(remote_ip, remote_port, local_port).await {
         Ok(channels) => channels,
@@ -312,7 +397,6 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    // Wait for connection with adaptive polling
     let handle = channels.handle;
     if let Err(e) = wait_for_connection(&manager, handle).await {
         let reply = map_connect_error_to_reply(&e);
@@ -323,16 +407,200 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
         return Err(e);
     }
 
-    // Send success reply
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut stream = proto.reply_success(reply_addr).await?;
-
-    // Forward data
     let result = forward_tcp_data(&mut stream, channels).await;
-
-    // Cleanup
     manager.close(handle).await;
     result
+}
+
+// RFC 8305 Happy Eyeballs: race connections to multiple addresses
+// Event-driven: uses wait_socket_ready instead of polling
+async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
+    proto: Socks5ServerProtocol<T, fast_socks5::server::states::CommandRead>,
+    manager: Arc<TunnelManager>,
+    addresses: Vec<IpAddress>,
+    remote_port: u16,
+) -> Result<(), Socks5Error> {
+    use tokio::time::timeout;
+
+    log::debug!(
+        "TCP CONNECT racing to {} addresses on port {}",
+        addresses.len(),
+        remote_port
+    );
+
+    let mut addr_iter = addresses.into_iter().peekable();
+    let mut pending: Vec<(SocketHandle, SocketChannels)> = Vec::new();
+    let mut last_error: Option<Socks5Error> = None;
+
+    // Start first connection immediately
+    if let Some(ip) = addr_iter.next() {
+        match start_connection(&manager, ip, remote_port).await {
+            Ok(channels) => {
+                log::debug!("Started connection attempt to {:?}", ip);
+                pending.push((channels.handle, channels));
+            }
+            Err(e) => {
+                log::debug!("Failed to start connection to {:?}: {}", ip, e);
+                last_error = Some(e);
+            }
+        }
+    }
+
+    // Main racing loop with total timeout
+    let result = timeout(CONNECT_TIMEOUT, async {
+        race_connections_event_driven(
+            &manager,
+            &mut pending,
+            &mut addr_iter,
+            remote_port,
+            &mut last_error,
+        ).await
+    }).await;
+
+    match result {
+        Ok(Ok((winner_handle, winner_channels))) => {
+            log::debug!("Connection established to handle {:?}", winner_handle);
+            let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+            let mut stream = proto.reply_success(reply_addr).await?;
+            let result = forward_tcp_data(&mut stream, winner_channels).await;
+            manager.close(winner_handle).await;
+            result
+        }
+        Ok(Err(e)) => {
+            let reply = map_connect_error_to_reply(&e);
+            if let Err(rep_err) = proto.reply_error(&reply).await {
+                log::debug!("Failed to send error reply: {}", rep_err);
+            }
+            Err(e)
+        }
+        Err(_) => {
+            // Timeout - cleanup pending connections
+            for (handle, _) in pending.drain(..) {
+                manager.close(handle).await;
+            }
+            if let Err(e) = proto.reply_error(&ReplyError::ConnectionTimeout).await {
+                log::debug!("Failed to send timeout reply: {}", e);
+            }
+            Err(Socks5Error::Timeout)
+        }
+    }
+}
+
+/// Event-driven connection racing using wait_socket_ready
+async fn race_connections_event_driven(
+    manager: &Arc<TunnelManager>,
+    pending: &mut Vec<(SocketHandle, SocketChannels)>,
+    addr_iter: &mut std::iter::Peekable<std::vec::IntoIter<IpAddress>>,
+    remote_port: u16,
+    last_error: &mut Option<Socks5Error>,
+) -> Result<(SocketHandle, SocketChannels), Socks5Error> {
+    use tokio::sync::mpsc;
+    use tokio::time::sleep;
+
+    // Channel for receiving connection ready notifications
+    let (ready_tx, mut ready_rx) = mpsc::channel::<(SocketHandle, TcpSocketState)>(16);
+
+    // Start wait tasks for existing pending connections
+    for (handle, _) in pending.iter() {
+        let manager = manager.clone();
+        let handle = *handle;
+        let tx = ready_tx.clone();
+        tokio::spawn(async move {
+            let state = manager.wait_socket_ready(handle).await;
+            let _ = tx.send((handle, state)).await;
+        });
+    }
+
+    // Timer for starting next connection
+    let next_attempt = sleep(CONNECTION_ATTEMPT_DELAY);
+    tokio::pin!(next_attempt);
+
+    loop {
+        // Check if we have any pending connections or addresses to try
+        if pending.is_empty() && addr_iter.peek().is_none() {
+            return Err(last_error.take().unwrap_or_else(||
+                Socks5Error::ConnectionFailed("All connection attempts failed".into())));
+        }
+
+        let has_more_addresses = addr_iter.peek().is_some();
+
+        tokio::select! {
+            biased;
+
+            // Wait for connection ready notification
+            Some((handle, state)) = ready_rx.recv() => {
+                match state {
+                    TcpSocketState::Established => {
+                        // Found winner
+                        if let Some(idx) = pending.iter().position(|(h, _)| *h == handle) {
+                            let (winner_handle, winner_channels) = pending.remove(idx);
+                            // Close other pending connections
+                            for (h, _) in pending.drain(..) {
+                                manager.close(h).await;
+                            }
+                            return Ok((winner_handle, winner_channels));
+                        }
+                    }
+                    TcpSocketState::Closed => {
+                        // Connection failed, remove from pending
+                        if let Some(idx) = pending.iter().position(|(h, _)| *h == handle) {
+                            let (h, _) = pending.remove(idx);
+                            manager.close(h).await;
+                            *last_error = Some(Socks5Error::ConnectionFailed("Connection closed".into()));
+
+                            // If no pending connections left, immediately try next address
+                            if pending.is_empty() && has_more_addresses {
+                                next_attempt.as_mut().reset(tokio::time::Instant::now());
+                            }
+                        }
+                    }
+                    TcpSocketState::Connecting => {
+                        // Should not happen - wait_socket_ready only returns on state change
+                    }
+                }
+            }
+
+            // Start next connection after delay (RFC 8305: 250ms)
+            _ = &mut next_attempt, if has_more_addresses => {
+                if let Some(ip) = addr_iter.next() {
+                    log::debug!("Starting next connection attempt to {:?}", ip);
+                    match start_connection(manager, ip, remote_port).await {
+                        Ok(channels) => {
+                            let handle = channels.handle;
+                            pending.push((handle, channels));
+                            // Start wait task for new connection
+                            let manager = manager.clone();
+                            let tx = ready_tx.clone();
+                            tokio::spawn(async move {
+                                let state = manager.wait_socket_ready(handle).await;
+                                let _ = tx.send((handle, state)).await;
+                            });
+                        }
+                        Err(e) => {
+                            log::debug!("Failed to start connection to {:?}: {}", ip, e);
+                            *last_error = Some(e);
+                        }
+                    }
+                }
+                // Reset timer for next attempt
+                next_attempt.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
+            }
+        }
+    }
+}
+
+async fn start_connection(
+    manager: &TunnelManager,
+    remote_ip: IpAddress,
+    remote_port: u16,
+) -> Result<SocketChannels, Socks5Error> {
+    let local_port = get_local_port();
+    manager
+        .connect(remote_ip, remote_port, local_port)
+        .await
+        .map_err(Socks5Error::TunnelError)
 }
 
 /// Handle SOCKS5 BIND command (RFC 1928)

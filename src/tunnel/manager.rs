@@ -105,6 +105,11 @@ pub enum ManagerCommand {
         prefer_ipv6: bool,
         response: oneshot::Sender<Result<IpAddress, ManagerError>>,
     },
+    // DNS resolution returning all addresses (for Happy Eyeballs connection racing)
+    DnsResolveAll {
+        domain: String,
+        response: oneshot::Sender<Result<Vec<IpAddress>, ManagerError>>,
+    },
     // Register UDP session for receiving data from tunnel
     UdpRegister {
         local_port: u16,
@@ -116,6 +121,11 @@ pub enum ManagerCommand {
     },
     // Get TCP socket state
     GetSocketState {
+        handle: SocketHandle,
+        response: oneshot::Sender<TcpSocketState>,
+    },
+    // Wait for socket to become ready (established or closed)
+    WaitSocketReady {
         handle: SocketHandle,
         response: oneshot::Sender<TcpSocketState>,
     },
@@ -144,6 +154,8 @@ struct SocketState {
     pending_from_client_bytes: usize,
     pending_to_client: VecDeque<Bytes>,
     pending_to_client_bytes: usize,
+    // Waiters for socket ready notification (event-driven instead of polling)
+    ready_waiters: Vec<oneshot::Sender<TcpSocketState>>,
 }
 
 // DNS query state for a single query (A or AAAA)
@@ -193,6 +205,7 @@ impl DnsSockets {
 struct DnsQueryGroup {
     domain: String,
     response: Option<oneshot::Sender<Result<IpAddress, ManagerError>>>, // Option to allow early response
+    response_all: Option<oneshot::Sender<Result<Vec<IpAddress>, ManagerError>>>, // For resolve_all
     ipv4_result: Option<Result<Vec<DnsRecord>, DnsError>>,
     ipv6_result: Option<Result<Vec<DnsRecord>, DnsError>>,
     created_at: Instant,
@@ -253,6 +266,25 @@ fn dns_cache_get(cache: &Cache<String, DnsCacheValue>, domain: &str, prefer_ipv6
     }
 
     None
+}
+
+// Get all valid IP addresses from cache (for Happy Eyeballs connection racing)
+fn dns_cache_get_all(cache: &Cache<String, DnsCacheValue>, domain: &str) -> Option<Vec<IpAddress>> {
+    let value = cache.get(domain)?;
+    let now = Instant::now();
+
+    let valid_ips: Vec<IpAddress> = value
+        .records
+        .iter()
+        .filter(|(_, exp)| *exp > now)
+        .map(|(ip, _)| *ip)
+        .collect();
+
+    if valid_ips.is_empty() {
+        None
+    } else {
+        Some(valid_ips)
+    }
 }
 
 fn dns_cache_insert(cache: &mut Cache<String, DnsCacheValue>, domain: String, records: &[DnsRecord]) {
@@ -564,6 +596,37 @@ impl TunnelManager {
         response_rx.await.map_err(|_| ManagerError::ResponseChannelClosed)?
     }
 
+    pub async fn resolve_all(&self, domain: &str) -> Result<Vec<IpAddress>, ManagerError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.cmd_tx
+            .send(ManagerCommand::DnsResolveAll {
+                domain: domain.to_string(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ManagerError::ChannelClosed)?;
+
+        response_rx.await.map_err(|_| ManagerError::ResponseChannelClosed)?
+    }
+
+    pub async fn wait_socket_ready(&self, handle: SocketHandle) -> TcpSocketState {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        if self.cmd_tx
+            .send(ManagerCommand::WaitSocketReady {
+                handle,
+                response: response_tx,
+            })
+            .await
+            .is_err()
+        {
+            return TcpSocketState::Closed;
+        }
+
+        response_rx.await.unwrap_or(TcpSocketState::Closed)
+    }
+
     async fn run_loop(
         mut tunnel: MasqueTunnel,
         mut stack: NetworkStack,
@@ -756,6 +819,26 @@ impl TunnelManager {
                     );
                 }
             }
+            ManagerCommand::DnsResolveAll { domain, response } => {
+                // Check cache first for all addresses
+                if let Some(ips) = dns_cache_get_all(dns_cache, &domain) {
+                    log::debug!("DNS cache hit (all): {} -> {} addresses", domain, ips.len());
+                    if response.send(Ok(ips)).is_err() {
+                        log::trace!("Failed to send cached DNS response: receiver dropped");
+                    }
+                } else {
+                    Self::start_dns_query_all(
+                        stack,
+                        dns_queries,
+                        dns_groups,
+                        dns_sockets,
+                        dns_cache,
+                        &domain,
+                        response,
+                        dns_servers,
+                    );
+                }
+            }
             ManagerCommand::UdpRegister { local_port, response } => {
                 Self::register_udp_session(stack, udp_sessions, local_port, response);
             }
@@ -766,6 +849,21 @@ impl TunnelManager {
                 let state = Self::get_tcp_socket_state(stack, sockets, handle);
                 if response.send(state).is_err() {
                     log::trace!("Failed to send socket state response: receiver dropped");
+                }
+            }
+            ManagerCommand::WaitSocketReady { handle, response } => {
+                let state = Self::get_tcp_socket_state(stack, sockets, handle);
+                if state != TcpSocketState::Connecting {
+                    // Already ready or closed, respond immediately
+                    if response.send(state).is_err() {
+                        log::trace!("Failed to send socket ready response: receiver dropped");
+                    }
+                } else if let Some(socket_state) = sockets.get_mut(&handle) {
+                    // Still connecting, add to waiters
+                    socket_state.ready_waiters.push(response);
+                } else {
+                    // Socket not found
+                    let _ = response.send(TcpSocketState::Closed);
                 }
             }
         }
@@ -784,6 +882,11 @@ impl TunnelManager {
                     log::trace!("Failed to send DNS error: receiver dropped");
                 }
             }
+            ManagerCommand::DnsResolveAll { response, .. } => {
+                if response.send(Err(ManagerError::NotConnected)).is_err() {
+                    log::trace!("Failed to send DNS error: receiver dropped");
+                }
+            }
             ManagerCommand::UdpRegister { response, .. } => {
                 if response.send(Err(ManagerError::NotConnected)).is_err() {
                     log::trace!("Failed to send UDP register error: receiver dropped");
@@ -794,6 +897,9 @@ impl TunnelManager {
                 if response.send(TcpSocketState::Closed).is_err() {
                     log::trace!("Failed to send socket state: receiver dropped");
                 }
+            }
+            ManagerCommand::WaitSocketReady { response, .. } => {
+                let _ = response.send(TcpSocketState::Closed);
             }
         }
     }
@@ -847,6 +953,7 @@ impl TunnelManager {
             pending_from_client_bytes: 0,
             pending_to_client: VecDeque::new(),
             pending_to_client_bytes: 0,
+            ready_waiters: Vec::new(),
         };
 
         sockets.insert(handle, state);
@@ -863,9 +970,14 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         handle: SocketHandle,
     ) {
+        // Notify all waiters that the connection is closed
+        if let Some(state) = sockets.remove(&handle) {
+            for waiter in state.ready_waiters {
+                let _ = waiter.send(TcpSocketState::Closed);
+            }
+        }
         stack.tcp_close(handle);
         stack.remove_socket(handle);
-        sockets.remove(&handle);
     }
 
     fn get_tcp_socket_state(
@@ -883,6 +995,45 @@ impl TunnelManager {
             TcpSocketState::Established
         } else {
             TcpSocketState::Connecting
+        }
+    }
+
+    // Notify waiters when socket state changes from Connecting
+    // Two-phase approach to avoid borrow conflicts:
+    // 1. Collect notifications while holding mutable borrow
+    // 2. Send notifications after releasing borrow
+    fn notify_ready_waiters(
+        stack: &mut NetworkStack,
+        sockets: &mut HashMap<SocketHandle, SocketState>,
+    ) {
+        // Phase 1: Collect notifications
+        let mut notifications: Vec<(Vec<oneshot::Sender<TcpSocketState>>, TcpSocketState)> = Vec::new();
+
+        for (handle, state) in sockets.iter_mut() {
+            if state.ready_waiters.is_empty() {
+                continue;
+            }
+            // Check current state
+            let tcp_state = if !stack.tcp_is_active(*handle) {
+                TcpSocketState::Closed
+            } else if stack.tcp_may_send(*handle) && stack.tcp_may_recv(*handle) {
+                TcpSocketState::Established
+            } else {
+                TcpSocketState::Connecting
+            };
+
+            if tcp_state != TcpSocketState::Connecting {
+                // State changed, drain waiters
+                let waiters: Vec<_> = state.ready_waiters.drain(..).collect();
+                notifications.push((waiters, tcp_state));
+            }
+        }
+
+        // Phase 2: Send notifications (no longer borrowing sockets)
+        for (waiters, tcp_state) in notifications {
+            for waiter in waiters {
+                let _ = waiter.send(tcp_state);
+            }
         }
     }
 
@@ -1000,6 +1151,7 @@ impl TunnelManager {
             DnsQueryGroup {
                 domain: domain.to_string(),
                 response: Some(response),
+                response_all: None,
                 ipv4_result: None,
                 ipv6_result: None,
                 created_at: Instant::now(),
@@ -1063,6 +1215,107 @@ impl TunnelManager {
                         },
                     );
                     log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
+                } else {
+                    Self::record_dns_error(
+                        dns_groups,
+                        group_id,
+                        DnsRecordType::AAAA,
+                        DnsError::SocketError("DNS AAAA send failed".into()),
+                    );
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
+                }
+            }
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
+            }
+        }
+    }
+
+    fn start_dns_query_all(
+        stack: &mut NetworkStack,
+        dns_queries: &mut HashMap<u16, DnsQueryState>,
+        dns_groups: &mut HashMap<u32, DnsQueryGroup>,
+        dns_sockets: &mut DnsSockets,
+        dns_cache: &mut Cache<String, DnsCacheValue>,
+        domain: &str,
+        response: oneshot::Sender<Result<Vec<IpAddress>, ManagerError>>,
+        dns_servers: &[IpAddress],
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let group_id = DNS_GROUP_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Create group to track both queries (resolve_all waits for both results)
+        dns_groups.insert(
+            group_id,
+            DnsQueryGroup {
+                domain: domain.to_string(),
+                response: None,
+                response_all: Some(response),
+                ipv4_result: None,
+                ipv6_result: None,
+                created_at: Instant::now(),
+                prefer_ipv6: true, // Default to IPv6 preference for sorting
+            },
+        );
+
+        // Select DNS server (prefer IPv6 for resolve_all)
+        let dns_server = Self::select_dns_server(dns_servers, true);
+
+        let dns_handle = match dns_sockets.ensure_socket(stack, dns_server) {
+            Ok(handle) => handle,
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e.clone());
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::AAAA, e);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
+                return;
+            }
+        };
+
+        // Send A query (IPv4)
+        match Self::build_unique_dns_query(dns_queries, domain, DnsRecordType::A) {
+            Ok((tx_id_a, packet_a)) => {
+                if stack.udp_send(dns_handle, dns_server, dns_port(), &packet_a).is_ok() {
+                    dns_queries.insert(
+                        tx_id_a,
+                        DnsQueryState {
+                            group_id,
+                            query_type: DnsRecordType::A,
+                        },
+                    );
+                    log::debug!("DNS A query sent (all): {} (id={})", domain, tx_id_a);
+                } else {
+                    Self::record_dns_error(
+                        dns_groups,
+                        group_id,
+                        DnsRecordType::A,
+                        DnsError::SocketError("DNS A send failed".into()),
+                    );
+                    Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
+                }
+            }
+            Err(e) => {
+                Self::record_dns_error(dns_groups, group_id, DnsRecordType::A, e);
+                Self::try_resolve_dns_group(dns_queries, dns_groups, dns_cache, group_id);
+            }
+        }
+
+        // Send AAAA query (IPv6)
+        match Self::build_unique_dns_query(dns_queries, domain, DnsRecordType::AAAA) {
+            Ok((tx_id_aaaa, packet_aaaa)) => {
+                if stack
+                    .udp_send(dns_handle, dns_server, dns_port(), &packet_aaaa)
+                    .is_ok()
+                {
+                    dns_queries.insert(
+                        tx_id_aaaa,
+                        DnsQueryState {
+                            group_id,
+                            query_type: DnsRecordType::AAAA,
+                        },
+                    );
+                    log::debug!("DNS AAAA query sent (all): {} (id={})", domain, tx_id_aaaa);
                 } else {
                     Self::record_dns_error(
                         dns_groups,
@@ -1252,6 +1505,27 @@ impl TunnelManager {
                 log::debug!("DNS cache updated: {} ({} records)", domain, all_records.len());
             }
 
+            // Handle response_all: return all addresses when both queries complete
+            if let Some(response_all) = group.response_all.take() {
+                let all_ips: Vec<IpAddress> = all_records.iter().map(|r| r.address).collect();
+                if all_ips.is_empty() {
+                    let err = match (&group.ipv4_result, &group.ipv6_result) {
+                        (Some(Err(e4)), _) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
+                        (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
+                        _ => DnsError::NoRecords,
+                    };
+                    log::debug!("DNS resolution (all) failed: {:?}", err);
+                    if response_all.send(Err(ManagerError::Dns(err))).is_err() {
+                        log::trace!("Failed to send DNS response (all): receiver dropped");
+                    }
+                } else {
+                    log::debug!("DNS resolved (all): {} addresses", all_ips.len());
+                    if response_all.send(Ok(all_ips)).is_err() {
+                        log::trace!("Failed to send DNS response (all): receiver dropped");
+                    }
+                }
+            }
+
             // Remove group and cleanup queries
             dns_groups.remove(&group_id);
             dns_queries.retain(|_, s| s.group_id != group_id);
@@ -1315,6 +1589,9 @@ impl TunnelManager {
             return false;
         }
 
+        // Notify waiters of socket state changes (event-driven)
+        Self::notify_ready_waiters(stack, sockets);
+
         // Process DNS responses
         Self::process_dns_responses(stack, dns_queries, dns_groups, dns_cache, dns_sockets);
 
@@ -1344,6 +1621,11 @@ impl TunnelManager {
                 if let Some(response) = group.response.take() {
                     if response.send(Err(ManagerError::Dns(DnsError::Timeout))).is_err() {
                         log::trace!("Failed to send DNS timeout response: receiver dropped");
+                    }
+                }
+                if let Some(response_all) = group.response_all.take() {
+                    if response_all.send(Err(ManagerError::Dns(DnsError::Timeout))).is_err() {
+                        log::trace!("Failed to send DNS timeout response (all): receiver dropped");
                     }
                 }
             }
