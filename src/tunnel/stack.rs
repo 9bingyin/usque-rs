@@ -1,10 +1,11 @@
 use crate::tunnel::device::VirtualDevice;
 use bytes::BytesMut;
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{Socket, tcp::{Socket as TcpSocket, SocketBuffer}};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -21,6 +22,7 @@ pub struct NetworkStack {
     device: VirtualDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
+    valid_handles: HashSet<SocketHandle>,
     local_ipv4: Option<Ipv4Address>,
     local_ipv6: Option<Ipv6Address>,
 }
@@ -121,6 +123,7 @@ impl NetworkStack {
             device,
             iface,
             sockets,
+            valid_handles: HashSet::new(),
             local_ipv4,
             local_ipv6,
         }
@@ -138,24 +141,45 @@ impl NetworkStack {
         Ok(())
     }
 
-    pub fn create_tcp_socket_with_buffer(&mut self, buffer_size: usize) -> smoltcp::iface::SocketHandle {
+    fn get_tcp_socket_mut(&mut self, handle: SocketHandle) -> Option<&mut TcpSocket<'static>> {
+        if self.valid_handles.contains(&handle) {
+            Some(self.sockets.get_mut::<TcpSocket>(handle))
+        } else {
+            None
+        }
+    }
+
+    fn get_udp_socket_mut(&mut self, handle: SocketHandle) -> Option<&mut UdpSocket<'static>> {
+        if self.valid_handles.contains(&handle) {
+            Some(self.sockets.get_mut::<UdpSocket>(handle))
+        } else {
+            None
+        }
+    }
+
+    pub fn create_tcp_socket_with_buffer(&mut self, buffer_size: usize) -> SocketHandle {
         let rx_buffer = SocketBuffer::new(vec![0; buffer_size]);
         let tx_buffer = SocketBuffer::new(vec![0; buffer_size]);
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        self.sockets.add(socket)
+        let handle = self.sockets.add(socket);
+        self.valid_handles.insert(handle);
+        handle
     }
 
     pub fn connect_tcp(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: SocketHandle,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
     ) -> Result<(), StackError> {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
+        if !self.valid_handles.contains(&handle) {
+            return Err(StackError::SocketError("invalid socket handle".into()));
+        }
         let cx = self.iface.context();
+        let socket = self.sockets.get_mut::<TcpSocket>(handle);
         socket
             .connect(cx, (remote_ip, remote_port), local_port)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
@@ -163,10 +187,11 @@ impl NetworkStack {
 
     pub fn tcp_send(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: SocketHandle,
         data: &[u8],
     ) -> Result<usize, StackError> {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
+        let socket = self.get_tcp_socket_mut(handle)
+            .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .send_slice(data)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
@@ -174,37 +199,44 @@ impl NetworkStack {
 
     pub fn tcp_recv(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: SocketHandle,
         buf: &mut [u8],
     ) -> Result<usize, StackError> {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
+        let socket = self.get_tcp_socket_mut(handle)
+            .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .recv_slice(buf)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
     }
 
-    pub fn tcp_is_active(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
-        socket.is_active()
+    pub fn tcp_is_active(&mut self, handle: SocketHandle) -> bool {
+        self.get_tcp_socket_mut(handle)
+            .map(|s| s.is_active())
+            .unwrap_or(false)
     }
 
-    pub fn tcp_may_send(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
-        socket.may_send()
+    pub fn tcp_may_send(&mut self, handle: SocketHandle) -> bool {
+        self.get_tcp_socket_mut(handle)
+            .map(|s| s.may_send())
+            .unwrap_or(false)
     }
 
-    pub fn tcp_may_recv(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
-        socket.may_recv()
+    pub fn tcp_may_recv(&mut self, handle: SocketHandle) -> bool {
+        self.get_tcp_socket_mut(handle)
+            .map(|s| s.may_recv())
+            .unwrap_or(false)
     }
 
-    pub fn tcp_close(&mut self, handle: smoltcp::iface::SocketHandle) {
-        let socket = self.sockets.get_mut::<TcpSocket>(handle);
-        socket.close();
+    pub fn tcp_close(&mut self, handle: SocketHandle) {
+        if let Some(socket) = self.get_tcp_socket_mut(handle) {
+            socket.close();
+        }
     }
 
-    pub fn remove_socket(&mut self, handle: smoltcp::iface::SocketHandle) {
-        self.sockets.remove(handle);
+    pub fn remove_socket(&mut self, handle: SocketHandle) {
+        if self.valid_handles.remove(&handle) {
+            self.sockets.remove(handle);
+        }
     }
 
     pub fn inject_packet(&mut self, packet: &[u8]) {
@@ -244,7 +276,7 @@ impl NetworkStack {
         &mut self,
         local_addr: IpAddress,
         local_port: u16,
-    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
+    ) -> Result<SocketHandle, StackError> {
         let rx_buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; 16],
             vec![0; 8192],
@@ -260,7 +292,9 @@ impl NetworkStack {
             .bind(local_endpoint)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))?;
 
-        Ok(self.sockets.add(socket))
+        let handle = self.sockets.add(socket);
+        self.valid_handles.insert(handle);
+        Ok(handle)
     }
 
     // UDP socket methods for DNS resolution and UDP associate
@@ -268,7 +302,7 @@ impl NetworkStack {
         &mut self,
         local_port: u16,
         remote_ip: IpAddress,
-    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
+    ) -> Result<SocketHandle, StackError> {
         let local_addr = self.local_addr_for_remote(remote_ip)?;
         self.bind_udp_socket(local_addr, local_port)
     }
@@ -276,19 +310,20 @@ impl NetworkStack {
     pub fn create_udp_socket_default(
         &mut self,
         local_port: u16,
-    ) -> Result<smoltcp::iface::SocketHandle, StackError> {
+    ) -> Result<SocketHandle, StackError> {
         let local_addr = self.local_addr_default()?;
         self.bind_udp_socket(local_addr, local_port)
     }
 
     pub fn udp_send(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: SocketHandle,
         remote_ip: IpAddress,
         remote_port: u16,
         data: &[u8],
     ) -> Result<(), StackError> {
-        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        let socket = self.get_udp_socket_mut(handle)
+            .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         let endpoint = IpEndpoint::new(remote_ip, remote_port);
         socket
             .send_slice(data, endpoint)
@@ -297,17 +332,19 @@ impl NetworkStack {
 
     pub fn udp_recv(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: SocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, UdpMetadata), StackError> {
-        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        let socket = self.get_udp_socket_mut(handle)
+            .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .recv_slice(buf)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
     }
 
-    pub fn udp_can_recv(&mut self, handle: smoltcp::iface::SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<UdpSocket>(handle);
-        socket.can_recv()
+    pub fn udp_can_recv(&mut self, handle: SocketHandle) -> bool {
+        self.get_udp_socket_mut(handle)
+            .map(|s| s.can_recv())
+            .unwrap_or(false)
     }
 }
