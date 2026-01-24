@@ -2,6 +2,30 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 
 mod api;
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 mod config;
 mod crypto;
 mod proxy;
@@ -456,7 +480,16 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
     };
 
     println!("Starting SOCKS5 server on {}:{}", bind, port);
-    server.run().await?;
+    tokio::select! {
+        result = server.run() => {
+            if let Err(e) = result {
+                log::error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown_signal() => {
+            log::info!("Shutdown signal received, exiting");
+        }
+    }
 
     Ok(())
 }
