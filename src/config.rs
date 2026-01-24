@@ -6,11 +6,11 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
-    ReadError(#[from] std::io::Error),
+    Read(#[from] std::io::Error),
     #[error("failed to parse config file: {0}")]
-    ParseError(#[from] serde_json::Error),
+    Parse(#[from] serde_json::Error),
     #[error("crypto error: {0}")]
-    CryptoError(String),
+    Crypto(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -45,7 +45,7 @@ impl Config {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(&self.private_key)
-            .map_err(|e| ConfigError::ParseError(serde_json::Error::io(std::io::Error::new(
+            .map_err(|e| ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to decode private key: {}", e),
             ))))
@@ -62,7 +62,7 @@ impl Config {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(&base64_content)
-            .map_err(|e| ConfigError::ParseError(serde_json::Error::io(std::io::Error::new(
+            .map_err(|e| ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to decode endpoint public key: {}", e),
             ))))
@@ -82,6 +82,6 @@ impl Config {
 
         // Fallback to PKCS#8 format
         SigningKey::from_pkcs8_der(&der)
-            .map_err(|e| ConfigError::CryptoError(e.to_string()))
+            .map_err(|e| ConfigError::Crypto(e.to_string()))
     }
 }

@@ -15,7 +15,6 @@ pub enum CryptoError {
 pub struct EcKeyPair {
     pub private_key_der: Vec<u8>,
     pub public_key_der: Vec<u8>,
-    pub signing_key: SigningKey,
 }
 
 pub fn generate_ec_key_pair() -> Result<EcKeyPair, CryptoError> {
@@ -37,7 +36,6 @@ pub fn generate_ec_key_pair() -> Result<EcKeyPair, CryptoError> {
     Ok(EcKeyPair {
         private_key_der,
         public_key_der,
-        signing_key,
     })
 }
 

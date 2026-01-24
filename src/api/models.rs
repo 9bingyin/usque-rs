@@ -29,56 +29,21 @@ pub struct DeviceUpdate {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountData {
     pub id: String,
-    #[serde(rename = "type")]
-    pub account_type: Option<String>,
-    pub model: Option<String>,
-    pub name: Option<String>,
-    pub key: Option<String>,
-    pub key_type: Option<String>,
-    #[serde(rename = "tunnel_type")]
-    pub tun_type: Option<String>,
     pub account: Account,
     pub config: AccountConfig,
-    pub warp_enabled: Option<bool>,
-    pub waitlist_enabled: Option<bool>,
-    pub created: Option<String>,
-    pub updated: Option<String>,
-    pub tos: Option<String>,
-    pub place: Option<i32>,
-    pub locale: Option<String>,
-    pub enabled: Option<bool>,
-    pub install_id: Option<String>,
     pub token: Option<String>,
-    pub fcm_token: Option<String>,
-    #[serde(rename = "serial_number")]
-    pub serial: Option<String>,
-    pub policy: Option<Policy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Account {
-    pub id: String,
-    pub account_type: Option<String>,
-    pub created: Option<String>,
-    pub updated: Option<String>,
-    pub managed: Option<String>,
-    pub organization: Option<String>,
-    pub premium_data: Option<i64>,
-    pub quota: Option<i64>,
-    pub warp_plus: Option<bool>,
-    pub referral_count: Option<i32>,
-    pub referral_renewal_countdown: Option<i32>,
-    pub role: Option<String>,
     pub license: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountConfig {
-    pub client_id: Option<String>,
     pub peers: Option<Vec<Peer>>,
     #[serde(rename = "interface")]
     pub interface_config: Option<InterfaceConfig>,
-    pub services: Option<Services>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,29 +67,4 @@ pub struct Peer {
 pub struct Endpoint {
     pub v4: Option<String>,
     pub v6: Option<String>,
-    pub host: Option<String>,
-    pub ports: Option<Vec<u16>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Services {
-    pub http_proxy: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Policy {
-    pub tunnel_protocol: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiError {
-    pub code: Option<i32>,
-    pub message: Option<String>,
-    pub errors: Option<Vec<ApiErrorDetail>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiErrorDetail {
-    pub code: Option<i32>,
-    pub message: Option<String>,
 }

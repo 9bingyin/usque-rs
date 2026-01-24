@@ -34,8 +34,6 @@ pub enum DnsError {
     NoRecords,
     #[error("invalid response")]
     InvalidResponse,
-    #[error("channel error")]
-    ChannelError,
     #[error("encode error: {0}")]
     EncodeError(String),
     #[error("decode error: {0}")]
@@ -44,8 +42,6 @@ pub enum DnsError {
     ParseError(String),
     #[error("socket error: {0}")]
     SocketError(String),
-    #[error("tunnel not connected")]
-    NotConnected,
 }
 
 /// Parse DNS server addresses from string list

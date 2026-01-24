@@ -143,7 +143,7 @@ impl MasqueTunnel {
             }
             Err(e) => {
                 log::warn!("dgram_send error: {:?}, buf len: {}", e, self.dgram_send_buf.len());
-                Err(MasqueError::QuicError(QuicError::QuicError(e)))
+                Err(MasqueError::QuicError(QuicError::Quiche(e)))
             }
         }
     }
@@ -195,7 +195,7 @@ impl MasqueTunnel {
                 Ok(payload_len)
             }
             Err(quiche::Error::Done) => Ok(0),
-            Err(e) => Err(MasqueError::QuicError(QuicError::QuicError(e))),
+            Err(e) => Err(MasqueError::QuicError(QuicError::Quiche(e))),
         }
     }
 
@@ -286,7 +286,7 @@ impl MasqueTunnel {
                     Ok(_) => {}
                     Err(e) => {
                         log::error!("QUIC recv error: {:?}", e);
-                        return Err(MasqueError::QuicError(QuicError::QuicError(e)));
+                        return Err(MasqueError::QuicError(QuicError::Quiche(e)));
                     }
                 }
             }

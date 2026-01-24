@@ -50,7 +50,7 @@ pub enum QuicError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("QUIC error: {0}")]
-    QuicError(#[from] quiche::Error),
+    Quiche(#[from] quiche::Error),
     #[error("connection error: {0}")]
     ConnectionError(String),
     #[error("handshake timeout")]
@@ -173,7 +173,7 @@ impl QuicConnection {
             let (write, _send_info) = match self.conn.send(&mut self.send_buf) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
-                Err(e) => return Err(QuicError::QuicError(e)),
+                Err(e) => return Err(QuicError::Quiche(e)),
             };
 
             self.socket.send_to(&self.send_buf[..write], self.peer_addr).await?;

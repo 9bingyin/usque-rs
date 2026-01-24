@@ -99,10 +99,10 @@ impl FragBuffer {
             return None;
         }
 
-        if let Some(end_seq) = self.end_seq {
-            if seq > end_seq {
-                self.reset(now);
-            }
+        if let Some(end_seq) = self.end_seq
+            && seq > end_seq
+        {
+            self.reset(now);
         }
 
         if seq < self.highest_seq {
@@ -124,9 +124,7 @@ impl FragBuffer {
 
         let end_seq = self.end_seq?;
         for idx in 1..=end_seq {
-            if self.fragments[idx as usize].is_none() {
-                return None;
-            }
+            self.fragments[idx as usize].as_ref()?;
         }
 
         let total_len: usize = (1..=end_seq)
@@ -884,10 +882,10 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
 
                             if let Some(assembled) = buffer.insert(seq, is_last, Bytes::copy_from_slice(payload), now) {
                                 frag_buffers.remove(&target);
-                                if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await {
-                                    if let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, assembled).await {
-                                        log::debug!("Failed to send UDP data to tunnel: {}", e);
-                                    }
+                                if let Some((remote_ip, remote_port)) = target_addr_to_ip(&target, manager).await
+                                    && let Err(e) = manager.send_udp(remote_ip, remote_port, local_port, assembled).await
+                                {
+                                    log::debug!("Failed to send UDP data to tunnel: {}", e);
                                 }
                             }
                         }

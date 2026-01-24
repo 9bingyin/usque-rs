@@ -91,20 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
         Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu } => {
-            run_socks_server(
-                &bind,
+            let options = SocksServerOptions {
+                bind,
                 port,
-                &config,
+                config_path: config,
                 username,
                 password,
-                &sni,
-                dns,
+                sni,
+                dns_servers: dns,
                 connect_port,
                 keepalive,
                 initial_packet_size,
                 mtu,
-            )
-            .await?;
+            };
+            run_socks_server(options).await?;
         }
     }
 
@@ -312,20 +312,36 @@ async fn enroll_device(
     Ok(())
 }
 
-async fn run_socks_server(
-    bind: &str,
+struct SocksServerOptions {
+    bind: String,
     port: u16,
-    config_path: &str,
+    config_path: String,
     username: Option<String>,
     password: Option<String>,
-    sni: &str,
+    sni: String,
     dns_servers: Vec<String>,
     connect_port: u16,
     keepalive: u64,
     initial_packet_size: u16,
     mtu: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+}
+
+async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
+
+    let SocksServerOptions {
+        bind,
+        port,
+        config_path,
+        username,
+        password,
+        sni,
+        dns_servers,
+        connect_port,
+        keepalive,
+        initial_packet_size,
+        mtu,
+    } = options;
 
     // Read tuning parameters from environment variables
     let congestion_control: String = std::env::var("USQUE_CC")
@@ -346,7 +362,7 @@ async fn run_socks_server(
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let cfg = config::Config::load(config_path)?;
+    let cfg = config::Config::load(&config_path)?;
     println!("Config loaded from {}", config_path);
 
     let signing_key = cfg.get_signing_key()?;
@@ -399,7 +415,7 @@ async fn run_socks_server(
         endpoint,
         cert_der,
         key_der,
-        sni: sni.to_string(),
+        sni,
         endpoint_pub_key,
         ipv4: cfg.ipv4.clone(),
         ipv6: if cfg.ipv6.trim().is_empty() { None } else { Some(cfg.ipv6.clone()) },
@@ -416,7 +432,7 @@ async fn run_socks_server(
         .map(|n| n.get())
         .unwrap_or(1);
     let worker_count = if tunnel_workers == 0 {
-        available.min(4).max(1)
+        available.clamp(1, 4)
     } else {
         tunnel_workers.max(1)
     };

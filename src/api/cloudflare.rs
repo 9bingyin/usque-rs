@@ -15,11 +15,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Error, Debug)]
 pub enum ApiClientError {
     #[error("HTTP request failed: {0}")]
-    RequestError(#[from] reqwest::Error),
+    Request(#[from] reqwest::Error),
     #[error("API error: {0}")]
-    ApiError(String),
+    Api(String),
     #[error("crypto error: {0}")]
-    CryptoError(String),
+    Crypto(String),
 }
 
 pub struct CloudflareClient {
@@ -66,9 +66,9 @@ impl CloudflareClient {
         jwt: Option<&str>,
     ) -> Result<AccountData, ApiClientError> {
         let wg_key = generate_random_wg_pubkey()
-            .map_err(|e| ApiClientError::CryptoError(e.to_string()))?;
+            .map_err(|e| ApiClientError::Crypto(e.to_string()))?;
         let serial = generate_random_serial()
-            .map_err(|e| ApiClientError::CryptoError(e.to_string()))?;
+            .map_err(|e| ApiClientError::Crypto(e.to_string()))?;
 
         let registration = Registration {
             key: wg_key,
@@ -99,7 +99,7 @@ impl CloudflareClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiClientError::ApiError(format!(
+            return Err(ApiClientError::Api(format!(
                 "registration failed: {} - {}",
                 status, body
             )));
@@ -139,7 +139,7 @@ impl CloudflareClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiClientError::ApiError(format!(
+            return Err(ApiClientError::Api(format!(
                 "enroll key failed: {} - {}",
                 status, body
             )));
