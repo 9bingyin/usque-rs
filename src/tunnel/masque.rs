@@ -59,16 +59,15 @@ impl MasqueTunnel {
         // quiche automatically sends SETTINGS_H3_DATAGRAM_00 (0x276) and
         // SETTINGS_H3_DATAGRAM (0x33) when the QUIC connection has datagrams enabled
 
-        let h3_conn = quiche::h3::Connection::with_transport(
-            &mut self.quic_conn.conn,
-            &h3_config,
-        )?;
+        let h3_conn = quiche::h3::Connection::with_transport(&mut self.quic_conn.conn, &h3_config)?;
         self.h3_conn = Some(h3_conn);
         Ok(())
     }
 
     pub fn send_connect_ip_request(&mut self) -> Result<u64, MasqueError> {
-        let h3_conn = self.h3_conn.as_mut()
+        let h3_conn = self
+            .h3_conn
+            .as_mut()
             .ok_or_else(|| MasqueError::ConnectionError("H3 not initialized".into()))?;
 
         // Cloudflare uses "cf-connect-ip" instead of standard "connect-ip"
@@ -83,18 +82,15 @@ impl MasqueTunnel {
             quiche::h3::Header::new(b"user-agent", b""),
         ];
 
-        let stream_id = h3_conn.send_request(
-            &mut self.quic_conn.conn,
-            &headers,
-            false,
-        )?;
+        let stream_id = h3_conn.send_request(&mut self.quic_conn.conn, &headers, false)?;
 
         self.connect_stream_id = Some(stream_id);
         Ok(stream_id)
     }
 
     pub fn send_datagram(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>, MasqueError> {
-        let stream_id = self.connect_stream_id
+        let stream_id = self
+            .connect_stream_id
             .ok_or_else(|| MasqueError::ConnectionError("No connect stream".into()))?;
 
         // Process IP packet (decrement TTL/Hop Limit, recalculate checksum)
@@ -137,12 +133,19 @@ impl MasqueTunnel {
         match self.quic_conn.conn.dgram_send(&self.dgram_send_buf) {
             Ok(()) => Ok(None),
             Err(quiche::Error::BufferTooShort) => {
-                log::debug!("dgram_send BufferTooShort ({} bytes), generating ICMP", self.dgram_send_buf.len());
+                log::debug!(
+                    "dgram_send BufferTooShort ({} bytes), generating ICMP",
+                    self.dgram_send_buf.len()
+                );
                 let icmp = compose_icmp_packet_too_big(&self.packet_buf, MIN_MTU);
                 Ok(icmp)
             }
             Err(e) => {
-                log::warn!("dgram_send error: {:?}, buf len: {}", e, self.dgram_send_buf.len());
+                log::warn!(
+                    "dgram_send error: {:?}, buf len: {}",
+                    e,
+                    self.dgram_send_buf.len()
+                );
                 Err(MasqueError::QuicError(QuicError::Quiche(e)))
             }
         }
@@ -223,11 +226,15 @@ impl MasqueTunnel {
 
             if let Some(err) = self.quic_conn.conn.peer_error() {
                 let reason = String::from_utf8_lossy(err.reason.as_slice());
-                log::error!("Connection closed by peer: error={}, reason={}",
-                    err.error_code, reason);
-                return Err(MasqueError::ConnectionError(
-                    format!("peer closed: {} - {}", err.error_code, reason)
-                ));
+                log::error!(
+                    "Connection closed by peer: error={}, reason={}",
+                    err.error_code,
+                    reason
+                );
+                return Err(MasqueError::ConnectionError(format!(
+                    "peer closed: {} - {}",
+                    err.error_code, reason
+                )));
             }
 
             if self.quic_conn.is_closed() {
@@ -253,11 +260,15 @@ impl MasqueTunnel {
 
             if let Some(err) = self.quic_conn.conn.peer_error() {
                 let reason = String::from_utf8_lossy(err.reason.as_slice());
-                log::error!("Connection closed by peer: error={}, reason={}",
-                    err.error_code, reason);
-                return Err(MasqueError::ConnectionError(
-                    format!("peer closed: {} - {}", err.error_code, reason)
-                ));
+                log::error!(
+                    "Connection closed by peer: error={}, reason={}",
+                    err.error_code,
+                    reason
+                );
+                return Err(MasqueError::ConnectionError(format!(
+                    "peer closed: {} - {}",
+                    err.error_code, reason
+                )));
             }
 
             self.poll_h3_events()?;
@@ -276,7 +287,9 @@ impl MasqueTunnel {
         match tokio::time::timeout(
             Duration::from_millis(100),
             self.quic_conn.socket.recv_from(buf),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok((len, from))) => {
                 let recv_info = quiche::RecvInfo {
                     from,
@@ -327,9 +340,10 @@ impl MasqueTunnel {
                                             self.established = true;
                                             log::info!("Connect-IP request accepted");
                                         } else {
-                                            return Err(MasqueError::ConnectIpFailed(
-                                                format!("status: {}", status)
-                                            ));
+                                            return Err(MasqueError::ConnectIpFailed(format!(
+                                                "status: {}",
+                                                status
+                                            )));
                                         }
                                     }
                                 }
@@ -656,8 +670,8 @@ fn compose_icmpv6_packet_too_big(original_packet: &[u8], mtu: u16) -> Option<Vec
 
     // Calculate ICMPv6 checksum (includes pseudo-header)
     let checksum = calculate_icmpv6_checksum(
-        &packet[8..24],   // source
-        &packet[24..40],  // destination
+        &packet[8..24],  // source
+        &packet[24..40], // destination
         &packet[icmp_start..],
     );
     packet[icmp_start + 2] = (checksum >> 8) as u8;

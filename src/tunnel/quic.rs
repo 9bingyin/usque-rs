@@ -20,7 +20,10 @@ impl std::str::FromStr for CongestionControl {
             "reno" => Ok(CongestionControl::Reno),
             "cubic" => Ok(CongestionControl::Cubic),
             "bbr" | "bbr2" | "bbrv2" => Ok(CongestionControl::Bbr2),
-            _ => Err(format!("Unknown congestion control algorithm: {}. Valid options: reno, cubic, bbr2", s)),
+            _ => Err(format!(
+                "Unknown congestion control algorithm: {}. Valid options: reno, cubic, bbr2",
+                s
+            )),
         }
     }
 }
@@ -88,7 +91,7 @@ impl Default for QuicConfig {
             dgram_recv_max_queue_len: 10000,
             dgram_send_max_queue_len: 10000,
             initial_packet_size: 1242,
-            congestion_control: CongestionControl::Bbr2,
+            congestion_control: CongestionControl::Cubic,
         }
     }
 }
@@ -176,7 +179,9 @@ impl QuicConnection {
                 Err(e) => return Err(QuicError::Quiche(e)),
             };
 
-            self.socket.send_to(&self.send_buf[..write], self.peer_addr).await?;
+            self.socket
+                .send_to(&self.send_buf[..write], self.peer_addr)
+                .await?;
             total_sent += write;
         }
 
@@ -236,7 +241,9 @@ pub async fn connect(
         match tokio::time::timeout(
             Duration::from_millis(100),
             quic_conn.socket.recv_from(&mut buf),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok((len, from))) => {
                 let recv_info = quiche::RecvInfo {
                     from,
@@ -285,8 +292,8 @@ pub async fn connect_with_pinning(
 }
 
 fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool {
-    use x509_cert::Certificate;
     use der::{Decode, Encode};
+    use x509_cert::Certificate;
 
     let cert = match Certificate::from_der(cert_der) {
         Ok(c) => c,

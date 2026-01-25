@@ -5,17 +5,21 @@ mod api;
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            log::error!("Failed to install Ctrl+C handler: {}", e);
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                log::error!("Failed to install SIGTERM handler: {}", e);
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -82,7 +86,11 @@ enum Commands {
         #[arg(short = 'w', long)]
         password: Option<String>,
         /// SNI address for MASQUE connection
-        #[arg(short, long = "sni-address", default_value = "consumer-masque.cloudflareclient.com")]
+        #[arg(
+            short,
+            long = "sni-address",
+            default_value = "consumer-masque.cloudflareclient.com"
+        )]
         sni: String,
         /// DNS servers to use (can be specified multiple times)
         #[arg(short, long, default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()])]
@@ -108,13 +116,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Register { config, model, locale, name, jwt, accept_tos } => {
-            register_device(&config, &model, &locale, name.as_deref(), jwt.as_deref(), accept_tos).await?;
+        Commands::Register {
+            config,
+            model,
+            locale,
+            name,
+            jwt,
+            accept_tos,
+        } => {
+            register_device(
+                &config,
+                &model,
+                &locale,
+                name.as_deref(),
+                jwt.as_deref(),
+                accept_tos,
+            )
+            .await?;
         }
-        Commands::Enroll { config, name, regen_key } => {
+        Commands::Enroll {
+            config,
+            name,
+            regen_key,
+        } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks { bind, port, config, username, password, sni, dns, connect_port, keepalive, initial_packet_size, mtu } => {
+        Commands::Socks {
+            bind,
+            port,
+            config,
+            username,
+            password,
+            sni,
+            dns,
+            connect_port,
+            keepalive,
+            initial_packet_size,
+            mtu,
+        } => {
             let options = SocksServerOptions {
                 bind,
                 port,
@@ -156,8 +195,7 @@ async fn register_device(
     let account = client.register(model, locale, jwt).await?;
     println!("Account created: {}", account.id);
 
-    let token = account.token.clone()
-        .ok_or("No token in response")?;
+    let token = account.token.clone().ok_or("No token in response")?;
 
     // Step 2: Generate ECDSA key pair
     let key_pair = crypto::generate_ec_key_pair()?;
@@ -165,39 +203,50 @@ async fn register_device(
 
     // Step 3: Enroll MASQUE key
     let name = device_name.unwrap_or("usque-rs");
-    let updated = client.enroll_key(
-        &account.id,
-        &token,
-        &key_pair.public_key_der,
-        Some(name),
-    ).await?;
+    let updated = client
+        .enroll_key(&account.id, &token, &key_pair.public_key_der, Some(name))
+        .await?;
     println!("MASQUE key enrolled");
 
     // Step 4: Build and save config
-    let endpoint_v4 = updated.config.peers.as_ref()
+    let endpoint_v4 = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
         .and_then(|e| e.v4.clone());
 
-    let endpoint_v6 = updated.config.peers.as_ref()
+    let endpoint_v6 = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
         .and_then(|e| e.v6.clone());
 
-    let endpoint_pub_key = updated.config.peers.as_ref()
+    let endpoint_pub_key = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .map(|p| p.public_key.clone());
 
-    let ipv4 = updated.config.interface_config.as_ref()
+    let ipv4 = updated
+        .config
+        .interface_config
+        .as_ref()
         .and_then(|i| i.addresses.as_ref())
         .and_then(|a| a.v4.clone());
 
-    let ipv6 = updated.config.interface_config.as_ref()
+    let ipv6 = updated
+        .config
+        .interface_config
+        .as_ref()
         .and_then(|i| i.addresses.as_ref())
         .and_then(|a| a.v6.clone());
 
-    let license = updated.account.license.clone()
-        .unwrap_or_default();
+    let license = updated.account.license.clone().unwrap_or_default();
 
     if endpoint_v4.as_deref().unwrap_or("").is_empty()
         && endpoint_v6.as_deref().unwrap_or("").is_empty()
@@ -209,15 +258,12 @@ async fn register_device(
         .filter(|k| !k.trim().is_empty())
         .ok_or("No endpoint public key in response")?;
 
-    if ipv4.as_deref().unwrap_or("").is_empty()
-        && ipv6.as_deref().unwrap_or("").is_empty()
-    {
+    if ipv4.as_deref().unwrap_or("").is_empty() && ipv6.as_deref().unwrap_or("").is_empty() {
         return Err("No interface addresses in response".into());
     }
 
     let cfg = config::Config {
-        private_key: base64::engine::general_purpose::STANDARD
-            .encode(&key_pair.private_key_der),
+        private_key: base64::engine::general_purpose::STANDARD.encode(&key_pair.private_key_der),
         endpoint_v4: endpoint_v4.unwrap_or_default(),
         endpoint_v6: endpoint_v6.unwrap_or_default(),
         endpoint_pub_key,
@@ -256,7 +302,8 @@ async fn enroll_device(
     } else {
         let signing_key = cfg.get_signing_key()?;
         let public_key = signing_key.verifying_key();
-        let public_key_der = public_key.to_public_key_der()
+        let public_key_der = public_key
+            .to_public_key_der()
             .map_err(|e| format!("Failed to encode public key: {}", e))?
             .to_vec();
         let private_key_der = cfg.get_private_key_der()?;
@@ -265,38 +312,53 @@ async fn enroll_device(
 
     // Call API to re-enroll
     let client = api::CloudflareClient::new();
-    let updated = client.enroll_key(
-        &cfg.id,
-        &cfg.access_token,
-        &public_key_der,
-        device_name,
-    ).await?;
+    let updated = client
+        .enroll_key(&cfg.id, &cfg.access_token, &public_key_der, device_name)
+        .await?;
     println!("MASQUE key enrolled");
 
     // Build updated config
-    let endpoint_v4 = updated.config.peers.as_ref()
+    let endpoint_v4 = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
         .and_then(|e| e.v4.clone());
 
-    let endpoint_v6 = updated.config.peers.as_ref()
+    let endpoint_v6 = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .and_then(|p| p.endpoint.as_ref())
         .and_then(|e| e.v6.clone());
 
-    let endpoint_pub_key = updated.config.peers.as_ref()
+    let endpoint_pub_key = updated
+        .config
+        .peers
+        .as_ref()
         .and_then(|p| p.first())
         .map(|p| p.public_key.clone());
 
-    let ipv4 = updated.config.interface_config.as_ref()
+    let ipv4 = updated
+        .config
+        .interface_config
+        .as_ref()
         .and_then(|i| i.addresses.as_ref())
         .and_then(|a| a.v4.clone());
 
-    let ipv6 = updated.config.interface_config.as_ref()
+    let ipv6 = updated
+        .config
+        .interface_config
+        .as_ref()
         .and_then(|i| i.addresses.as_ref())
         .and_then(|a| a.v6.clone());
 
-    let license = updated.account.license.clone()
+    let license = updated
+        .account
+        .license
+        .clone()
         .unwrap_or(cfg.license.clone());
 
     let endpoint_v4 = endpoint_v4.unwrap_or(cfg.endpoint_v4.clone());
@@ -305,8 +367,7 @@ async fn enroll_device(
         return Err("No endpoint info in response or existing config".into());
     }
 
-    let endpoint_pub_key = endpoint_pub_key
-        .unwrap_or(cfg.endpoint_pub_key.clone());
+    let endpoint_pub_key = endpoint_pub_key.unwrap_or(cfg.endpoint_pub_key.clone());
     if endpoint_pub_key.trim().is_empty() {
         return Err("No endpoint public key in response or existing config".into());
     }
@@ -318,8 +379,7 @@ async fn enroll_device(
     }
 
     let new_cfg = config::Config {
-        private_key: base64::engine::general_purpose::STANDARD
-            .encode(&private_key_der),
+        private_key: base64::engine::general_purpose::STANDARD.encode(&private_key_der),
         endpoint_v4,
         endpoint_v6,
         endpoint_pub_key,
@@ -368,8 +428,8 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
     } = options;
 
     // Read tuning parameters from environment variables
-    let congestion_control: String = std::env::var("USQUE_CC")
-        .unwrap_or_else(|_| "bbr2".to_string());
+    let congestion_control: String =
+        std::env::var("USQUE_CC").unwrap_or_else(|_| "cubic".to_string());
 
     let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
         .ok()
@@ -422,8 +482,7 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
     println!("Using DNS servers: {:?}", dns_servers);
 
     // Parse congestion control algorithm
-    let cc: tunnel::CongestionControl = congestion_control.parse()
-        .map_err(|e: String| e)?;
+    let cc: tunnel::CongestionControl = congestion_control.parse().map_err(|e: String| e)?;
     println!("Using congestion control: {}", cc);
 
     let keepalive_ms = keepalive.saturating_mul(1000);
@@ -442,7 +501,11 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
         sni,
         endpoint_pub_key,
         ipv4: cfg.ipv4.clone(),
-        ipv6: if cfg.ipv6.trim().is_empty() { None } else { Some(cfg.ipv6.clone()) },
+        ipv6: if cfg.ipv6.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.ipv6.clone())
+        },
         dns_servers: dns_addrs,
         keepalive,
         initial_packet_size,
@@ -474,9 +537,7 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
         (Some(_), None) => {
             return Err("Password is required when username is set".into());
         }
-        _ => {
-            proxy::Socks5Server::new(addr, tunnel_pool)
-        }
+        _ => proxy::Socks5Server::new(addr, tunnel_pool),
     };
 
     println!("Starting SOCKS5 server on {}:{}", bind, port);

@@ -62,7 +62,9 @@ pub fn time_as_cf_string(time: chrono::DateTime<chrono::Local>) -> String {
 
 use ring::rand::SecureRandom;
 
-pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+pub fn generate_self_signed_cert(
+    signing_key: &SigningKey,
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
     use der::{Decode, Encode};
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
     use x509_cert::name::Name;
@@ -71,8 +73,7 @@ pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, V
     use x509_cert::time::Validity;
 
     let subject = Name::default();
-    let serial = SerialNumber::new(&[0u8])
-        .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
+    let serial = SerialNumber::new(&[0u8]).map_err(|e| CryptoError::EncodeError(e.to_string()))?;
 
     let validity = Validity::from_now(std::time::Duration::from_secs(24 * 60 * 60))
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
@@ -98,12 +99,15 @@ pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, V
         subject,
         spki,
         &signer,
-    ).map_err(|e| CryptoError::EncodeError(e.to_string()))?;
+    )
+    .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
 
-    let cert = builder.build::<p256::ecdsa::DerSignature>()
+    let cert = builder
+        .build::<p256::ecdsa::DerSignature>()
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
 
-    let cert_der = cert.to_der()
+    let cert_der = cert
+        .to_der()
         .map_err(|e| CryptoError::EncodeError(e.to_string()))?;
 
     let private_key_der = signing_key
@@ -134,7 +138,9 @@ impl signature::Keypair for EcdsaSigner {
 }
 
 impl spki::DynSignatureAlgorithmIdentifier for EcdsaSigner {
-    fn signature_algorithm_identifier(&self) -> Result<spki::AlgorithmIdentifierOwned, spki::Error> {
+    fn signature_algorithm_identifier(
+        &self,
+    ) -> Result<spki::AlgorithmIdentifierOwned, spki::Error> {
         use der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
         Ok(spki::AlgorithmIdentifierOwned {
             oid: ECDSA_WITH_SHA_256,

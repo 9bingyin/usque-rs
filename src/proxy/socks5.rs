@@ -1,14 +1,16 @@
-use crate::tunnel::manager::{ManagerCommand, ManagerError, SocketChannels, TcpSocketState, TunnelManager, TunnelManagerPool};
+use crate::tunnel::manager::{
+    ManagerCommand, ManagerError, SocketChannels, TcpSocketState, TunnelManager, TunnelManagerPool,
+};
 use bytes::{Bytes, BytesMut};
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
-use fast_socks5::{parse_udp_request, new_udp_header, ReplyError, Socks5Command};
+use fast_socks5::{ReplyError, Socks5Command, new_udp_header, parse_udp_request};
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,7 +39,10 @@ fn interleave_addresses(mut addresses: Vec<IpAddress>) -> Vec<IpAddress> {
     }
 
     // Count IPv6 addresses
-    let v6_count = addresses.iter().filter(|ip| matches!(ip, IpAddress::Ipv6(_))).count();
+    let v6_count = addresses
+        .iter()
+        .filter(|ip| matches!(ip, IpAddress::Ipv6(_)))
+        .count();
     let v4_count = addresses.len() - v6_count;
 
     // If all same type, no interleaving needed
@@ -129,7 +134,12 @@ impl FragBuffer {
         }
 
         let total_len: usize = (1..=end_seq)
-            .map(|idx| self.fragments[idx as usize].as_ref().map(|b| b.len()).unwrap_or(0))
+            .map(|idx| {
+                self.fragments[idx as usize]
+                    .as_ref()
+                    .map(|b| b.len())
+                    .unwrap_or(0)
+            })
             .sum();
         let mut merged = BytesMut::with_capacity(total_len);
         for idx in 1..=end_seq {
@@ -215,10 +225,19 @@ pub struct Socks5Server {
 
 impl Socks5Server {
     pub fn new(bind_addr: SocketAddr, manager_pool: Arc<TunnelManagerPool>) -> Self {
-        Self { bind_addr, manager_pool, auth: None }
+        Self {
+            bind_addr,
+            manager_pool,
+            auth: None,
+        }
     }
 
-    pub fn with_auth(bind_addr: SocketAddr, manager_pool: Arc<TunnelManagerPool>, username: String, password: String) -> Self {
+    pub fn with_auth(
+        bind_addr: SocketAddr,
+        manager_pool: Arc<TunnelManagerPool>,
+        username: String,
+        password: String,
+    ) -> Self {
         Self {
             bind_addr,
             manager_pool,
@@ -288,16 +307,12 @@ async fn handle_client(
     .await?;
 
     match cmd {
-        Socks5Command::TCPConnect => {
-            handle_tcp_connect(proto, manager, &target_addr).await
-        }
+        Socks5Command::TCPConnect => handle_tcp_connect(proto, manager, &target_addr).await,
         Socks5Command::TCPBind => {
             let resolved_addr = resolve_target_addr(&manager, &target_addr).await?;
             handle_tcp_bind(proto, manager, local_addr, resolved_addr).await
         }
-        Socks5Command::UDPAssociate => {
-            handle_udp_associate(proto, manager, local_addr).await
-        }
+        Socks5Command::UDPAssociate => handle_udp_associate(proto, manager, local_addr).await,
     }
 }
 
@@ -314,15 +329,18 @@ async fn resolve_target_addr(
                 }
                 IpAddr::V6(v6) => {
                     let s = v6.segments();
-                    IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                    ))
                 }
             };
             Ok((ip, addr.port()))
         }
         TargetAddr::Domain(domain, port) => {
             log::debug!("Resolving {} through tunnel", domain);
-            let ip = manager.resolve(domain, true).await
-                .map_err(|e| Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e)))?;
+            let ip = manager.resolve(domain, true).await.map_err(|e| {
+                Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
+            })?;
             log::debug!("Resolved {} -> {:?}", domain, ip);
             Ok((ip, *port))
         }
@@ -344,15 +362,18 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
                 }
                 IpAddr::V6(v6) => {
                     let s = v6.segments();
-                    IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                    ))
                 }
             };
             (vec![ip], addr.port())
         }
         TargetAddr::Domain(domain, port) => {
             log::debug!("Resolving all addresses for {} through tunnel", domain);
-            let ips = manager.resolve_all(domain).await
-                .map_err(|e| Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e)))?;
+            let ips = manager.resolve_all(domain).await.map_err(|e| {
+                Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
+            })?;
             let sorted = interleave_addresses(ips);
             log::debug!("Resolved {} -> {} addresses (sorted)", domain, sorted.len());
             (sorted, *port)
@@ -455,8 +476,10 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
             &mut addr_iter,
             remote_port,
             &mut last_error,
-        ).await
-    }).await;
+        )
+        .await
+    })
+    .await;
 
     match result {
         Ok(Ok((winner_handle, winner_channels))) => {
@@ -508,7 +531,9 @@ async fn race_connections_event_driven(
         let tx = ready_tx.clone();
         tokio::spawn(async move {
             let state = manager.wait_socket_ready(handle).await;
-            let _ = tx.send((handle, state)).await;
+            if tx.send((handle, state)).await.is_err() {
+                log::trace!("Failed to send connection ready notification: receiver dropped");
+            }
         });
     }
 
@@ -519,8 +544,9 @@ async fn race_connections_event_driven(
     loop {
         // Check if we have any pending connections or addresses to try
         if pending.is_empty() && addr_iter.peek().is_none() {
-            return Err(last_error.take().unwrap_or_else(||
-                Socks5Error::ConnectionFailed("All connection attempts failed".into())));
+            return Err(last_error.take().unwrap_or_else(|| {
+                Socks5Error::ConnectionFailed("All connection attempts failed".into())
+            }));
         }
 
         let has_more_addresses = addr_iter.peek().is_some();
@@ -574,7 +600,9 @@ async fn race_connections_event_driven(
                             let tx = ready_tx.clone();
                             tokio::spawn(async move {
                                 let state = manager.wait_socket_ready(handle).await;
-                                let _ = tx.send((handle, state)).await;
+                                if tx.send((handle, state)).await.is_err() {
+                                    log::trace!("Failed to send connection ready notification: receiver dropped");
+                                }
                             });
                         }
                         Err(e) => {
@@ -627,10 +655,7 @@ async fn handle_tcp_bind<T: AsyncRead + AsyncWrite + Unpin>(
     let mut client_stream = proto.reply_success(reply_addr).await?;
 
     // Wait for incoming connection with timeout
-    let accept_result = tokio::time::timeout(
-        Duration::from_secs(60),
-        listener.accept()
-    ).await;
+    let accept_result = tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
 
     let (incoming_stream, peer_addr) = match accept_result {
         Ok(Ok((stream, addr))) => (stream, addr),
@@ -769,7 +794,8 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(true) => continue,
@@ -798,7 +824,8 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
     let local_port = get_local_port();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-    manager.cmd_sender()
+    manager
+        .cmd_sender()
         .send(ManagerCommand::UdpRegister {
             local_port,
             response: response_tx,
@@ -822,10 +849,12 @@ async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Send + 'static
         &mut from_tunnel,
         local_port,
         &manager,
-    ).await;
+    )
+    .await;
 
     // Cleanup
-    if let Err(e) = manager.cmd_sender()
+    if let Err(e) = manager
+        .cmd_sender()
         .send(ManagerCommand::UdpUnregister { local_port })
         .await
     {
@@ -926,7 +955,10 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn target_addr_to_ip(target: &TargetAddr, manager: &TunnelManager) -> Option<(IpAddress, u16)> {
+async fn target_addr_to_ip(
+    target: &TargetAddr,
+    manager: &TunnelManager,
+) -> Option<(IpAddress, u16)> {
     match target {
         TargetAddr::Ip(addr) => {
             let ip = match addr.ip() {
@@ -936,20 +968,20 @@ async fn target_addr_to_ip(target: &TargetAddr, manager: &TunnelManager) -> Opti
                 }
                 IpAddr::V6(v6) => {
                     let s = v6.segments();
-                    IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                    ))
                 }
             };
             Some((ip, addr.port()))
         }
-        TargetAddr::Domain(domain, port) => {
-            match manager.resolve(domain, true).await {
-                Ok(ip) => Some((ip, *port)),
-                Err(e) => {
-                    log::warn!("UDP DNS resolution failed for {}: {:?}", domain, e);
-                    None
-                }
+        TargetAddr::Domain(domain, port) => match manager.resolve(domain, true).await {
+            Ok(ip) => Some((ip, *port)),
+            Err(e) => {
+                log::warn!("UDP DNS resolution failed for {}: {:?}", domain, e);
+                None
             }
-        }
+        },
     }
 }
 
@@ -977,10 +1009,19 @@ fn map_connect_error_to_reply(err: &Socks5Error) -> ReplyError {
     }
 }
 
-fn build_udp_response(remote_ip: IpAddress, remote_port: u16, data: &[u8]) -> Result<Vec<u8>, Socks5Error> {
+fn build_udp_response(
+    remote_ip: IpAddress,
+    remote_port: u16,
+    data: &[u8],
+) -> Result<Vec<u8>, Socks5Error> {
     let addr = match remote_ip {
         IpAddress::Ipv4(v4) => {
-            let bytes: [u8; 4] = [v4.octets()[0], v4.octets()[1], v4.octets()[2], v4.octets()[3]];
+            let bytes: [u8; 4] = [
+                v4.octets()[0],
+                v4.octets()[1],
+                v4.octets()[2],
+                v4.octets()[3],
+            ];
             SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::from(bytes)), remote_port)
         }
         IpAddress::Ipv6(v6) => {

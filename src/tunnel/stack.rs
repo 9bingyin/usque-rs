@@ -1,8 +1,11 @@
 use crate::tunnel::device::VirtualDevice;
 use bytes::BytesMut;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{Socket, tcp::{Socket as TcpSocket, SocketBuffer}};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
+use smoltcp::socket::{
+    Socket,
+    tcp::{Socket as TcpSocket, SocketBuffer},
+};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use std::collections::HashSet;
@@ -89,15 +92,15 @@ impl NetworkStack {
             },
             None => None,
         };
-        let local_ipv6: Option<Ipv6Address> = ipv6
-            .filter(|s| !s.trim().is_empty())
-            .and_then(|s| match s.parse() {
-                Ok(addr) => Some(addr),
-                Err(e) => {
-                    log::warn!("Invalid IPv6 address '{}': {}", s, e);
-                    None
-                }
-            });
+        let local_ipv6: Option<Ipv6Address> =
+            ipv6.filter(|s| !s.trim().is_empty())
+                .and_then(|s| match s.parse() {
+                    Ok(addr) => Some(addr),
+                    Err(e) => {
+                        log::warn!("Invalid IPv6 address '{}': {}", s, e);
+                        None
+                    }
+                });
 
         if local_ipv4.is_none() && local_ipv6.is_none() {
             log::warn!("No valid IP addresses configured, using fallback IPv4 10.0.0.1");
@@ -132,10 +135,14 @@ impl NetworkStack {
     pub fn poll(&mut self) -> Result<(), StackError> {
         let timestamp = SmolInstant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+            self.iface
+                .poll(timestamp, &mut self.device, &mut self.sockets);
         }));
         if result.is_err() {
-            log::error!("smoltcp poll panicked, snapshot: {}", self.socket_snapshot());
+            log::error!(
+                "smoltcp poll panicked, snapshot: {}",
+                self.socket_snapshot()
+            );
             return Err(StackError::PollPanic);
         }
         Ok(())
@@ -185,24 +192,18 @@ impl NetworkStack {
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
     }
 
-    pub fn tcp_send(
-        &mut self,
-        handle: SocketHandle,
-        data: &[u8],
-    ) -> Result<usize, StackError> {
-        let socket = self.get_tcp_socket_mut(handle)
+    pub fn tcp_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize, StackError> {
+        let socket = self
+            .get_tcp_socket_mut(handle)
             .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .send_slice(data)
             .map_err(|e| StackError::SocketError(format!("{:?}", e)))
     }
 
-    pub fn tcp_recv(
-        &mut self,
-        handle: SocketHandle,
-        buf: &mut [u8],
-    ) -> Result<usize, StackError> {
-        let socket = self.get_tcp_socket_mut(handle)
+    pub fn tcp_recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize, StackError> {
+        let socket = self
+            .get_tcp_socket_mut(handle)
             .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .recv_slice(buf)
@@ -253,10 +254,12 @@ impl NetworkStack {
 
     fn local_addr_for_remote(&self, remote_ip: IpAddress) -> Result<IpAddress, StackError> {
         match remote_ip {
-            IpAddress::Ipv4(_) => self.local_ipv4
+            IpAddress::Ipv4(_) => self
+                .local_ipv4
                 .map(IpAddress::Ipv4)
                 .ok_or_else(|| StackError::SocketError("No IPv4 address configured".into())),
-            IpAddress::Ipv6(_) => self.local_ipv6
+            IpAddress::Ipv6(_) => self
+                .local_ipv6
                 .map(IpAddress::Ipv6)
                 .ok_or_else(|| StackError::SocketError("No IPv6 address configured".into())),
         }
@@ -277,14 +280,8 @@ impl NetworkStack {
         local_addr: IpAddress,
         local_port: u16,
     ) -> Result<SocketHandle, StackError> {
-        let rx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0; 8192],
-        );
-        let tx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0; 8192],
-        );
+        let rx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 8192]);
+        let tx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 8192]);
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
         let local_endpoint = IpEndpoint::new(local_addr, local_port);
@@ -322,7 +319,8 @@ impl NetworkStack {
         remote_port: u16,
         data: &[u8],
     ) -> Result<(), StackError> {
-        let socket = self.get_udp_socket_mut(handle)
+        let socket = self
+            .get_udp_socket_mut(handle)
             .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         let endpoint = IpEndpoint::new(remote_ip, remote_port);
         socket
@@ -335,7 +333,8 @@ impl NetworkStack {
         handle: SocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, UdpMetadata), StackError> {
-        let socket = self.get_udp_socket_mut(handle)
+        let socket = self
+            .get_udp_socket_mut(handle)
             .ok_or_else(|| StackError::SocketError("invalid socket handle".into()))?;
         socket
             .recv_slice(buf)

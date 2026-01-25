@@ -97,7 +97,7 @@ usque-rs socks [OPTIONS]
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USQUE_CC` | `bbr2` | Congestion control algorithm (reno/cubic/bbr/bbr2) |
+| `USQUE_CC` | `cubic` | Congestion control algorithm (reno/cubic/bbr/bbr2) |
 | `USQUE_TCP_BUFFER_SIZE` | `1048576` | TCP buffer size per direction in bytes |
 | `USQUE_QUIC_IDLE_TIMEOUT_MS` | `90000` | QUIC idle timeout in ms (should be > 2x keepalive) |
 | `USQUE_TUNNEL_WORKERS` | `1` | Worker count (0=auto, default 1 to avoid abusing upstream) |

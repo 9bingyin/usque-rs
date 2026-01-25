@@ -30,10 +30,7 @@ pub struct CloudflareClient {
 fn default_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("User-Agent", HeaderValue::from_static("WARP for Android"));
-    headers.insert(
-        "CF-Client-Version",
-        HeaderValue::from_static("a-6.35-4471"),
-    );
+    headers.insert("CF-Client-Version", HeaderValue::from_static("a-6.35-4471"));
     headers.insert(
         "Content-Type",
         HeaderValue::from_static("application/json; charset=UTF-8"),
@@ -65,10 +62,9 @@ impl CloudflareClient {
         locale: &str,
         jwt: Option<&str>,
     ) -> Result<AccountData, ApiClientError> {
-        let wg_key = generate_random_wg_pubkey()
-            .map_err(|e| ApiClientError::Crypto(e.to_string()))?;
-        let serial = generate_random_serial()
-            .map_err(|e| ApiClientError::Crypto(e.to_string()))?;
+        let wg_key =
+            generate_random_wg_pubkey().map_err(|e| ApiClientError::Crypto(e.to_string()))?;
+        let serial = generate_random_serial().map_err(|e| ApiClientError::Crypto(e.to_string()))?;
 
         let registration = Registration {
             key: wg_key,

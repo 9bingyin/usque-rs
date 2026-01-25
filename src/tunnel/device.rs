@@ -94,10 +94,19 @@ impl VirtualDevice {
 }
 
 impl Device for VirtualDevice {
-    type RxToken<'a> = VirtualRxToken where Self: 'a;
-    type TxToken<'a> = VirtualTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = VirtualRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtualTxToken<'a>
+    where
+        Self: 'a;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx_queue.pop_front()?;
         Some((
             VirtualRxToken { data: packet },
@@ -153,7 +162,7 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         buffer.resize(len, 0);
         let result = f(&mut buffer);
         while self.queue.len() >= MAX_QUEUE_SIZE {
-            let _ = self.queue.pop_front();
+            drop(self.queue.pop_front());
             self.drop_logger.log_drop();
         }
         self.queue.push_back(buffer);

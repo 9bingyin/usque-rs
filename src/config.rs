@@ -45,10 +45,12 @@ impl Config {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(&self.private_key)
-            .map_err(|e| ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to decode private key: {}", e),
-            ))))
+            .map_err(|e| {
+                ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to decode private key: {}", e),
+                )))
+            })
     }
 
     pub fn get_endpoint_pub_key_der(&self) -> Result<Vec<u8>, ConfigError> {
@@ -62,16 +64,18 @@ impl Config {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(&base64_content)
-            .map_err(|e| ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to decode endpoint public key: {}", e),
-            ))))
+            .map_err(|e| {
+                ConfigError::Parse(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to decode endpoint public key: {}", e),
+                )))
+            })
     }
 
     pub fn get_signing_key(&self) -> Result<p256::ecdsa::SigningKey, ConfigError> {
+        use p256::SecretKey;
         use p256::ecdsa::SigningKey;
         use p256::pkcs8::DecodePrivateKey;
-        use p256::SecretKey;
 
         let der = self.get_private_key_der()?;
 
@@ -81,7 +85,6 @@ impl Config {
         }
 
         // Fallback to PKCS#8 format
-        SigningKey::from_pkcs8_der(&der)
-            .map_err(|e| ConfigError::Crypto(e.to_string()))
+        SigningKey::from_pkcs8_der(&der).map_err(|e| ConfigError::Crypto(e.to_string()))
     }
 }

@@ -48,7 +48,8 @@ pub enum DnsError {
 pub fn parse_dns_servers(servers: &[String]) -> Result<Vec<IpAddress>, DnsError> {
     let mut addrs = Vec::new();
     for server in servers {
-        let addr: std::net::IpAddr = server.parse()
+        let addr: std::net::IpAddr = server
+            .parse()
             .map_err(|e| DnsError::ParseError(format!("Invalid DNS server '{}': {}", server, e)))?;
         let ip = match addr {
             std::net::IpAddr::V4(v4) => {
@@ -57,7 +58,9 @@ pub fn parse_dns_servers(servers: &[String]) -> Result<Vec<IpAddress>, DnsError>
             }
             std::net::IpAddr::V6(v6) => {
                 let s = v6.segments();
-                IpAddress::Ipv6(Ipv6Address::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                IpAddress::Ipv6(Ipv6Address::new(
+                    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                ))
             }
         };
         addrs.push(ip);
@@ -95,8 +98,7 @@ pub fn build_dns_query(domain: &str, record_type: RecordType) -> Result<(u16, Ve
 pub fn parse_dns_response_with_id(
     data: &[u8],
 ) -> Result<(u16, Result<Vec<DnsRecord>, DnsError>), DnsError> {
-    let message = Message::from_bytes(data)
-        .map_err(|e| DnsError::DecodeError(format!("{}", e)))?;
+    let message = Message::from_bytes(data).map_err(|e| DnsError::DecodeError(format!("{}", e)))?;
     let id = message.id();
     let result = match validate_dns_response(&message) {
         Ok(()) => extract_dns_records(&message),
@@ -137,8 +139,14 @@ fn extract_dns_records(message: &Message) -> Result<Vec<DnsRecord>, DnsError> {
                 let segments = aaaa.0.segments();
                 records.push(DnsRecord {
                     address: IpAddress::Ipv6(Ipv6Address::new(
-                        segments[0], segments[1], segments[2], segments[3],
-                        segments[4], segments[5], segments[6], segments[7],
+                        segments[0],
+                        segments[1],
+                        segments[2],
+                        segments[3],
+                        segments[4],
+                        segments[5],
+                        segments[6],
+                        segments[7],
                     )),
                     ttl,
                 });
