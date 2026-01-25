@@ -715,9 +715,6 @@ impl TunnelManager {
             let quic_timeout = tunnel.quic_conn.conn.timeout()
                 .unwrap_or(Duration::from_millis(100));
             let poll_timeout = quic_timeout.min(MAX_POLL_INTERVAL);
-            let has_backpressure = state.sockets
-                .values()
-                .any(|state| state.pending_to_client_bytes >= MAX_PENDING_TO_CLIENT);
             poll_timer.as_mut().reset(TokioInstant::now() + poll_timeout);
 
             tokio::select! {
@@ -739,7 +736,7 @@ impl TunnelManager {
                 }
 
                 // Receive UDP data from QUIC socket
-                Some(incoming) = incoming_rx.recv(), if !has_backpressure => {
+                Some(incoming) = incoming_rx.recv() => {
                     let mut data = incoming.data;
                     Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data, incoming.from, local_addr);
                     if !Self::process_after_recv(&mut tunnel, &mut state.stack, &mut state.sockets).await {

@@ -20,6 +20,7 @@ static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 const PORT_RANGE_START: u16 = 49152;
 const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(5);
@@ -728,40 +729,54 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
     let mut client_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
 
     loop {
-        tokio::select! {
-            result = channels.from_stack.recv() => {
-                match result {
-                    Some(data) => {
-                        if let Err(e) = writer.write_all(&data).await {
-                            log::debug!("Error writing to client: {}", e);
-                            break;
+        let result = tokio::time::timeout(IDLE_TIMEOUT, async {
+            tokio::select! {
+                result = channels.from_stack.recv() => {
+                    match result {
+                        Some(data) => {
+                            if let Err(e) = writer.write_all(&data).await {
+                                log::debug!("Error writing to client: {}", e);
+                                return false;
+                            }
+                            true
+                        }
+                        None => {
+                            log::trace!("Tunnel channel closed");
+                            false
                         }
                     }
-                    None => {
-                        log::trace!("Tunnel channel closed");
-                        break;
+                }
+
+                result = reader.read_buf(&mut client_buf) => {
+                    match result {
+                        Ok(0) => {
+                            log::debug!("Client closed connection");
+                            false
+                        }
+                        Ok(n) => {
+                            let data = client_buf.split_to(n).freeze();
+                            if channels.to_stack.send(data).await.is_err() {
+                                log::trace!("Tunnel channel closed");
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("Error reading from client: {}", e);
+                            false
+                        }
                     }
                 }
             }
+        }).await;
 
-            result = reader.read_buf(&mut client_buf) => {
-                match result {
-                    Ok(0) => {
-                        log::debug!("Client closed connection");
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = client_buf.split_to(n).freeze();
-                        if channels.to_stack.send(data).await.is_err() {
-                            log::trace!("Tunnel channel closed");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!("Error reading from client: {}", e);
-                        break;
-                    }
-                }
+        match result {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(_) => {
+                log::debug!("Connection idle timeout ({} secs)", IDLE_TIMEOUT.as_secs());
+                break;
             }
         }
     }
