@@ -752,11 +752,17 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Socks5Error> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut client_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
+    let mut client_eof = false;
+    let mut tunnel_eof = false;
 
     loop {
+        if client_eof && tunnel_eof {
+            break;
+        }
+
         let result = tokio::time::timeout(IDLE_TIMEOUT, async {
             tokio::select! {
-                result = channels.from_stack.recv() => {
+                result = channels.from_stack.recv(), if !tunnel_eof => {
                     match result {
                         Some(data) => {
                             if let Err(e) = writer.write_all(&data).await {
@@ -767,25 +773,35 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                         }
                         None => {
                             log::trace!("Tunnel channel closed");
-                            false
+                            // Flush before signaling EOF to client
+                            if let Err(e) = writer.flush().await {
+                                log::debug!("Error flushing to client: {}", e);
+                            }
+                            if let Err(e) = writer.shutdown().await {
+                                log::debug!("Error shutting down writer: {}", e);
+                            }
+                            tunnel_eof = true;
+                            true
                         }
                     }
                 }
 
-                result = reader.read_buf(&mut client_buf) => {
+                result = reader.read_buf(&mut client_buf), if !client_eof => {
                     match result {
                         Ok(0) => {
                             log::debug!("Client closed connection");
-                            false
+                            // Drop the sender to signal EOF to tunnel side
+                            drop(channels.to_stack.clone());
+                            client_eof = true;
+                            true
                         }
                         Ok(n) => {
                             let data = client_buf.split_to(n).freeze();
                             if channels.to_stack.send(data).await.is_err() {
                                 log::trace!("Tunnel channel closed");
-                                false
-                            } else {
-                                true
+                                tunnel_eof = true;
                             }
+                            true
                         }
                         Err(e) => {
                             log::debug!("Error reading from client: {}", e);

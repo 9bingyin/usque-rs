@@ -132,6 +132,13 @@ impl MasqueTunnel {
 
         match self.quic_conn.conn.dgram_send(&self.dgram_send_buf) {
             Ok(()) => Ok(None),
+            Err(quiche::Error::Done) => {
+                log::debug!(
+                    "Datagram dropped: congestion window full ({} bytes)",
+                    self.dgram_send_buf.len()
+                );
+                Ok(None)
+            }
             Err(quiche::Error::BufferTooShort) => {
                 log::debug!(
                     "dgram_send BufferTooShort ({} bytes), generating ICMP",

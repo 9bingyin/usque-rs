@@ -179,10 +179,24 @@ impl QuicConnection {
                 Err(e) => return Err(QuicError::Quiche(e)),
             };
 
-            self.socket
+            match self
+                .socket
                 .send_to(&self.send_buf[..write], self.peer_addr)
-                .await?;
-            total_sent += write;
+                .await
+            {
+                Ok(_) => {
+                    total_sent += write;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    log::debug!("UDP send WouldBlock, dropping packet");
+                    continue;
+                }
+                Err(e) if is_enobufs(&e) => {
+                    log::debug!("UDP send ENOBUFS, dropping packet");
+                    continue;
+                }
+                Err(e) => return Err(QuicError::IoError(e)),
+            }
         }
 
         Ok(total_sent)
@@ -325,3 +339,8 @@ fn generate_scid() -> Result<quiche::ConnectionId<'static>, QuicError> {
 }
 
 use ring::rand::SecureRandom;
+
+// ENOBUFS: 55 on macOS/BSD, 105 on Linux
+fn is_enobufs(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(55) | Some(105))
+}

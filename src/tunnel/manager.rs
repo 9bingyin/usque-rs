@@ -5,7 +5,7 @@ use crate::tunnel::dns::{
 use crate::tunnel::masque::MasqueTunnel;
 use crate::tunnel::quic;
 use crate::tunnel::stack::{NetworkStack, StackError};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use quick_cache::unsync::Cache;
 use rand::Rng;
 use smoltcp::iface::SocketHandle;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use crate::tunnel::quic::CongestionControl;
@@ -340,6 +340,7 @@ struct RuntimeState {
     dns_sockets: DnsSockets,
     dns_cache: Cache<String, DnsCacheValue>,
     udp_sessions: HashMap<u16, UdpSessionState>,
+    read_buffer: BytesMut,
 }
 
 impl RuntimeState {
@@ -352,6 +353,7 @@ impl RuntimeState {
             dns_sockets: DnsSockets::new(),
             dns_cache: Cache::new(DNS_CACHE_CAPACITY),
             udp_sessions: HashMap::new(),
+            read_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
         }
     }
 }
@@ -364,9 +366,11 @@ const UDP_RECV_BUFFER_SIZE: usize = 65535;
 const MAX_TCP_READ_CHUNK: usize = 64 * 1024;
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-// Backpressure limits per socket (1MB each for high throughput, ref: quic-go recommends 7.5MB system buffer)
-const MAX_PENDING_DATA: usize = 1024 * 1024; // 1MB per socket
+// Backpressure: from_client uses small channel (32) so send().await naturally blocks SOCKS5 reads
+const MAX_PENDING_DATA: usize = 256 * 1024; // 256KB per socket (for partial writes)
+// Backpressure: to_client uses try_send + pending queue, must never block manager
 const MAX_PENDING_TO_CLIENT: usize = 1024 * 1024; // 1MB per socket
+const UDP_BATCH_READ_BUDGET: usize = 128;
 
 enum DeliverError {
     Backpressure,
@@ -694,12 +698,17 @@ impl TunnelManager {
         let local_addr = tunnel.quic_conn.local_addr;
         let (incoming_tx, mut incoming_rx) = mpsc::channel(INCOMING_DGRAM_CAPACITY);
         let socket = tunnel.quic_conn.socket.clone();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let mut shutdown_sub = shutdown_tx.subscribe();
+        // Guard: when all senders are dropped, the completion channel closes
+        let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
+        let recv_completion_tx = completion_tx.clone();
         let recv_handle = tokio::spawn(async move {
+            let _guard = recv_completion_tx;
             let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             loop {
                 tokio::select! {
-                    _ = &mut shutdown_rx => break,
+                    _ = shutdown_sub.recv() => break,
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, from)) => {
@@ -753,7 +762,7 @@ impl TunnelManager {
                 // Handle control commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
                     Self::handle_command(&mut state, dns_servers, tcp_buffer_size, cmd);
-                    if !Self::process_after_recv(&mut tunnel, &mut state.stack, &mut state.sockets).await {
+                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
                         break;
                     }
                 }
@@ -761,16 +770,28 @@ impl TunnelManager {
                 // Handle UDP sends from SOCKS5
                 Some(udp_cmd) = udp_rx.recv() => {
                     Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
-                    if !Self::process_after_recv(&mut tunnel, &mut state.stack, &mut state.sockets).await {
+                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
                         break;
                     }
                 }
 
-                // Receive UDP data from QUIC socket
+                // Receive UDP data from QUIC socket - batch read
                 Some(incoming) = incoming_rx.recv() => {
                     let mut data = incoming.data;
                     Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data, incoming.from, local_addr);
-                    if !Self::process_after_recv(&mut tunnel, &mut state.stack, &mut state.sockets).await {
+                    // Batch read remaining datagrams
+                    let mut budget = UDP_BATCH_READ_BUDGET - 1;
+                    while budget > 0 {
+                        match incoming_rx.try_recv() {
+                            Ok(incoming) => {
+                                let mut data = incoming.data;
+                                Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data, incoming.from, local_addr);
+                                budget -= 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
                         break;
                     }
                 }
@@ -790,9 +811,13 @@ impl TunnelManager {
             }
         }
 
+        // Phase 1: broadcast shutdown to all tasks
         if shutdown_tx.send(()).is_err() {
-            log::trace!("Failed to send shutdown signal: receiver dropped");
+            log::trace!("Failed to send shutdown signal: no receivers");
         }
+        // Phase 2: drop our guard and wait for all tasks to finish
+        drop(completion_tx);
+        let _ = completion_rx.recv().await; // returns None when all senders dropped
         if let Err(e) = recv_handle.await {
             log::debug!("Recv task join error: {:?}", e);
         }
@@ -971,8 +996,8 @@ impl TunnelManager {
             return Err(ManagerError::Stack(e));
         }
 
-        let (to_client_tx, to_client_rx) = mpsc::channel(8192);
-        let (from_client_tx, from_client_rx) = mpsc::channel(8192);
+        let (to_client_tx, to_client_rx) = mpsc::channel(128);
+        let (from_client_tx, from_client_rx) = mpsc::channel(32);
 
         let state = SocketState {
             to_client: to_client_tx,
@@ -1780,12 +1805,13 @@ impl TunnelManager {
                         MAX_PENDING_TO_CLIENT.saturating_sub(socket_state.pending_to_client_bytes);
                     let read_len = available.min(MAX_TCP_READ_CHUNK);
                     if read_len > 0 {
-                        let mut buf = vec![0u8; read_len];
-                        if let Ok(n) = state.stack.tcp_recv(handle, &mut buf)
+                        if state.read_buffer.len() < read_len {
+                            state.read_buffer.resize(read_len, 0);
+                        }
+                        if let Ok(n) = state.stack.tcp_recv(handle, &mut state.read_buffer[..read_len])
                             && n > 0
                         {
-                            buf.truncate(n);
-                            let data = Bytes::from(buf);
+                            let data = Bytes::copy_from_slice(&state.read_buffer[..n]);
                             match Self::deliver_to_client(handle, socket_state, data) {
                                 Ok(()) | Err(DeliverError::Backpressure) => {}
                                 Err(DeliverError::Closed) => {
@@ -1851,65 +1877,67 @@ impl TunnelManager {
         true
     }
 
-    // Lightweight processing after UDP recv: only handle TCP data transfer
-    async fn process_after_recv(
+    // Process after receiving data: poll stack, read TCP sockets, flush outbound packets
+    async fn flush_outbound(
         tunnel: &mut MasqueTunnel,
-        stack: &mut NetworkStack,
-        sockets: &mut HashMap<SocketHandle, SocketState>,
+        state: &mut RuntimeState,
     ) -> bool {
-        if let Err(e) = stack.poll() {
+        if let Err(e) = state.stack.poll() {
             log::error!("smoltcp poll failed, restarting tunnel: {}", e);
             return false;
         }
 
-        let handles: Vec<SocketHandle> = sockets.keys().copied().collect();
+        let handles: Vec<SocketHandle> = state.sockets.keys().copied().collect();
         for handle in handles {
-            let Some(state) = sockets.get_mut(&handle) else {
+            let Some(socket_state) = state.sockets.get_mut(&handle) else {
                 continue;
             };
 
-            if Self::flush_pending_to_client(state) {
+            if Self::flush_pending_to_client(socket_state) {
                 log::trace!("TCP channel closed for socket {:?}", handle);
-                stack.tcp_close(handle);
+                state.stack.tcp_close(handle);
                 continue;
             }
-            if state.pending_to_client_bytes >= MAX_PENDING_TO_CLIENT || !stack.tcp_may_recv(handle)
+            if socket_state.pending_to_client_bytes >= MAX_PENDING_TO_CLIENT
+                || !state.stack.tcp_may_recv(handle)
             {
                 continue;
             }
 
-            let available = MAX_PENDING_TO_CLIENT.saturating_sub(state.pending_to_client_bytes);
+            let available =
+                MAX_PENDING_TO_CLIENT.saturating_sub(socket_state.pending_to_client_bytes);
             let read_len = available.min(MAX_TCP_READ_CHUNK);
             if read_len == 0 {
                 continue;
             }
 
-            let mut buf = vec![0u8; read_len];
-            if let Ok(n) = stack.tcp_recv(handle, &mut buf)
+            if state.read_buffer.len() < read_len {
+                state.read_buffer.resize(read_len, 0);
+            }
+            if let Ok(n) = state.stack.tcp_recv(handle, &mut state.read_buffer[..read_len])
                 && n > 0
             {
-                buf.truncate(n);
-                let data = Bytes::from(buf);
-                match Self::deliver_to_client(handle, state, data) {
+                let data = Bytes::copy_from_slice(&state.read_buffer[..n]);
+                match Self::deliver_to_client(handle, socket_state, data) {
                     Ok(()) | Err(DeliverError::Backpressure) => {}
                     Err(DeliverError::Closed) => {
                         log::trace!("TCP channel closed for socket {:?}", handle);
-                        stack.tcp_close(handle);
+                        state.stack.tcp_close(handle);
                     }
                 }
             }
         }
 
-        while let Some(packet) = stack.take_packet() {
+        while let Some(packet) = state.stack.take_packet() {
             let send_result = tunnel.send_datagram(packet.as_ref());
-            stack.recycle_tx_buffer(packet);
+            state.stack.recycle_tx_buffer(packet);
             if let Err(e) = send_result {
-                log::debug!("Failed to send datagram in process_after_recv: {:?}", e);
+                log::debug!("Failed to send datagram: {:?}", e);
             }
         }
 
         if let Err(e) = tunnel.quic_conn.send_async().await {
-            log::debug!("Failed to send QUIC data in process_after_recv: {:?}", e);
+            log::debug!("Failed to send QUIC data: {:?}", e);
         }
         true
     }
