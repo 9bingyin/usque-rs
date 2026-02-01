@@ -2106,12 +2106,10 @@ impl TunnelManager {
         }
 
         while let Some(packet) = state.stack.take_packet() {
-            if let Err(e) = tunnel.send_ip_packet(packet.as_ref()).await {
-                log::warn!("Failed to send WG packet: {:?}", e);
-            }
+            tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
-        tunnel.flush_queued().await;
+        tunnel.flush_send_queue().await;
         true
     }
 
@@ -2197,12 +2195,10 @@ impl TunnelManager {
         }
 
         while let Some(packet) = state.stack.take_packet() {
-            if let Err(e) = tunnel.send_ip_packet(packet.as_ref()).await {
-                log::debug!("Failed to send WG packet: {:?}", e);
-            }
+            tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
-        tunnel.flush_queued().await;
+        tunnel.flush_send_queue().await;
         true
     }
 

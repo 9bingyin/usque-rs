@@ -27,6 +27,7 @@ pub struct WgTunnel {
     socket: Arc<UdpSocket>,
     client_id: [u8; 3],
     packet_pool: PacketBufPool,
+    send_queue: Vec<Packet>,
 }
 
 impl WgTunnel {
@@ -67,6 +68,7 @@ impl WgTunnel {
             socket,
             client_id,
             packet_pool,
+            send_queue: Vec::with_capacity(64),
         }
     }
 
@@ -118,22 +120,36 @@ impl WgTunnel {
         }
     }
 
-    /// Encrypt an IP packet and send it through the WG tunnel via UDP.
-    /// Uses PacketBufPool to recycle input buffers: when gotatun finishes encryption
-    /// and drops the input Packet, ReturnToPool automatically returns the buffer to the pool.
-    pub async fn send_ip_packet(&mut self, ip_data: &[u8]) -> Result<(), WgTunnelError> {
+    /// Encrypt an IP packet synchronously and buffer it for batch sending.
+    /// Call flush_send_queue() after processing all pending packets.
+    pub fn encrypt_ip_packet(&mut self, ip_data: &[u8]) {
         let mut packet = self.packet_pool.get();
         packet.truncate(ip_data.len());
         packet.copy_from_slice(ip_data);
         if let Some(wg_kind) = self.tunn.handle_outgoing_packet(packet) {
-            self.send_wg_packet(wg_kind).await?;
+            self.prepare_and_queue(wg_kind);
         }
-        Ok(())
     }
 
-    /// Flush all queued WG control packets (keepalive, rekey retransmissions, etc.)
-    pub async fn flush_queued(&mut self) {
-        self.flush_queued_packets().await;
+    /// Batch send all buffered encrypted packets and queued control packets.
+    pub async fn flush_send_queue(&mut self) {
+        // Drain queued control packets (keepalive, rekey) into send_queue
+        loop {
+            let next = self.tunn.get_queued_packets().next();
+            match next {
+                Some(wg_kind) => self.prepare_and_queue(wg_kind),
+                None => break,
+            }
+        }
+        let mut queue = std::mem::take(&mut self.send_queue);
+        for packet in &queue {
+            let data: &[u8] = packet;
+            if let Err(e) = self.try_send_udp(data).await {
+                log::warn!("Failed to send WG packet: {}", e);
+            }
+        }
+        queue.clear();
+        self.send_queue = queue;
     }
 
     /// Process incoming UDP data: strip reserved bytes, decrypt, inject IP packets
@@ -244,6 +260,28 @@ impl WgTunnel {
                 }
             }
             TunnResult::WriteToTunnel(_) => {}
+        }
+    }
+
+    /// Inject WARP client_id into reserved bytes and push to send_queue.
+    fn prepare_and_queue(&mut self, wg_kind: WgKind) {
+        let mut packet: Packet = wg_kind.into();
+        let buf = packet.buf_mut();
+        if buf.len() >= 4 {
+            buf[1..4].copy_from_slice(&self.client_id);
+        }
+        self.send_queue.push(packet);
+    }
+
+    /// try_send fast path; fall back to send().await on WouldBlock.
+    async fn try_send_udp(&self, data: &[u8]) -> Result<(), WgTunnelError> {
+        match self.socket.try_send(data) {
+            Ok(_) => Ok(()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.socket.send(data).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
