@@ -367,9 +367,9 @@ const MAX_TCP_READ_CHUNK: usize = 64 * 1024;
 
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 // Backpressure: from_client uses small channel (32) so send().await naturally blocks SOCKS5 reads
-const MAX_PENDING_DATA: usize = 256 * 1024; // 256KB per socket (for partial writes)
+const MAX_PENDING_DATA: usize = 128 * 1024; // 128KB per socket (for partial writes)
 // Backpressure: to_client uses try_send + pending queue, must never block manager
-const MAX_PENDING_TO_CLIENT: usize = 1024 * 1024; // 1MB per socket
+const MAX_PENDING_TO_CLIENT: usize = 256 * 1024; // 256KB per socket
 const UDP_BATCH_READ_BUDGET: usize = 128;
 
 enum DeliverError {

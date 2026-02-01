@@ -249,7 +249,7 @@ src/
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `USQUE_CC` | `cubic` | 拥塞控制算法（reno/cubic/bbr2）|
-| `USQUE_TCP_BUFFER_SIZE` | `1048576` | TCP 缓冲区大小（字节）|
+| `USQUE_TCP_BUFFER_SIZE` | `65536` | TCP 缓冲区大小（字节）|
 | `USQUE_QUIC_IDLE_TIMEOUT_MS` | `90000` | QUIC 空闲超时（毫秒）|
 | `USQUE_TUNNEL_WORKERS` | `1` | 隧道 worker 数量 |
 | `USQUE_MAX_CONNECTIONS` | `1024` | 最大并发连接数 |

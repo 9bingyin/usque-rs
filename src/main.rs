@@ -434,7 +434,7 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
     let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1048576);
+        .unwrap_or(65536);
 
     let quic_idle_timeout_ms: u64 = std::env::var("USQUE_QUIC_IDLE_TIMEOUT_MS")
         .ok()
