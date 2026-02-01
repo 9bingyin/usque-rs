@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant as StdInstant};
@@ -130,6 +130,13 @@ impl Device for VirtualDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
+        // RX packets are already integrity-protected by QUIC, skip RX checksum verification.
+        // Only compute checksums on TX.
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.icmpv6 = Checksum::Tx;
         caps
     }
 }

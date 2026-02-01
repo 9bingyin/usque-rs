@@ -736,6 +736,7 @@ impl TunnelManager {
         let mut last_keepalive = Instant::now();
         let keepalive_interval = Duration::from_secs(keepalive_secs);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+        const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
         let poll_timer = tokio::time::sleep(Duration::from_millis(0));
         tokio::pin!(poll_timer);
 
@@ -746,13 +747,17 @@ impl TunnelManager {
                 break;
             }
 
-            // Dynamic timeout based on quiche's internal timer
+            // Dynamic timeout: min of QUIC timer, smoltcp timer, and upper bound
             let quic_timeout = tunnel
                 .quic_conn
                 .conn
                 .timeout()
                 .unwrap_or(Duration::from_millis(100));
-            let poll_timeout = quic_timeout.min(MAX_POLL_INTERVAL);
+            let smoltcp_timeout = state
+                .stack
+                .poll_delay()
+                .unwrap_or(DEFAULT_POLL_INTERVAL);
+            let poll_timeout = quic_timeout.min(smoltcp_timeout).min(MAX_POLL_INTERVAL);
             poll_timer
                 .as_mut()
                 .reset(TokioInstant::now() + poll_timeout);

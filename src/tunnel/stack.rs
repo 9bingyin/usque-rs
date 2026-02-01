@@ -4,11 +4,12 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::socket::{
     Socket,
-    tcp::{Socket as TcpSocket, SocketBuffer},
+    tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer},
 };
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use std::collections::HashSet;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -107,18 +108,33 @@ impl NetworkStack {
             local_ipv4 = Some(Ipv4Address::new(10, 0, 0, 1));
         }
 
-        let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
-        // Use the same device instance for Interface creation
+        let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
         iface.update_ip_addrs(|addrs| {
             if let Some(v4) = local_ipv4 {
-                addrs.push(IpCidr::new(IpAddress::Ipv4(v4), 32)).ok();
+                // Use /0 prefix to match all addresses (virtual interface acts as gateway)
+                addrs.push(IpCidr::new(IpAddress::Ipv4(v4), 0)).ok();
             }
             if let Some(v6) = local_ipv6 {
-                addrs.push(IpCidr::new(IpAddress::Ipv6(v6), 128)).ok();
+                addrs.push(IpCidr::new(IpAddress::Ipv6(v6), 0)).ok();
             }
         });
+
+        if let Some(v4) = local_ipv4 {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(v4)
+                .expect("IPv4 default route");
+        }
+        if let Some(v6) = local_ipv6 {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(v6)
+                .expect("IPv6 default route");
+        }
+        iface.set_any_ip(true);
 
         let sockets = SocketSet::new(vec![]);
 
@@ -148,6 +164,15 @@ impl NetworkStack {
         Ok(())
     }
 
+    /// Returns the optimal delay before the next poll, based on smoltcp's internal timers
+    /// (TCP retransmission, delayed ACK, etc.). Returns None if immediate polling is needed.
+    pub fn poll_delay(&mut self) -> Option<Duration> {
+        let timestamp = SmolInstant::now();
+        self.iface
+            .poll_delay(timestamp, &self.sockets)
+            .map(|d| Duration::from_micros(d.total_micros()))
+    }
+
     fn get_tcp_socket_mut(&mut self, handle: SocketHandle) -> Option<&mut TcpSocket<'static>> {
         if self.valid_handles.contains(&handle) {
             Some(self.sockets.get_mut::<TcpSocket>(handle))
@@ -170,6 +195,8 @@ impl NetworkStack {
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
+        socket.set_congestion_control(CongestionControl::Cubic);
+        socket.set_timeout(Some(smoltcp::time::Duration::from_secs(7200)));
         let handle = self.sockets.add(socket);
         self.valid_handles.insert(handle);
         handle
