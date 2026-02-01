@@ -28,6 +28,28 @@ const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_FRAG_MAX_COUNT: usize = 128;
 
+/// Convert std IpAddr to smoltcp IpAddress, unwrapping IPv4-mapped IPv6
+/// (e.g. ::ffff:104.26.12.31) to native IPv4.
+fn std_ip_to_smoltcp(ip: IpAddr) -> IpAddress {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let o = v4.octets();
+                IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+            } else {
+                let s = v6.segments();
+                IpAddress::Ipv6(Ipv6Address::new(
+                    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                ))
+            }
+        }
+    }
+}
+
 // RFC 8305 Happy Eyeballs parameters
 const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
@@ -321,21 +343,7 @@ async fn resolve_target_addr(
     target: &TargetAddr,
 ) -> Result<(IpAddress, u16), Socks5Error> {
     match target {
-        TargetAddr::Ip(addr) => {
-            let ip = match addr.ip() {
-                IpAddr::V4(v4) => {
-                    let o = v4.octets();
-                    IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
-                }
-                IpAddr::V6(v6) => {
-                    let s = v6.segments();
-                    IpAddress::Ipv6(Ipv6Address::new(
-                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-                    ))
-                }
-            };
-            Ok((ip, addr.port()))
-        }
+        TargetAddr::Ip(addr) => Ok((std_ip_to_smoltcp(addr.ip()), addr.port())),
         TargetAddr::Domain(domain, port) => {
             log::debug!("Resolving {} through tunnel", domain);
             let ip = manager.resolve(domain, true).await.map_err(|e| {
@@ -355,19 +363,7 @@ async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
     // Resolve addresses and get port
     let (addresses, remote_port) = match target {
         TargetAddr::Ip(addr) => {
-            let ip = match addr.ip() {
-                IpAddr::V4(v4) => {
-                    let o = v4.octets();
-                    IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
-                }
-                IpAddr::V6(v6) => {
-                    let s = v6.segments();
-                    IpAddress::Ipv6(Ipv6Address::new(
-                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-                    ))
-                }
-            };
-            (vec![ip], addr.port())
+            (vec![std_ip_to_smoltcp(addr.ip())], addr.port())
         }
         TargetAddr::Domain(domain, port) => {
             log::debug!("Resolving all addresses for {} through tunnel", domain);

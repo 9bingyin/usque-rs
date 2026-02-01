@@ -4,6 +4,7 @@ use crate::tunnel::dns::{
 };
 use crate::tunnel::masque::MasqueTunnel;
 use crate::tunnel::quic;
+use crate::tunnel::wireguard::WgTunnel;
 use crate::tunnel::stack::{NetworkStack, StackError};
 use bytes::{Bytes, BytesMut};
 use quick_cache::unsync::Cache;
@@ -70,6 +71,17 @@ pub struct ConnectionParams {
     pub congestion_control: CongestionControl,
     pub tcp_buffer_size: usize,
     pub quic_idle_timeout_ms: u64,
+    pub tunnel_mode: TunnelMode,
+    pub wg_private_key: Option<[u8; 32]>,
+    pub wg_peer_public_key: Option<[u8; 32]>,
+    pub wg_client_id: Option<[u8; 3]>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum TunnelMode {
+    #[default]
+    Masque,
+    Wireguard,
 }
 
 #[derive(Error, Debug)]
@@ -427,13 +439,29 @@ impl TunnelManager {
     ) {
         let mut backoff = ExponentialBackoff::new();
 
+        enum TunnelConn {
+            Masque(Box<MasqueTunnel>, NetworkStack),
+            Wg(Box<WgTunnel>, NetworkStack),
+        }
+
         loop {
-            log::info!("Establishing MASQUE connection to {}", params.endpoint);
+            let mode_name = match params.tunnel_mode {
+                TunnelMode::Masque => "MASQUE",
+                TunnelMode::Wireguard => "WireGuard",
+            };
+            log::info!("Establishing {} connection to {}", mode_name, params.endpoint);
 
             let (conn_tx, mut conn_rx) = oneshot::channel();
             let params_clone = params.clone();
             tokio::spawn(async move {
-                let res = Self::establish_connection(&params_clone).await;
+                let res = match params_clone.tunnel_mode {
+                    TunnelMode::Masque => Self::establish_connection(&params_clone)
+                        .await
+                        .map(|(t, s)| TunnelConn::Masque(Box::new(t), s)),
+                    TunnelMode::Wireguard => Self::establish_connection_wg(&params_clone)
+                        .await
+                        .map(|(t, s)| TunnelConn::Wg(Box::new(t), s)),
+                };
                 if conn_tx.send(res).is_err() {
                     log::debug!("Connection result dropped: receiver closed");
                 }
@@ -443,19 +471,34 @@ impl TunnelManager {
                 tokio::select! {
                     res = &mut conn_rx => {
                         match res {
-                            Ok(Ok((tunnel, stack))) => {
+                            Ok(Ok(conn)) => {
                                 log::info!("Tunnel connected successfully");
                                 backoff.reset();
-                                Self::run_loop(
-                                    tunnel,
-                                    stack,
-                                    &mut cmd_rx,
-                                    &mut udp_rx,
-                                    &params.dns_servers,
-                                    params.keepalive,
-                                    params.tcp_buffer_size,
-                                )
-                                .await;
+                                match conn {
+                                    TunnelConn::Masque(tunnel, stack) => {
+                                        Self::run_loop(
+                                            *tunnel,
+                                            stack,
+                                            &mut cmd_rx,
+                                            &mut udp_rx,
+                                            &params.dns_servers,
+                                            params.keepalive,
+                                            params.tcp_buffer_size,
+                                        )
+                                        .await;
+                                    }
+                                    TunnelConn::Wg(tunnel, stack) => {
+                                        Self::run_loop_wg(
+                                            *tunnel,
+                                            stack,
+                                            &mut cmd_rx,
+                                            &mut udp_rx,
+                                            &params.dns_servers,
+                                            params.tcp_buffer_size,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 log::warn!("Connection lost, reconnecting...");
                             }
                             Ok(Err(e)) => {
@@ -560,6 +603,51 @@ impl TunnelManager {
         let stack = NetworkStack::new(ipv4, ipv6, mtu);
 
         Ok((masque_tunnel, stack))
+    }
+
+    async fn establish_connection_wg(
+        params: &ConnectionParams,
+    ) -> Result<(WgTunnel, NetworkStack), Box<dyn std::error::Error + Send + Sync>> {
+        let wg_private_key = params.wg_private_key.ok_or("WG private key not set")?;
+        let wg_peer_public_key = params.wg_peer_public_key.ok_or("WG peer public key not set")?;
+        let wg_client_id = params.wg_client_id.ok_or("WG client_id not set")?;
+
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = Arc::new(socket);
+
+        let keepalive = if params.keepalive > 0 {
+            Some(params.keepalive as u16)
+        } else {
+            None
+        };
+
+        let mut wg_tunnel = WgTunnel::new(
+            wg_private_key,
+            wg_peer_public_key,
+            socket,
+            params.endpoint,
+            wg_client_id,
+            keepalive,
+        );
+
+        wg_tunnel.establish(Duration::from_secs(30)).await?;
+
+        let mtu = if params.mtu == 0 {
+            1280
+        } else {
+            params.mtu as usize
+        };
+        log::info!("WireGuard tunnel established, MTU {}", mtu);
+
+        let ipv4 = if params.ipv4.trim().is_empty() {
+            None
+        } else {
+            Some(params.ipv4.as_str())
+        };
+        let ipv6 = params.ipv6.as_deref().filter(|s| !s.trim().is_empty());
+        let stack = NetworkStack::new(ipv4, ipv6, mtu);
+
+        Ok((wg_tunnel, stack))
     }
 
     pub async fn connect(
@@ -827,6 +915,136 @@ impl TunnelManager {
             log::debug!("Recv task join error: {:?}", e);
         }
         log::info!("TunnelManager run_loop ended");
+    }
+
+    async fn run_loop_wg(
+        mut tunnel: WgTunnel,
+        stack: NetworkStack,
+        cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
+        udp_rx: &mut mpsc::Receiver<UdpSend>,
+        dns_servers: &[IpAddress],
+        tcp_buffer_size: usize,
+    ) {
+        let socket = tunnel.socket();
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(INCOMING_DGRAM_CAPACITY);
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let mut shutdown_sub = shutdown_tx.subscribe();
+        let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
+        let recv_completion_tx = completion_tx.clone();
+
+        let recv_handle = tokio::spawn(async move {
+            let _guard = recv_completion_tx;
+            let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
+            loop {
+                tokio::select! {
+                    _ = shutdown_sub.recv() => break,
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, from)) => {
+                                if len == 0 { continue; }
+                                let data = buf[..len].to_vec();
+                                if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
+                                    log::trace!("Incoming datagram channel closed");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("UDP recv error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut state = RuntimeState::new(stack);
+
+        const WG_TIMER_INTERVAL: Duration = Duration::from_secs(1);
+        const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+        const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let wg_timer = tokio::time::sleep(WG_TIMER_INTERVAL);
+        tokio::pin!(wg_timer);
+        let poll_timer = tokio::time::sleep(Duration::from_millis(0));
+        tokio::pin!(poll_timer);
+
+        loop {
+            if tunnel.is_expired() {
+                log::error!("WireGuard tunnel expired");
+                break;
+            }
+
+            let smoltcp_timeout = state.stack.poll_delay().unwrap_or(DEFAULT_POLL_INTERVAL);
+            let poll_timeout = smoltcp_timeout.min(MAX_POLL_INTERVAL);
+            poll_timer
+                .as_mut()
+                .reset(TokioInstant::now() + poll_timeout);
+
+            tokio::select! {
+                biased;
+                Some(cmd) = cmd_rx.recv() => {
+                    Self::handle_command(&mut state, dns_servers, tcp_buffer_size, cmd);
+                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
+                        break;
+                    }
+                }
+
+                Some(udp_cmd) = udp_rx.recv() => {
+                    Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
+                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
+                        break;
+                    }
+                }
+
+                Some(incoming) = incoming_rx.recv() => {
+                    let mut data = incoming.data;
+                    let ip_packets = tunnel.process_incoming_udp(&mut data).await;
+                    for ip_pkt in &ip_packets {
+                        state.stack.inject_packet(ip_pkt);
+                    }
+                    let mut budget = UDP_BATCH_READ_BUDGET - 1;
+                    while budget > 0 {
+                        match incoming_rx.try_recv() {
+                            Ok(incoming) => {
+                                let mut data = incoming.data;
+                                let ip_packets = tunnel.process_incoming_udp(&mut data).await;
+                                for ip_pkt in &ip_packets {
+                                    state.stack.inject_packet(ip_pkt);
+                                }
+                                budget -= 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
+                        break;
+                    }
+                }
+
+                _ = &mut wg_timer => {
+                    if let Err(e) = tunnel.tick_timers().await {
+                        log::warn!("WG timer error: {}", e);
+                    }
+                    wg_timer.as_mut().reset(TokioInstant::now() + WG_TIMER_INTERVAL);
+                }
+
+                _ = &mut poll_timer => {
+                    if !Self::poll_all_wg(&mut tunnel, &mut state).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if shutdown_tx.send(()).is_err() {
+            log::trace!("Failed to send shutdown signal: no receivers");
+        }
+        drop(completion_tx);
+        let _ = completion_rx.recv().await;
+        if let Err(e) = recv_handle.await {
+            log::debug!("Recv task join error: {:?}", e);
+        }
+        log::info!("TunnelManager WG run_loop ended");
     }
 
     fn handle_command(
@@ -1698,31 +1916,16 @@ impl TunnelManager {
         }
     }
 
-    async fn poll_all(
-        tunnel: &mut MasqueTunnel,
-        state: &mut RuntimeState,
-        last_keepalive: &mut Instant,
-        keepalive_interval: Duration,
-    ) -> bool {
-        // Send keepalive PING if interval elapsed
-        if last_keepalive.elapsed() >= keepalive_interval {
-            if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
-                log::warn!("Failed to send keepalive PING: {:?}", e);
-            } else {
-                log::debug!("Sent keepalive PING frame");
-            }
-            *last_keepalive = Instant::now();
-        }
-
+    /// Common poll logic shared by MASQUE and WG modes:
+    /// stack poll, socket notifications, DNS/UDP processing, TCP I/O, cleanup.
+    fn poll_stack_common(state: &mut RuntimeState) -> bool {
         if let Err(e) = state.stack.poll() {
             log::error!("smoltcp poll failed, restarting tunnel: {}", e);
             return false;
         }
 
-        // Notify waiters of socket state changes (event-driven)
         Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
 
-        // Process DNS responses
         Self::process_dns_responses(
             &mut state.stack,
             &mut state.dns_queries,
@@ -1731,7 +1934,6 @@ impl TunnelManager {
             &state.dns_sockets,
         );
 
-        // Process UDP session responses
         Self::process_udp_responses(&mut state.stack, &mut state.udp_sessions);
 
         // Cleanup timed out DNS groups (5 second timeout)
@@ -1744,7 +1946,6 @@ impl TunnelManager {
             .collect();
 
         for group_id in timed_out_groups {
-            // Remove all queries for this group
             let query_ids: Vec<u16> = state
                 .dns_queries
                 .iter()
@@ -1754,7 +1955,6 @@ impl TunnelManager {
             for id in query_ids {
                 state.dns_queries.remove(&id);
             }
-            // Send timeout error
             if let Some(mut group) = state.dns_groups.remove(&group_id) {
                 if let Some(response) = group.response.take()
                     && response
@@ -1861,6 +2061,29 @@ impl TunnelManager {
             state.stack.remove_socket(handle);
         }
 
+        true
+    }
+
+    async fn poll_all(
+        tunnel: &mut MasqueTunnel,
+        state: &mut RuntimeState,
+        last_keepalive: &mut Instant,
+        keepalive_interval: Duration,
+    ) -> bool {
+        // Send keepalive PING if interval elapsed
+        if last_keepalive.elapsed() >= keepalive_interval {
+            if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
+                log::warn!("Failed to send keepalive PING: {:?}", e);
+            } else {
+                log::debug!("Sent keepalive PING frame");
+            }
+            *last_keepalive = Instant::now();
+        }
+
+        if !Self::poll_stack_common(state) {
+            return false;
+        }
+
         while let Some(packet) = state.stack.take_packet() {
             let send_result = tunnel.send_datagram(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
@@ -1882,11 +2105,22 @@ impl TunnelManager {
         true
     }
 
-    // Process after receiving data: poll stack, read TCP sockets, flush outbound packets
-    async fn flush_outbound(
-        tunnel: &mut MasqueTunnel,
-        state: &mut RuntimeState,
-    ) -> bool {
+    async fn poll_all_wg(tunnel: &mut WgTunnel, state: &mut RuntimeState) -> bool {
+        if !Self::poll_stack_common(state) {
+            return false;
+        }
+
+        while let Some(packet) = state.stack.take_packet() {
+            if let Err(e) = tunnel.send_ip_packet(packet.as_ref()).await {
+                log::warn!("Failed to send WG packet: {:?}", e);
+            }
+            state.stack.recycle_tx_buffer(packet);
+        }
+        true
+    }
+
+    /// Common flush logic: poll stack + TCP read handling.
+    fn flush_stack_reads(state: &mut RuntimeState) -> bool {
         if let Err(e) = state.stack.poll() {
             log::error!("smoltcp poll failed, restarting tunnel: {}", e);
             return false;
@@ -1933,6 +2167,17 @@ impl TunnelManager {
             }
         }
 
+        true
+    }
+
+    async fn flush_outbound(
+        tunnel: &mut MasqueTunnel,
+        state: &mut RuntimeState,
+    ) -> bool {
+        if !Self::flush_stack_reads(state) {
+            return false;
+        }
+
         while let Some(packet) = state.stack.take_packet() {
             let send_result = tunnel.send_datagram(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
@@ -1943,6 +2188,23 @@ impl TunnelManager {
 
         if let Err(e) = tunnel.quic_conn.send_async().await {
             log::debug!("Failed to send QUIC data: {:?}", e);
+        }
+        true
+    }
+
+    async fn flush_outbound_wg(
+        tunnel: &mut WgTunnel,
+        state: &mut RuntimeState,
+    ) -> bool {
+        if !Self::flush_stack_reads(state) {
+            return false;
+        }
+
+        while let Some(packet) = state.stack.take_packet() {
+            if let Err(e) = tunnel.send_ip_packet(packet.as_ref()).await {
+                log::debug!("Failed to send WG packet: {:?}", e);
+            }
+            state.stack.recycle_tx_buffer(packet);
         }
         true
     }

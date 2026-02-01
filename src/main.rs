@@ -37,6 +37,7 @@ mod config;
 mod crypto;
 mod proxy;
 mod tunnel;
+mod wg_config;
 
 #[derive(Parser)]
 #[command(name = "usque-rs")]
@@ -75,6 +76,20 @@ enum Commands {
         #[arg(short, long)]
         regen_key: bool,
     },
+    RegisterWg {
+        #[arg(short, long, default_value = "warp.conf")]
+        config: String,
+        #[arg(short, long, default_value = "PC")]
+        model: String,
+        #[arg(short, long, default_value = "en_US")]
+        locale: String,
+        /// ZeroTrust team token (optional)
+        #[arg(long)]
+        jwt: Option<String>,
+        /// Accept Cloudflare TOS (non-interactive setup)
+        #[arg(short, long)]
+        accept_tos: bool,
+    },
     Socks {
         #[arg(short, long, default_value = "0.0.0.0")]
         bind: String,
@@ -82,6 +97,9 @@ enum Commands {
         port: u16,
         #[arg(short, long, default_value = "config.json")]
         config: String,
+        /// Tunnel mode: masque (default) or wg
+        #[arg(long, default_value = "masque")]
+        mode: String,
         /// Username for SOCKS5 authentication (optional)
         #[arg(short, long)]
         username: Option<String>,
@@ -137,6 +155,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::RegisterWg {
+            config,
+            model,
+            locale,
+            jwt,
+            accept_tos,
+        } => {
+            register_wg_device(
+                &config,
+                &model,
+                &locale,
+                jwt.as_deref(),
+                accept_tos,
+            )
+            .await?;
+        }
         Commands::Enroll {
             config,
             name,
@@ -148,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             port,
             config,
+            mode,
             username,
             password,
             sni,
@@ -157,20 +192,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_packet_size,
             mtu,
         } => {
-            let options = SocksServerOptions {
-                bind,
-                port,
-                config_path: config,
-                username,
-                password,
-                sni,
-                dns_servers: dns,
-                connect_port,
-                keepalive,
-                initial_packet_size,
-                mtu,
-            };
-            run_socks_server(options).await?;
+            match mode.as_str() {
+                "wg" | "wireguard" => {
+                    let options = SocksServerWgOptions {
+                        bind,
+                        port,
+                        config_path: config,
+                        username,
+                        password,
+                        dns_servers: dns,
+                        mtu,
+                    };
+                    run_socks_server_wg(options).await?;
+                }
+                _ => {
+                    let options = SocksServerOptions {
+                        bind,
+                        port,
+                        config_path: config,
+                        username,
+                        password,
+                        sni,
+                        dns_servers: dns,
+                        connect_port,
+                        keepalive,
+                        initial_packet_size,
+                        mtu,
+                    };
+                    run_socks_server(options).await?;
+                }
+            }
         }
     }
 
@@ -516,6 +567,10 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
         congestion_control: cc,
         tcp_buffer_size,
         quic_idle_timeout_ms,
+        tunnel_mode: tunnel::TunnelMode::Masque,
+        wg_private_key: None,
+        wg_peer_public_key: None,
+        wg_client_id: None,
     };
 
     let available = std::thread::available_parallelism()
@@ -554,6 +609,274 @@ async fn run_socks_server(options: SocksServerOptions) -> Result<(), Box<dyn std
             log::info!("Shutdown signal received, exiting");
         }
     }
+
+    Ok(())
+}
+
+struct SocksServerWgOptions {
+    bind: String,
+    port: u16,
+    config_path: String,
+    username: Option<String>,
+    password: Option<String>,
+    dns_servers: Vec<String>,
+    mtu: u16,
+}
+
+async fn run_socks_server_wg(
+    options: SocksServerWgOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    let SocksServerWgOptions {
+        bind,
+        port,
+        config_path,
+        username,
+        password,
+        dns_servers,
+        mtu,
+    } = options;
+
+    let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65536);
+
+    let tunnel_workers: usize = std::env::var("USQUE_TUNNEL_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+
+    let wg_cfg = wg_config::WgConfig::load(&config_path)?;
+    println!("WireGuard config loaded from {}", config_path);
+
+    let private_key = wg_cfg.get_private_key_bytes()?;
+    let peer_public_key = wg_cfg.get_peer_public_key_bytes()?;
+    let client_id = wg_cfg.get_client_id_bytes()?;
+    let mut endpoint = wg_cfg.get_endpoint_addr()?;
+    if endpoint.port() == 0 {
+        log::warn!("Endpoint port is 0, using default WG port 2408");
+        endpoint.set_port(2408);
+    }
+    let keepalive = wg_cfg.keepalive as u64;
+
+    println!("Will connect to WG endpoint: {}", endpoint);
+    println!(
+        "Client ID (reserved): [{}, {}, {}]",
+        client_id[0], client_id[1], client_id[2]
+    );
+
+    // Use DNS from config if CLI didn't override defaults,
+    // otherwise use the CLI-provided DNS servers
+    let dns_addrs = if !wg_cfg.dns.trim().is_empty() {
+        tunnel::dns::parse_dns_servers(std::slice::from_ref(&wg_cfg.dns))?
+    } else {
+        tunnel::dns::parse_dns_servers(&dns_servers)?
+    };
+    println!("Using DNS servers: {:?}", dns_addrs);
+
+    let wg_mtu = if mtu == 0 {
+        wg_cfg.mtu
+    } else {
+        mtu
+    };
+
+    let params = tunnel::ConnectionParams {
+        endpoint,
+        cert_der: Vec::new(),
+        key_der: Vec::new(),
+        sni: String::new(),
+        endpoint_pub_key: None,
+        ipv4: wg_cfg.ipv4_address().to_string(),
+        ipv6: wg_cfg.ipv6_address().map(|s| s.to_string()),
+        dns_servers: dns_addrs,
+        keepalive,
+        initial_packet_size: 0,
+        mtu: wg_mtu,
+        congestion_control: tunnel::CongestionControl::default(),
+        tcp_buffer_size,
+        quic_idle_timeout_ms: 0,
+        tunnel_mode: tunnel::TunnelMode::Wireguard,
+        wg_private_key: Some(private_key),
+        wg_peer_public_key: Some(peer_public_key),
+        wg_client_id: Some(client_id),
+    };
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let worker_count = if tunnel_workers == 0 {
+        available.clamp(1, 4)
+    } else {
+        tunnel_workers.max(1)
+    };
+
+    let tunnel_pool = Arc::new(tunnel::TunnelManagerPool::new(params, worker_count));
+    println!("WireGuard tunnel manager pool started (workers: {})", worker_count);
+
+    let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
+
+    let server = match (username, password) {
+        (Some(user), Some(pass)) => {
+            println!("SOCKS5 authentication enabled");
+            proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
+        }
+        (Some(_), None) => {
+            return Err("Password is required when username is set".into());
+        }
+        _ => proxy::Socks5Server::new(addr, tunnel_pool),
+    };
+
+    println!("Starting SOCKS5 server (WireGuard mode) on {}:{}", bind, port);
+    tokio::select! {
+        result = server.run() => {
+            if let Err(e) = result {
+                log::error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown_signal() => {
+            log::info!("Shutdown signal received, exiting");
+        }
+    }
+
+    Ok(())
+}
+
+async fn register_wg_device(
+    config_path: &str,
+    model: &str,
+    locale: &str,
+    jwt: Option<&str>,
+    _accept_tos: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+
+    println!("Registering new WireGuard device...");
+    if jwt.is_some() {
+        println!("Using ZeroTrust authentication");
+    }
+
+    // Step 1: Generate Curve25519 key pair
+    let wg_keys = crypto::generate_wg_key_pair()?;
+    println!("Generated WireGuard key pair");
+
+    // Step 2: Register with real WG public key
+    let client = api::CloudflareClient::new();
+    let account = client
+        .register_wg(&wg_keys.public_key_base64, model, locale, jwt)
+        .await?;
+    println!("Account created: {}", account.id);
+
+    let token = account.token.clone().ok_or("No token in response")?;
+
+    // Step 3: Extract peer config
+    let peer = account
+        .config
+        .peers
+        .as_ref()
+        .and_then(|p| p.first())
+        .ok_or("No peer info in response")?;
+
+    let peer_public_key = peer.public_key.clone();
+    let endpoint_v4 = peer
+        .endpoint
+        .as_ref()
+        .and_then(|e| e.v4.clone())
+        .unwrap_or_default();
+    let endpoint_v6 = peer
+        .endpoint
+        .as_ref()
+        .and_then(|e| e.v6.clone());
+
+    let interface = account
+        .config
+        .interface_config
+        .as_ref()
+        .and_then(|i| i.addresses.as_ref())
+        .ok_or("No interface addresses in response")?;
+
+    let ipv4 = interface.v4.clone().unwrap_or_default();
+    let ipv6 = interface.v6.clone();
+
+    let client_id = account
+        .config
+        .client_id
+        .clone()
+        .ok_or("No client_id in response")?;
+
+    if endpoint_v4.is_empty() {
+        return Err("No endpoint v4 in response".into());
+    }
+    if ipv4.is_empty() {
+        return Err("No IPv4 address in response".into());
+    }
+
+    // Step 4: Build endpoint string (IP:port, default port 2408)
+    // Cloudflare API may return port 0; replace with default WG port 2408.
+    let endpoint_str = match endpoint_v4.parse::<SocketAddr>() {
+        Ok(addr) if addr.port() == 0 => {
+            SocketAddr::new(addr.ip(), 2408).to_string()
+        }
+        Ok(_) => endpoint_v4.clone(),
+        Err(_) => {
+            if let Ok(ip) = endpoint_v4.parse::<std::net::IpAddr>() {
+                SocketAddr::new(ip, 2408).to_string()
+            } else {
+                format!("{}:2408", endpoint_v4)
+            }
+        }
+    };
+
+    let endpoint6_str = endpoint_v6.map(|v6| {
+        let trimmed = v6.trim_matches(|c| c == '[' || c == ']');
+        match trimmed.parse::<SocketAddr>().or_else(|_| v6.parse::<SocketAddr>()) {
+            Ok(addr) if addr.port() == 0 => {
+                SocketAddr::new(addr.ip(), 2408).to_string()
+            }
+            Ok(addr) => addr.to_string(),
+            Err(_) => {
+                let ip_str = trimmed.split("]:").next().unwrap_or(trimmed);
+                if let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() {
+                    SocketAddr::new(std::net::IpAddr::V6(ip), 2408).to_string()
+                } else {
+                    format!("[{}]:2408", ip_str)
+                }
+            }
+        }
+    });
+
+    // Step 5: Build and save WG config
+    let private_key_b64 =
+        base64::engine::general_purpose::STANDARD.encode(wg_keys.private_key);
+
+    let wg_cfg = wg_config::WgConfig {
+        device_id: account.id.clone(),
+        private_key: private_key_b64,
+        token,
+        client_id: client_id.clone(),
+        account_type: "free".to_string(),
+        mtu: 1280,
+        peer_public_key,
+        endpoint: endpoint_str,
+        endpoint6: endpoint6_str,
+        keepalive: 30,
+        address: format!("{}/32", ipv4),
+        address6: ipv6.map(|v6| format!("{}/128", v6)),
+        dns: "1.1.1.1".to_string(),
+    };
+
+    wg_cfg.save(config_path)?;
+    println!("WireGuard config saved to {}", config_path);
+
+    // Print reserved value for reference
+    let client_id_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&client_id)
+        .unwrap_or_default();
+    println!(
+        "reserved: {:?} (base64: {})",
+        client_id_bytes, client_id
+    );
 
     Ok(())
 }

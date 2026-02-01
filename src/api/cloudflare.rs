@@ -105,6 +105,57 @@ impl CloudflareClient {
         Ok(account_data)
     }
 
+    /// Register a device with a real Curve25519 public key for WireGuard mode.
+    /// Unlike MASQUE registration, no subsequent enroll_key() call is needed.
+    pub async fn register_wg(
+        &self,
+        wg_public_key: &str,
+        model: &str,
+        locale: &str,
+        jwt: Option<&str>,
+    ) -> Result<AccountData, ApiClientError> {
+        let serial =
+            generate_random_serial().map_err(|e| ApiClientError::Crypto(e.to_string()))?;
+
+        let registration = Registration {
+            key: wg_public_key.to_string(),
+            install_id: String::new(),
+            fcm_token: String::new(),
+            tos: time_as_cf_string(chrono::Local::now()),
+            model: model.to_string(),
+            serial,
+            os_version: String::new(),
+            key_type: KEY_TYPE_WG.to_string(),
+            tun_type: TUN_TYPE_WG.to_string(),
+            locale: locale.to_string(),
+        };
+
+        let url = format!("{}/reg", self.base_url);
+        let mut req = self.client.post(&url).headers(default_headers());
+
+        if let Some(token) = jwt {
+            req = req.header("CF-Access-Jwt-Assertion", token);
+        }
+
+        let resp = req
+            .timeout(REQUEST_TIMEOUT)
+            .json(&registration)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiClientError::Api(format!(
+                "WG registration failed: {} - {}",
+                status, body
+            )));
+        }
+
+        let account_data: AccountData = resp.json().await?;
+        Ok(account_data)
+    }
+
     pub async fn enroll_key(
         &self,
         account_id: &str,

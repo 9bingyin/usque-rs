@@ -44,6 +44,7 @@ pub struct AccountConfig {
     pub peers: Option<Vec<Peer>>,
     #[serde(rename = "interface")]
     pub interface_config: Option<InterfaceConfig>,
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

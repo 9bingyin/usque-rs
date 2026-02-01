@@ -39,6 +39,30 @@ pub fn generate_ec_key_pair() -> Result<EcKeyPair, CryptoError> {
     })
 }
 
+pub struct WgKeyPair {
+    pub private_key: [u8; 32],
+    pub public_key_base64: String,
+}
+
+pub fn generate_wg_key_pair() -> Result<WgKeyPair, CryptoError> {
+    use base64::Engine;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let mut key_bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key_bytes)
+        .map_err(|e| CryptoError::RandomError(e.to_string()))?;
+    let secret = StaticSecret::from(key_bytes);
+    let public = PublicKey::from(&secret);
+    let private_bytes: [u8; 32] = secret.to_bytes();
+    let public_b64 =
+        base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
+    Ok(WgKeyPair {
+        private_key: private_bytes,
+        public_key_base64: public_b64,
+    })
+}
+
 pub fn generate_random_wg_pubkey() -> Result<String, CryptoError> {
     use base64::Engine;
     let mut pubkey = [0u8; 32];
