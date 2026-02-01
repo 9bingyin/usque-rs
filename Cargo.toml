@@ -28,5 +28,6 @@ signature = "2.2.0"
 smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp.git", rev = "39cd44e585aae109f37a2bc9f31376414968456d", features = ["medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "assembler-max-segment-count-32"] }
 spki = "0.7.3"
 thiserror = "2.0.18"
+tikv-jemallocator = "0.6.1"
 tokio = { version = "1.49.0", features = ["full"] }
 x509-cert = { version = "0.2.5", features = ["builder"] }
