@@ -152,13 +152,10 @@ impl WgTunnel {
         self.send_queue = queue;
     }
 
-    /// Process incoming UDP data: strip reserved bytes, decrypt, inject IP packets
-    /// directly into the smoltcp stack.
-    pub async fn process_incoming_udp(
-        &mut self,
-        mut data: BytesMut,
-        stack: &mut NetworkStack,
-    ) {
+    /// Synchronously decrypt an incoming WG packet and inject IP payload into smoltcp.
+    /// WG control responses (handshake, cookie) are queued in send_queue for batch sending.
+    /// Call drain_queued_to_send_queue() + flush_send_queue() after processing a batch.
+    pub fn decrypt_incoming(&mut self, mut data: BytesMut, stack: &mut NetworkStack) {
         strip_reserved(&mut data);
 
         let packet = Packet::from_bytes(data);
@@ -171,8 +168,32 @@ impl WgTunnel {
         };
 
         let result = self.tunn.handle_incoming_packet(wg_kind);
-        self.handle_tunn_result(result, stack).await;
-        self.flush_queued_packets().await;
+        match result {
+            TunnResult::Done => {}
+            TunnResult::Err(e) => {
+                log::debug!("WG tunnel error: {:?}", e);
+            }
+            TunnResult::WriteToNetwork(response) => {
+                self.prepare_and_queue(response);
+            }
+            TunnResult::WriteToTunnel(packet) => {
+                let raw: &[u8] = &packet;
+                if !raw.is_empty() {
+                    stack.inject_packet(raw);
+                }
+            }
+        }
+    }
+
+    /// Move tunn's internally queued control packets (keepalive, rekey) into send_queue.
+    pub fn drain_queued_to_send_queue(&mut self) {
+        loop {
+            let next = self.tunn.get_queued_packets().next();
+            match next {
+                Some(wg_kind) => self.prepare_and_queue(wg_kind),
+                None => break,
+            }
+        }
     }
 
     /// Process incoming packet during handshake (no stack injection needed).
@@ -224,26 +245,6 @@ impl WgTunnel {
                     }
                 }
                 None => break,
-            }
-        }
-    }
-
-    async fn handle_tunn_result(&mut self, result: TunnResult, stack: &mut NetworkStack) {
-        match result {
-            TunnResult::Done => {}
-            TunnResult::Err(e) => {
-                log::debug!("WG tunnel error: {:?}", e);
-            }
-            TunnResult::WriteToNetwork(response) => {
-                if let Err(e) = self.send_wg_packet(response).await {
-                    log::warn!("Failed to send WG response: {}", e);
-                }
-            }
-            TunnResult::WriteToTunnel(packet) => {
-                let raw: &[u8] = &packet;
-                if !raw.is_empty() {
-                    stack.inject_packet(raw);
-                }
             }
         }
     }

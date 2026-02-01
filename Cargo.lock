@@ -2972,6 +2972,7 @@ dependencies = [
  "serde_json",
  "signature",
  "smoltcp",
+ "socket2 0.5.10",
  "spki",
  "thiserror 2.0.18",
  "tikv-jemallocator",

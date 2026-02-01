@@ -344,6 +344,48 @@ struct IncomingDatagram {
     from: SocketAddr,
 }
 
+struct PerfCounters {
+    last_report: Instant,
+    rx_packets: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    poll_count: u64,
+    loop_iterations: u64,
+}
+
+impl PerfCounters {
+    fn new() -> Self {
+        Self {
+            last_report: Instant::now(),
+            rx_packets: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            tx_bytes: 0,
+            poll_count: 0,
+            loop_iterations: 0,
+        }
+    }
+
+    fn maybe_report(&mut self) {
+        let elapsed = self.last_report.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        log::info!(
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s",
+            self.rx_packets as f64 / secs,
+            self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
+            self.tx_packets as f64 / secs,
+            self.tx_bytes as f64 * 8.0 / secs / 1_000_000.0,
+            self.poll_count as f64 / secs,
+            self.loop_iterations as f64 / secs,
+        );
+        *self = Self::new();
+    }
+}
+
 struct RuntimeState {
     stack: NetworkStack,
     sockets: HashMap<SocketHandle, SocketState>,
@@ -353,6 +395,7 @@ struct RuntimeState {
     dns_cache: Cache<String, DnsCacheValue>,
     udp_sessions: HashMap<u16, UdpSessionState>,
     read_buffer: BytesMut,
+    perf: PerfCounters,
 }
 
 impl RuntimeState {
@@ -366,6 +409,7 @@ impl RuntimeState {
             dns_cache: Cache::new(DNS_CACHE_CAPACITY),
             udp_sessions: HashMap::new(),
             read_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
+            perf: PerfCounters::new(),
         }
     }
 }
@@ -614,6 +658,9 @@ impl TunnelManager {
 
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(params.endpoint).await?;
+        let std_socket = socket.into_std()?;
+        Self::configure_udp_socket_buffers(&std_socket, 4 * 1024 * 1024, 2 * 1024 * 1024);
+        let socket = tokio::net::UdpSocket::from_std(std_socket)?;
         let socket = Arc::new(socket);
 
         let keepalive = if params.keepalive > 0 {
@@ -977,6 +1024,9 @@ impl TunnelManager {
                 break;
             }
 
+            state.perf.loop_iterations += 1;
+            state.perf.maybe_report();
+
             let smoltcp_timeout = state.stack.poll_delay().unwrap_or(DEFAULT_POLL_INTERVAL);
             let poll_timeout = smoltcp_timeout.min(MAX_POLL_INTERVAL);
             poll_timer
@@ -1000,17 +1050,23 @@ impl TunnelManager {
                 }
 
                 Some(incoming) = incoming_rx.recv() => {
-                    tunnel.process_incoming_udp(incoming.data, &mut state.stack).await;
+                    state.perf.rx_packets += 1;
+                    state.perf.rx_bytes += incoming.data.len() as u64;
+                    tunnel.decrypt_incoming(incoming.data, &mut state.stack);
                     let mut budget = UDP_BATCH_READ_BUDGET - 1;
                     while budget > 0 {
                         match incoming_rx.try_recv() {
                             Ok(incoming) => {
-                                tunnel.process_incoming_udp(incoming.data, &mut state.stack).await;
+                                state.perf.rx_packets += 1;
+                                state.perf.rx_bytes += incoming.data.len() as u64;
+                                tunnel.decrypt_incoming(incoming.data, &mut state.stack);
                                 budget -= 1;
                             }
                             Err(_) => break,
                         }
                     }
+                    tunnel.drain_queued_to_send_queue();
+                    tunnel.flush_send_queue().await;
                     if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
                         break;
                     }
@@ -2101,11 +2157,14 @@ impl TunnelManager {
     }
 
     async fn poll_all_wg(tunnel: &mut WgTunnel, state: &mut RuntimeState) -> bool {
+        state.perf.poll_count += 1;
         if !Self::poll_stack_common(state) {
             return false;
         }
 
         while let Some(packet) = state.stack.take_packet() {
+            state.perf.tx_packets += 1;
+            state.perf.tx_bytes += packet.len() as u64;
             tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
@@ -2190,11 +2249,14 @@ impl TunnelManager {
         tunnel: &mut WgTunnel,
         state: &mut RuntimeState,
     ) -> bool {
+        state.perf.poll_count += 1;
         if !Self::flush_stack_reads(state) {
             return false;
         }
 
         while let Some(packet) = state.stack.take_packet() {
+            state.perf.tx_packets += 1;
+            state.perf.tx_bytes += packet.len() as u64;
             tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
@@ -2261,6 +2323,31 @@ impl TunnelManager {
                 break;
             }
         }
+    }
+
+    fn configure_udp_socket_buffers(
+        socket: &std::net::UdpSocket,
+        recv_size: usize,
+        send_size: usize,
+    ) {
+        let sock = socket2::SockRef::from(socket);
+
+        if let Err(e) = sock.set_recv_buffer_size(recv_size) {
+            log::warn!("Failed to set SO_RCVBUF to {}KB: {}", recv_size / 1024, e);
+        }
+        if let Err(e) = sock.set_send_buffer_size(send_size) {
+            log::warn!("Failed to set SO_SNDBUF to {}KB: {}", send_size / 1024, e);
+        }
+
+        let actual_recv = sock.recv_buffer_size().unwrap_or(0);
+        let actual_send = sock.send_buffer_size().unwrap_or(0);
+        log::info!(
+            "WG UDP socket buffers: recv={}KB (req {}KB), send={}KB (req {}KB)",
+            actual_recv / 1024,
+            recv_size / 1024,
+            actual_send / 1024,
+            send_size / 1024,
+        );
     }
 
     fn deliver_to_client(
