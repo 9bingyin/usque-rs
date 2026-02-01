@@ -340,7 +340,7 @@ struct UdpSend {
 }
 
 struct IncomingDatagram {
-    data: Vec<u8>,
+    data: BytesMut,
     from: SocketAddr,
 }
 
@@ -613,6 +613,7 @@ impl TunnelManager {
         let wg_client_id = params.wg_client_id.ok_or("WG client_id not set")?;
 
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(params.endpoint).await?;
         let socket = Arc::new(socket);
 
         let keepalive = if params.keepalive > 0 {
@@ -625,7 +626,6 @@ impl TunnelManager {
             wg_private_key,
             wg_peer_public_key,
             socket,
-            params.endpoint,
             wg_client_id,
             keepalive,
         );
@@ -803,7 +803,7 @@ impl TunnelManager {
                                 if len == 0 {
                                     continue;
                                 }
-                                let data = buf[..len].to_vec();
+                                let data = BytesMut::from(&buf[..len]);
                                 if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
                                     log::trace!("Incoming datagram channel closed");
                                     break;
@@ -871,14 +871,14 @@ impl TunnelManager {
                 // Receive UDP data from QUIC socket - batch read
                 Some(incoming) = incoming_rx.recv() => {
                     let mut data = incoming.data;
-                    Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data, incoming.from, local_addr);
+                    Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data[..], incoming.from, local_addr);
                     // Batch read remaining datagrams
                     let mut budget = UDP_BATCH_READ_BUDGET - 1;
                     while budget > 0 {
                         match incoming_rx.try_recv() {
                             Ok(incoming) => {
                                 let mut data = incoming.data;
-                                Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data, incoming.from, local_addr);
+                                Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data[..], incoming.from, local_addr);
                                 budget -= 1;
                             }
                             Err(_) => break,
@@ -932,18 +932,21 @@ impl TunnelManager {
         let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
         let recv_completion_tx = completion_tx.clone();
 
+        let peer_addr = socket
+            .peer_addr()
+            .expect("WG socket should be connected");
         let recv_handle = tokio::spawn(async move {
             let _guard = recv_completion_tx;
             let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             loop {
                 tokio::select! {
                     _ = shutdown_sub.recv() => break,
-                    result = socket.recv_from(&mut buf) => {
+                    result = socket.recv(&mut buf) => {
                         match result {
-                            Ok((len, from)) => {
+                            Ok(len) => {
                                 if len == 0 { continue; }
-                                let data = buf[..len].to_vec();
-                                if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
+                                let data = BytesMut::from(&buf[..len]);
+                                if incoming_tx.send(IncomingDatagram { data, from: peer_addr }).await.is_err() {
                                     log::trace!("Incoming datagram channel closed");
                                     break;
                                 }
@@ -959,7 +962,7 @@ impl TunnelManager {
 
         let mut state = RuntimeState::new(stack);
 
-        const WG_TIMER_INTERVAL: Duration = Duration::from_secs(1);
+        const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
         const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -997,20 +1000,12 @@ impl TunnelManager {
                 }
 
                 Some(incoming) = incoming_rx.recv() => {
-                    let mut data = incoming.data;
-                    let ip_packets = tunnel.process_incoming_udp(&mut data).await;
-                    for ip_pkt in &ip_packets {
-                        state.stack.inject_packet(ip_pkt);
-                    }
+                    tunnel.process_incoming_udp(incoming.data, &mut state.stack).await;
                     let mut budget = UDP_BATCH_READ_BUDGET - 1;
                     while budget > 0 {
                         match incoming_rx.try_recv() {
                             Ok(incoming) => {
-                                let mut data = incoming.data;
-                                let ip_packets = tunnel.process_incoming_udp(&mut data).await;
-                                for ip_pkt in &ip_packets {
-                                    state.stack.inject_packet(ip_pkt);
-                                }
+                                tunnel.process_incoming_udp(incoming.data, &mut state.stack).await;
                                 budget -= 1;
                             }
                             Err(_) => break,
@@ -2116,6 +2111,7 @@ impl TunnelManager {
             }
             state.stack.recycle_tx_buffer(packet);
         }
+        tunnel.flush_queued().await;
         true
     }
 
@@ -2206,6 +2202,7 @@ impl TunnelManager {
             }
             state.stack.recycle_tx_buffer(packet);
         }
+        tunnel.flush_queued().await;
         true
     }
 

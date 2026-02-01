@@ -108,20 +108,28 @@ impl Device for VirtualDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx_queue.pop_front()?;
+        let buffer = self
+            .buffer_pool
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(self.mtu));
         Some((
             VirtualRxToken { data: packet },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
-                mtu: self.mtu,
+                buffer,
                 drop_logger: &mut self.tx_drop_logger,
             },
         ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        let buffer = self
+            .buffer_pool
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(self.mtu));
         Some(VirtualTxToken {
             queue: &mut self.tx_queue,
-            mtu: self.mtu,
+            buffer,
             drop_logger: &mut self.tx_drop_logger,
         })
     }
@@ -156,23 +164,23 @@ impl RxToken for VirtualRxToken {
 
 pub struct VirtualTxToken<'a> {
     queue: &'a mut VecDeque<BytesMut>,
-    mtu: usize,
+    buffer: BytesMut,
     drop_logger: &'a mut DropLogger,
 }
 
 impl<'a> TxToken for VirtualTxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = BytesMut::with_capacity(self.mtu.max(len));
-        buffer.resize(len, 0);
-        let result = f(&mut buffer);
+        self.buffer.clear();
+        self.buffer.resize(len, 0);
+        let result = f(&mut self.buffer);
         while self.queue.len() >= MAX_QUEUE_SIZE {
             drop(self.queue.pop_front());
             self.drop_logger.log_drop();
         }
-        self.queue.push_back(buffer);
+        self.queue.push_back(self.buffer);
         result
     }
 }

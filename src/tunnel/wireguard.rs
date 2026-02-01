@@ -1,13 +1,14 @@
 use bytes::BytesMut;
 use gotatun::noise::rate_limiter::RateLimiter;
 use gotatun::noise::{Tunn, TunnResult};
-use gotatun::packet::{Packet, WgKind};
+use gotatun::packet::{Packet, PacketBufPool, WgKind};
 use ring::rand::SecureRandom;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
+
+use super::stack::NetworkStack;
 
 #[derive(Error, Debug)]
 pub enum WgTunnelError {
@@ -24,8 +25,8 @@ pub enum WgTunnelError {
 pub struct WgTunnel {
     tunn: Tunn,
     socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
     client_id: [u8; 3],
+    packet_pool: PacketBufPool,
 }
 
 impl WgTunnel {
@@ -33,7 +34,6 @@ impl WgTunnel {
         private_key: [u8; 32],
         peer_public_key: [u8; 32],
         socket: Arc<UdpSocket>,
-        peer_addr: SocketAddr,
         client_id: [u8; 3],
         keepalive: Option<u16>,
     ) -> Self {
@@ -60,11 +60,13 @@ impl WgTunnel {
             rate_limiter,
         );
 
+        let packet_pool = PacketBufPool::new(256);
+
         Self {
             tunn,
             socket,
-            peer_addr,
             client_id,
+            packet_pool,
         }
     }
 
@@ -94,10 +96,10 @@ impl WgTunnel {
 
             tokio::select! {
                 biased;
-                result = self.socket.recv_from(&mut buf) => {
+                result = self.socket.recv(&mut buf) => {
                     match result {
-                        Ok((len, _from)) => {
-                            let _ = self.process_incoming_udp(&mut buf[..len]).await;
+                        Ok(len) => {
+                            self.process_handshake_packet(&mut buf[..len]).await;
                             if self.tunn.time_since_last_handshake().is_some() {
                                 log::info!("WireGuard handshake completed");
                                 return Ok(());
@@ -117,18 +119,48 @@ impl WgTunnel {
     }
 
     /// Encrypt an IP packet and send it through the WG tunnel via UDP.
+    /// Uses PacketBufPool to recycle input buffers: when gotatun finishes encryption
+    /// and drops the input Packet, ReturnToPool automatically returns the buffer to the pool.
     pub async fn send_ip_packet(&mut self, ip_data: &[u8]) -> Result<(), WgTunnelError> {
-        let packet = Packet::from_bytes(BytesMut::from(ip_data));
+        let mut packet = self.packet_pool.get();
+        packet.truncate(ip_data.len());
+        packet.copy_from_slice(ip_data);
         if let Some(wg_kind) = self.tunn.handle_outgoing_packet(packet) {
             self.send_wg_packet(wg_kind).await?;
         }
-        self.flush_queued_packets().await;
         Ok(())
     }
 
-    /// Process incoming UDP data: strip reserved bytes, decrypt, return IP packets
-    /// that should be injected into the smoltcp stack.
-    pub async fn process_incoming_udp(&mut self, data: &mut [u8]) -> Vec<Vec<u8>> {
+    /// Flush all queued WG control packets (keepalive, rekey retransmissions, etc.)
+    pub async fn flush_queued(&mut self) {
+        self.flush_queued_packets().await;
+    }
+
+    /// Process incoming UDP data: strip reserved bytes, decrypt, inject IP packets
+    /// directly into the smoltcp stack.
+    pub async fn process_incoming_udp(
+        &mut self,
+        mut data: BytesMut,
+        stack: &mut NetworkStack,
+    ) {
+        strip_reserved(&mut data);
+
+        let packet = Packet::from_bytes(data);
+        let wg_kind = match packet.try_into_wg() {
+            Ok(wg) => wg,
+            Err(e) => {
+                log::debug!("Failed to parse WG packet: {}", e);
+                return;
+            }
+        };
+
+        let result = self.tunn.handle_incoming_packet(wg_kind);
+        self.handle_tunn_result(result, stack).await;
+        self.flush_queued_packets().await;
+    }
+
+    /// Process incoming packet during handshake (no stack injection needed).
+    async fn process_handshake_packet(&mut self, data: &mut [u8]) {
         strip_reserved(data);
 
         let packet = Packet::from_bytes(BytesMut::from(&data[..]));
@@ -136,17 +168,13 @@ impl WgTunnel {
             Ok(wg) => wg,
             Err(e) => {
                 log::debug!("Failed to parse WG packet: {}", e);
-                return vec![];
+                return;
             }
         };
 
         let result = self.tunn.handle_incoming_packet(wg_kind);
-        let mut ip_packets = Vec::new();
-
-        self.handle_tunn_result(result, &mut ip_packets).await;
+        self.handle_tunn_result_handshake(result).await;
         self.flush_queued_packets().await;
-
-        ip_packets
     }
 
     /// Drive WG internal timers (keepalive, rekey, handshake retransmission).
@@ -168,17 +196,23 @@ impl WgTunnel {
         self.tunn.is_expired()
     }
 
-    /// Collect and send all queued packets (avoids borrow conflict with iterator).
+    /// Send queued packets one at a time, leveraging NLL to release the mutable
+    /// borrow on self.tunn between iterations (avoids collecting into Vec).
     async fn flush_queued_packets(&mut self) {
-        let queued: Vec<WgKind> = self.tunn.get_queued_packets().collect();
-        for packet in queued {
-            if let Err(e) = self.send_wg_packet(packet).await {
-                log::warn!("Failed to send queued WG packet: {}", e);
+        loop {
+            let next = self.tunn.get_queued_packets().next();
+            match next {
+                Some(wg_kind) => {
+                    if let Err(e) = self.send_wg_packet(wg_kind).await {
+                        log::warn!("Failed to send queued WG packet: {}", e);
+                    }
+                }
+                None => break,
             }
         }
     }
 
-    async fn handle_tunn_result(&mut self, result: TunnResult, ip_packets: &mut Vec<Vec<u8>>) {
+    async fn handle_tunn_result(&mut self, result: TunnResult, stack: &mut NetworkStack) {
         match result {
             TunnResult::Done => {}
             TunnResult::Err(e) => {
@@ -192,13 +226,28 @@ impl WgTunnel {
             TunnResult::WriteToTunnel(packet) => {
                 let raw: &[u8] = &packet;
                 if !raw.is_empty() {
-                    ip_packets.push(raw.to_vec());
+                    stack.inject_packet(raw);
                 }
             }
         }
     }
 
-    /// Inject WARP client_id into reserved bytes and send via UDP.
+    async fn handle_tunn_result_handshake(&mut self, result: TunnResult) {
+        match result {
+            TunnResult::Done => {}
+            TunnResult::Err(e) => {
+                log::debug!("WG tunnel error: {:?}", e);
+            }
+            TunnResult::WriteToNetwork(response) => {
+                if let Err(e) = self.send_wg_packet(response).await {
+                    log::warn!("Failed to send WG response: {}", e);
+                }
+            }
+            TunnResult::WriteToTunnel(_) => {}
+        }
+    }
+
+    /// Inject WARP client_id into reserved bytes and send via connected UDP socket.
     async fn send_wg_packet(&self, wg_kind: WgKind) -> Result<(), WgTunnelError> {
         let mut packet: Packet = wg_kind.into();
         let buf = packet.buf_mut();
@@ -206,7 +255,7 @@ impl WgTunnel {
             buf[1..4].copy_from_slice(&self.client_id);
         }
         let data: &[u8] = &packet;
-        self.socket.send_to(data, self.peer_addr).await?;
+        self.socket.send(data).await?;
         Ok(())
     }
 }
