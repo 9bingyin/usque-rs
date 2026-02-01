@@ -18,10 +18,10 @@ Cloudflare WARP client implemented in Rust, supporting both MASQUE and WireGuard
 
 ```bash
 # 1. Register a new device
-usque-rs register
+usque-rs register masque --accept-tos
 
 # 2. Start SOCKS5 proxy
-usque-rs socks
+usque-rs socks masque
 
 # 3. Test connection
 curl -x socks5://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
@@ -31,10 +31,10 @@ curl -x socks5://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ```bash
 # 1. Register a new device (generates warp.conf)
-usque-rs register-wg --accept-tos
+usque-rs register wg --accept-tos
 
-# 2. Start SOCKS5 proxy in WG mode
-usque-rs socks --mode wg --config warp.conf
+# 2. Start SOCKS5 proxy
+usque-rs socks wg
 
 # 3. Test connection
 curl -x socks5://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
@@ -42,12 +42,12 @@ curl -x socks5://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ## Commands
 
-### register
+### register masque
 
-Register a new device with Cloudflare WARP.
+Register a new device for MASQUE tunnel mode.
 
 ```bash
-usque-rs register [OPTIONS]
+usque-rs register masque [OPTIONS]
 ```
 
 | Option | Short | Default | Description |
@@ -59,12 +59,12 @@ usque-rs register [OPTIONS]
 | `--jwt` | - | - | ZeroTrust team token |
 | `--accept-tos` | `-a` | `false` | Accept Cloudflare TOS |
 
-### register-wg
+### register wg
 
-Register a new device with Cloudflare WARP for WireGuard mode. Generates a Curve25519 key pair and saves the configuration as an INI file.
+Register a new device for WireGuard tunnel mode. Generates a Curve25519 key pair and saves the configuration as an INI file.
 
 ```bash
-usque-rs register-wg [OPTIONS]
+usque-rs register wg [OPTIONS]
 ```
 
 | Option | Short | Default | Description |
@@ -77,7 +77,7 @@ usque-rs register-wg [OPTIONS]
 
 ### enroll
 
-Re-enroll device key (useful for key rotation).
+Re-enroll device key (MASQUE mode, useful for key rotation).
 
 ```bash
 usque-rs enroll [OPTIONS]
@@ -89,40 +89,52 @@ usque-rs enroll [OPTIONS]
 | `--name` | `-n` | - | Device name |
 | `--regen-key` | `-r` | `false` | Regenerate key pair |
 
-### socks
+### socks masque
 
-Start SOCKS5 proxy server.
+Start SOCKS5 proxy with MASQUE tunnel (HTTP/3 over QUIC).
 
 ```bash
-usque-rs socks [OPTIONS]
+usque-rs socks masque [OPTIONS]
 ```
 
-#### Network Options
+#### Common Options
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--bind` | `-b` | `0.0.0.0` | Bind address |
 | `--port` | `-p` | `1080` | Listen port |
-| `--config` | `-c` | `config.json` | Config file path (`config.json` for MASQUE, `warp.conf` for WG) |
-| `--mode` | - | `masque` | Tunnel mode: `masque` or `wg` |
-| `--sni-address` | `-s` | `consumer-masque.cloudflareclient.com` | SNI for MASQUE (MASQUE mode only) |
-| `--connect-port` | `-P` | `443` | MASQUE server port (MASQUE mode only) |
-| `--dns` | `-d` | `9.9.9.10,149.112.112.10` | DNS servers (can specify multiple) |
-
-#### Authentication Options
-
-| Option | Short | Default | Description |
-|--------|-------|---------|-------------|
+| `--config` | `-c` | `config.json` | Config file path |
 | `--username` | `-u` | - | SOCKS5 username |
 | `--password` | `-w` | - | SOCKS5 password (required if username set) |
+| `--dns` | `-d` | `9.9.9.10,149.112.112.10` | DNS servers (can specify multiple) |
+| `--mtu` | `-m` | `1280` | MTU |
 
-#### Performance Options
+#### MASQUE Options
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--mtu` | `-m` | `1280` | MTU for MASQUE connection |
-| `--initial-packet-size` | `-i` | `1242` | Initial QUIC packet size |
+| `--sni-address` | `-s` | `consumer-masque.cloudflareclient.com` | SNI for MASQUE connection |
+| `--connect-port` | `-P` | `443` | MASQUE server port |
 | `--keepalive-period` | `-k` | `30` | Keepalive interval in seconds |
+| `--initial-packet-size` | `-i` | `1242` | Initial QUIC packet size |
+
+### socks wg
+
+Start SOCKS5 proxy with WireGuard tunnel (UDP).
+
+```bash
+usque-rs socks wg [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--bind` | `-b` | `0.0.0.0` | Bind address |
+| `--port` | `-p` | `1080` | Listen port |
+| `--config` | `-c` | `warp.conf` | Config file path |
+| `--username` | `-u` | - | SOCKS5 username |
+| `--password` | `-w` | - | SOCKS5 password (required if username set) |
+| `--dns` | `-d` | `9.9.9.10,149.112.112.10` | DNS servers (can specify multiple) |
+| `--mtu` | `-m` | `1280` | MTU |
 
 ## Environment Variables
 
@@ -160,46 +172,70 @@ sudo sysctl -w net.core.wmem_max=7500000
 ### Basic Usage
 
 ```bash
-# Start with default settings
-usque-rs socks
+# Start MASQUE proxy with default settings
+usque-rs socks masque
 
 # Start on custom port with debug logging
-RUST_LOG=debug usque-rs socks -p 8080
+RUST_LOG=debug usque-rs socks masque -p 8080
 ```
 
 ### WireGuard Mode
 
 ```bash
 # Register and start WG proxy
-usque-rs register-wg --accept-tos
-usque-rs socks --mode wg --config warp.conf
+usque-rs register wg --accept-tos
+usque-rs socks wg
 
 # WG mode with custom port and DNS
-usque-rs socks --mode wg --config warp.conf -p 8080 -d 1.1.1.1
+usque-rs socks wg -p 8080 -d 1.1.1.1
 ```
 
 ### High Performance Mode
 
 ```bash
 # Enable auto worker count and larger buffers
-USQUE_TUNNEL_WORKERS=0 USQUE_TCP_BUFFER_SIZE=2097152 usque-rs socks
+USQUE_TUNNEL_WORKERS=0 USQUE_TCP_BUFFER_SIZE=2097152 usque-rs socks masque
 ```
 
 ### With Authentication
 
 ```bash
-usque-rs socks -u myuser -w mypassword
+usque-rs socks masque -u myuser -w mypassword
 ```
 
 ### ZeroTrust Mode
 
 ```bash
 # Register with team token
-usque-rs register --jwt <your-team-token>
+usque-rs register masque --jwt <your-team-token>
 
 # Use ZeroTrust SNI
-usque-rs socks --sni-address <your-team>.cloudflareaccess.com
+usque-rs socks masque --sni-address <your-team>.cloudflareaccess.com
 ```
+
+### Docker
+
+```bash
+# MASQUE mode (default)
+docker run -e SOCKS_BIND=0.0.0.0 -p 1080:1080 usque-rs
+
+# WireGuard mode
+docker run -e TUNNEL_MODE=wg -e SOCKS_BIND=0.0.0.0 -p 1080:1080 usque-rs
+
+# With authentication
+docker run -e SOCKS_USER=user -e SOCKS_PASS=pass -e SOCKS_BIND=0.0.0.0 -p 1080:1080 usque-rs
+```
+
+#### Docker Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TUNNEL_MODE` | `masque` | Tunnel mode: `masque` or `wg` (also accepts `wireguard`) |
+| `SOCKS_BIND` | `127.0.0.1` | SOCKS5 bind address |
+| `SOCKS_PORT` | `1080` | SOCKS5 listen port |
+| `SOCKS_USER` | - | SOCKS5 username |
+| `SOCKS_PASS` | - | SOCKS5 password |
+| `DNS_SERVERS` | `1.1.1.1,1.0.0.1` | DNS servers (comma-separated) |
 
 ## Config File Format
 
@@ -221,7 +257,7 @@ usque-rs socks --sni-address <your-team>.cloudflareaccess.com
 
 ### WireGuard mode (`warp.conf`)
 
-INI format, generated by `register-wg` command:
+INI format, generated by `register wg` command:
 
 ```ini
 [Account]

@@ -41,7 +41,7 @@ mod wg_config;
 
 #[derive(Parser)]
 #[command(name = "usque-rs")]
-#[command(about = "Cloudflare WARP MASQUE client")]
+#[command(about = "Cloudflare WARP client (MASQUE / WireGuard)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -49,7 +49,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Register device with Cloudflare WARP
     Register {
+        #[command(subcommand)]
+        mode: RegisterMode,
+    },
+    /// Re-enroll device key (MASQUE mode)
+    Enroll {
+        #[arg(short, long, default_value = "config.json")]
+        config: String,
+        /// Device name (optional)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Regenerate key pair
+        #[arg(short, long)]
+        regen_key: bool,
+    },
+    /// Start SOCKS5 proxy
+    Socks {
+        #[command(subcommand)]
+        mode: SocksMode,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegisterMode {
+    /// Register for MASQUE tunnel mode
+    Masque {
         #[arg(short, long, default_value = "config.json")]
         config: String,
         #[arg(short, long, default_value = "PC")]
@@ -66,17 +92,8 @@ enum Commands {
         #[arg(short, long)]
         accept_tos: bool,
     },
-    Enroll {
-        #[arg(short, long, default_value = "config.json")]
-        config: String,
-        /// Device name (optional)
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Regenerate key pair
-        #[arg(short, long)]
-        regen_key: bool,
-    },
-    RegisterWg {
+    /// Register for WireGuard tunnel mode
+    Wg {
         #[arg(short, long, default_value = "warp.conf")]
         config: String,
         #[arg(short, long, default_value = "PC")]
@@ -90,22 +107,30 @@ enum Commands {
         #[arg(short, long)]
         accept_tos: bool,
     },
-    Socks {
+}
+
+#[derive(Subcommand)]
+enum SocksMode {
+    /// MASQUE tunnel (HTTP/3 over QUIC)
+    Masque {
         #[arg(short, long, default_value = "0.0.0.0")]
         bind: String,
         #[arg(short, long, default_value = "1080")]
         port: u16,
         #[arg(short, long, default_value = "config.json")]
         config: String,
-        /// Tunnel mode: masque (default) or wg
-        #[arg(long, default_value = "masque")]
-        mode: String,
         /// Username for SOCKS5 authentication (optional)
         #[arg(short, long)]
         username: Option<String>,
         /// Password for SOCKS5 authentication (required if username is set)
         #[arg(short = 'w', long)]
         password: Option<String>,
+        /// DNS servers to use (can be specified multiple times)
+        #[arg(short, long, default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()])]
+        dns: Vec<String>,
+        /// MTU
+        #[arg(short = 'm', long, default_value = "1280")]
+        mtu: u16,
         /// SNI address for MASQUE connection
         #[arg(
             short,
@@ -113,19 +138,34 @@ enum Commands {
             default_value = "consumer-masque.cloudflareclient.com"
         )]
         sni: String,
-        /// DNS servers to use (can be specified multiple times)
-        #[arg(short, long, default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()])]
-        dns: Vec<String>,
-        /// Port for MASQUE connection
+        /// MASQUE server port
         #[arg(short = 'P', long = "connect-port", default_value = "443")]
         connect_port: u16,
         /// Keepalive period in seconds
         #[arg(short = 'k', long = "keepalive-period", default_value = "30")]
         keepalive: u64,
-        /// Initial packet size for MASQUE connection
+        /// Initial QUIC packet size
         #[arg(short = 'i', long = "initial-packet-size", default_value = "1242")]
         initial_packet_size: u16,
-        /// MTU for MASQUE connection
+    },
+    /// WireGuard tunnel (UDP)
+    Wg {
+        #[arg(short, long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(short, long, default_value = "1080")]
+        port: u16,
+        #[arg(short, long, default_value = "warp.conf")]
+        config: String,
+        /// Username for SOCKS5 authentication (optional)
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Password for SOCKS5 authentication (required if username is set)
+        #[arg(short = 'w', long)]
+        password: Option<String>,
+        /// DNS servers to use (can be specified multiple times)
+        #[arg(short, long, default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()])]
+        dns: Vec<String>,
+        /// MTU
         #[arg(short = 'm', long, default_value = "1280")]
         mtu: u16,
     },
@@ -137,40 +177,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Register {
-            config,
-            model,
-            locale,
-            name,
-            jwt,
-            accept_tos,
-        } => {
-            register_device(
-                &config,
-                &model,
-                &locale,
-                name.as_deref(),
-                jwt.as_deref(),
+        Commands::Register { mode } => match mode {
+            RegisterMode::Masque {
+                config,
+                model,
+                locale,
+                name,
+                jwt,
                 accept_tos,
-            )
-            .await?;
-        }
-        Commands::RegisterWg {
-            config,
-            model,
-            locale,
-            jwt,
-            accept_tos,
-        } => {
-            register_wg_device(
-                &config,
-                &model,
-                &locale,
-                jwt.as_deref(),
+            } => {
+                register_device(
+                    &config,
+                    &model,
+                    &locale,
+                    name.as_deref(),
+                    jwt.as_deref(),
+                    accept_tos,
+                )
+                .await?;
+            }
+            RegisterMode::Wg {
+                config,
+                model,
+                locale,
+                jwt,
                 accept_tos,
-            )
-            .await?;
-        }
+            } => {
+                register_wg_device(
+                    &config,
+                    &model,
+                    &locale,
+                    jwt.as_deref(),
+                    accept_tos,
+                )
+                .await?;
+            }
+        },
         Commands::Enroll {
             config,
             name,
@@ -178,51 +220,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enroll_device(&config, name.as_deref(), regen_key).await?;
         }
-        Commands::Socks {
-            bind,
-            port,
-            config,
-            mode,
-            username,
-            password,
-            sni,
-            dns,
-            connect_port,
-            keepalive,
-            initial_packet_size,
-            mtu,
-        } => {
-            match mode.as_str() {
-                "wg" | "wireguard" => {
-                    let options = SocksServerWgOptions {
-                        bind,
-                        port,
-                        config_path: config,
-                        username,
-                        password,
-                        dns_servers: dns,
-                        mtu,
-                    };
-                    run_socks_server_wg(options).await?;
-                }
-                _ => {
-                    let options = SocksServerOptions {
-                        bind,
-                        port,
-                        config_path: config,
-                        username,
-                        password,
-                        sni,
-                        dns_servers: dns,
-                        connect_port,
-                        keepalive,
-                        initial_packet_size,
-                        mtu,
-                    };
-                    run_socks_server(options).await?;
-                }
+        Commands::Socks { mode } => match mode {
+            SocksMode::Masque {
+                bind,
+                port,
+                config,
+                username,
+                password,
+                dns,
+                mtu,
+                sni,
+                connect_port,
+                keepalive,
+                initial_packet_size,
+            } => {
+                let options = SocksServerOptions {
+                    bind,
+                    port,
+                    config_path: config,
+                    username,
+                    password,
+                    sni,
+                    dns_servers: dns,
+                    connect_port,
+                    keepalive,
+                    initial_packet_size,
+                    mtu,
+                };
+                run_socks_server(options).await?;
             }
-        }
+            SocksMode::Wg {
+                bind,
+                port,
+                config,
+                username,
+                password,
+                dns,
+                mtu,
+            } => {
+                let options = SocksServerWgOptions {
+                    bind,
+                    port,
+                    config_path: config,
+                    username,
+                    password,
+                    dns_servers: dns,
+                    mtu,
+                };
+                run_socks_server_wg(options).await?;
+            }
+        },
     }
 
     Ok(())
