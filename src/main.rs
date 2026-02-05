@@ -3,12 +3,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::Parser;
 use usque_rs::app::{enroll, register, socks};
-use usque_rs::cli::{Cli, Commands, RegisterMode, SocksMode};
+use usque_rs::cli::{Cli, Commands, LogLevel, RegisterMode, SocksMode};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
     let cli = Cli::parse();
+
+    init_logger(cli.log, cli.disable_color, cli.timestamp);
 
     match cli.command {
         Commands::Register { mode } => match mode {
@@ -101,4 +102,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn init_logger(level: LogLevel, disable_color: bool, full_timestamp: bool) {
+    use colored::control::set_override;
+    use colored::Colorize;
+    use env_logger::Builder;
+    use log::{Level, LevelFilter};
+    use std::io::Write;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START_TIME: OnceLock<Instant> = OnceLock::new();
+
+    let filter = match level {
+        LogLevel::Silent => LevelFilter::Off,
+        LogLevel::Error => LevelFilter::Error,
+        LogLevel::Warning => LevelFilter::Warn,
+        LogLevel::Info => LevelFilter::Info,
+        LogLevel::Debug => LevelFilter::Trace,
+    };
+
+    if filter == LevelFilter::Off {
+        Builder::new().filter_level(LevelFilter::Off).init();
+        return;
+    }
+
+    set_override(!disable_color);
+    START_TIME.get_or_init(Instant::now);
+
+    Builder::new()
+        .filter_level(filter)
+        .format(move |buf, record| {
+            let level = record.level();
+            let level_str = match level {
+                Level::Error => "ERROR".red().bold().to_string(),
+                Level::Warn => "WARN".yellow().bold().to_string(),
+                Level::Info => "INFO".cyan().bold().to_string(),
+                Level::Debug => "DEBUG".white().to_string(),
+                Level::Trace => "TRACE".white().dimmed().to_string(),
+            };
+
+            if full_timestamp {
+                let now = chrono::Local::now();
+                writeln!(
+                    buf,
+                    "{} {} {}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f %z"),
+                    level_str,
+                    record.args()
+                )
+            } else {
+                let elapsed = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                writeln!(buf, "{}[{:04}] {}", level_str, elapsed, record.args())
+            }
+        })
+        .init();
 }

@@ -20,24 +20,25 @@ pub(crate) async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
     proto: Socks5ServerProtocol<T, fast_socks5::server::states::CommandRead>,
     manager: Arc<TunnelManager>,
     target: &TargetAddr,
+    _client_addr: SocketAddr,
 ) -> Result<(), Socks5Error> {
     // Resolve addresses and get port
     let (addresses, remote_port) = match target {
         TargetAddr::Ip(addr) => (vec![super::std_ip_to_smoltcp(addr.ip())], addr.port()),
         TargetAddr::Domain(domain, port) => {
-            log::debug!("Resolving all addresses for {} through tunnel", domain);
+            log::debug!("resolving {}", domain);
             let ips = manager.resolve_all(domain).await.map_err(|e| {
                 Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
             })?;
             let sorted = interleave_addresses(ips);
-            log::debug!("Resolved {} -> {} addresses (sorted)", domain, sorted.len());
+            log::debug!("resolved [{}]", sorted.iter().map(|ip| format!("{:?}", ip)).collect::<Vec<_>>().join(", "));
             (sorted, *port)
         }
     };
 
     if addresses.is_empty() {
         if let Err(e) = proto.reply_error(&ReplyError::HostUnreachable).await {
-            log::debug!("Failed to send error reply: {}", e);
+            log::trace!("failed to send error reply: {}", e);
         }
         return Err(Socks5Error::ProtocolError("No addresses resolved".into()));
     }
@@ -58,15 +59,13 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
     remote_ip: IpAddress,
     remote_port: u16,
 ) -> Result<(), Socks5Error> {
-    log::debug!("TCP CONNECT to {:?}:{}", remote_ip, remote_port);
-
     let local_port = get_local_port();
     let channels = match manager.connect(remote_ip, remote_port, local_port).await {
         Ok(channels) => channels,
         Err(err) => {
             let reply = map_manager_error_to_reply(&err);
             if let Err(rep_err) = proto.reply_error(&reply).await {
-                log::debug!("Failed to send connect error reply: {}", rep_err);
+                log::trace!("failed to send error reply: {}", rep_err);
             }
             return Err(Socks5Error::TunnelError(err));
         }
@@ -80,7 +79,7 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
             let err = Socks5Error::Timeout;
             let reply = map_connect_error_to_reply(&err);
             if let Err(rep_err) = proto.reply_error(&reply).await {
-                log::debug!("Failed to send connect error reply: {}", rep_err);
+                log::trace!("failed to send error reply: {}", rep_err);
             }
             manager.close(handle).await;
             return Err(err);
@@ -95,15 +94,17 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
         };
         let reply = map_connect_error_to_reply(&err);
         if let Err(rep_err) = proto.reply_error(&reply).await {
-            log::debug!("Failed to send connect error reply: {}", rep_err);
+            log::trace!("failed to send error reply: {}", rep_err);
         }
         manager.close(handle).await;
         return Err(err);
     }
 
+    log::info!("outbound connection to {:?}:{}", remote_ip, remote_port);
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut stream = proto.reply_success(reply_addr).await?;
     let result = forward_tcp_data(&mut stream, channels).await;
+    log::debug!("connection closed");
     manager.close(handle).await;
     result
 }
@@ -118,11 +119,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Socks5Error> {
     use tokio::time::timeout;
 
-    log::debug!(
-        "TCP CONNECT racing to {} addresses on port {}",
-        addresses.len(),
-        remote_port
-    );
+    log::debug!("racing {} addresses", addresses.len());
 
     let mut addr_iter = addresses.into_iter().peekable();
     let mut pending: Vec<(SocketHandle, SocketChannels)> = Vec::new();
@@ -132,11 +129,11 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
     if let Some(ip) = addr_iter.next() {
         match start_connection(&manager, ip, remote_port).await {
             Ok(channels) => {
-                log::debug!("Started connection attempt to {:?}", ip);
+                log::debug!("started connection to {:?}", ip);
                 pending.push((channels.handle, channels));
             }
             Err(e) => {
-                log::debug!("Failed to start connection to {:?}: {}", ip, e);
+                log::debug!("connection failed to {:?}: {}", ip, e);
                 last_error = Some(e);
             }
         }
@@ -157,17 +154,18 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
 
     match result {
         Ok(Ok((winner_handle, winner_channels))) => {
-            log::debug!("Connection established to handle {:?}", winner_handle);
+            log::info!("outbound connection established (racing)");
             let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
             let mut stream = proto.reply_success(reply_addr).await?;
             let result = forward_tcp_data(&mut stream, winner_channels).await;
+            log::debug!("connection closed");
             manager.close(winner_handle).await;
             result
         }
         Ok(Err(e)) => {
             let reply = map_connect_error_to_reply(&e);
             if let Err(rep_err) = proto.reply_error(&reply).await {
-                log::debug!("Failed to send error reply: {}", rep_err);
+                log::trace!("failed to send error reply: {}", rep_err);
             }
             Err(e)
         }
@@ -177,7 +175,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
                 manager.close(handle).await;
             }
             if let Err(e) = proto.reply_error(&ReplyError::ConnectionTimeout).await {
-                log::debug!("Failed to send timeout reply: {}", e);
+                log::trace!("failed to send error reply: {}", e);
             }
             Err(Socks5Error::Timeout)
         }
@@ -206,7 +204,7 @@ async fn race_connections_event_driven(
         tokio::spawn(async move {
             let state = manager.wait_socket_ready(handle).await;
             if tx.send((handle, state)).await.is_err() {
-                log::trace!("Failed to send connection ready notification: receiver dropped");
+                log::trace!("connection ready notification dropped");
             }
         });
     }
@@ -264,7 +262,7 @@ async fn race_connections_event_driven(
             // Start next connection after delay (RFC 8305: 250ms)
             _ = &mut next_attempt, if has_more_addresses => {
                 if let Some(ip) = addr_iter.next() {
-                    log::debug!("Starting next connection attempt to {:?}", ip);
+                    log::debug!("started connection to {:?}", ip);
                     match start_connection(manager, ip, remote_port).await {
                         Ok(channels) => {
                             let handle = channels.handle;
@@ -275,12 +273,12 @@ async fn race_connections_event_driven(
                             tokio::spawn(async move {
                                 let state = manager.wait_socket_ready(handle).await;
                                 if tx.send((handle, state)).await.is_err() {
-                                    log::trace!("Failed to send connection ready notification: receiver dropped");
+                                    log::trace!("connection ready notification dropped");
                                 }
                             });
                         }
                         Err(e) => {
-                            log::debug!("Failed to start connection to {:?}: {}", ip, e);
+                            log::debug!("connection failed to {:?}: {}", ip, e);
                             *last_error = Some(e);
                         }
                     }
@@ -317,12 +315,10 @@ pub(crate) async fn handle_tcp_bind<T: AsyncRead + AsyncWrite + Unpin>(
     local_addr: SocketAddr,
     _target: (IpAddress, u16),
 ) -> Result<(), Socks5Error> {
-    log::debug!("TCP BIND requested");
-
     // Bind a local TCP listener
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let bind_addr = listener.local_addr()?;
-    log::debug!("TCP BIND: listening on {}", bind_addr);
+    log::debug!("TCP BIND listening on {}", bind_addr);
 
     // First reply: tell client the bind address
     let reply_addr = SocketAddr::new(local_addr.ip(), bind_addr.port());
@@ -334,16 +330,16 @@ pub(crate) async fn handle_tcp_bind<T: AsyncRead + AsyncWrite + Unpin>(
     let (incoming_stream, peer_addr) = match accept_result {
         Ok(Ok((stream, addr))) => (stream, addr),
         Ok(Err(e)) => {
-            log::error!("TCP BIND: accept error: {}", e);
+            log::warn!("TCP BIND accept error: {}", e);
             return Err(Socks5Error::IoError(e));
         }
         Err(_) => {
-            log::debug!("TCP BIND: timeout waiting for connection");
+            log::debug!("TCP BIND timeout");
             return Err(Socks5Error::Timeout);
         }
     };
 
-    log::debug!("TCP BIND: accepted connection from {}", peer_addr);
+    log::info!("TCP BIND accepted from {}", peer_addr);
 
     // Second reply: tell client the peer address (using same format as first reply)
     // Note: In standard SOCKS5, we should send a second reply here, but fast-socks5
@@ -440,19 +436,19 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                     match result {
                         Some(data) => {
                             if let Err(e) = writer.write_all(&data).await {
-                                log::debug!("Error writing to client: {}", e);
+                                log::trace!("write to client failed: {}", e);
                                 return false;
                             }
                             true
                         }
                         None => {
-                            log::trace!("Tunnel channel closed");
+                            log::trace!("tunnel channel closed");
                             // Flush before signaling EOF to client
                             if let Err(e) = writer.flush().await {
-                                log::debug!("Error flushing to client: {}", e);
+                                log::trace!("flush to client failed: {}", e);
                             }
                             if let Err(e) = writer.shutdown().await {
-                                log::debug!("Error shutting down writer: {}", e);
+                                log::trace!("shutdown writer failed: {}", e);
                             }
                             tunnel_eof = true;
                             true
@@ -463,7 +459,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                 result = reader.read_buf(&mut client_buf), if !client_eof => {
                     match result {
                         Ok(0) => {
-                            log::debug!("Client closed connection");
+                            log::trace!("client closed connection");
                             // Drop the sender to signal EOF to tunnel side
                             drop(channels.to_stack.clone());
                             client_eof = true;
@@ -472,13 +468,13 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                         Ok(n) => {
                             let data = client_buf.split_to(n).freeze();
                             if channels.to_stack.send(data).await.is_err() {
-                                log::trace!("Tunnel channel closed");
+                                log::trace!("tunnel channel closed");
                                 tunnel_eof = true;
                             }
                             true
                         }
                         Err(e) => {
-                            log::debug!("Error reading from client: {}", e);
+                            log::trace!("read from client failed: {}", e);
                             false
                         }
                     }
@@ -491,7 +487,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
             Ok(true) => continue,
             Ok(false) => break,
             Err(_) => {
-                log::debug!("Connection idle timeout ({} secs)", IDLE_TIMEOUT.as_secs());
+                log::trace!("connection idle timeout");
                 break;
             }
         }

@@ -1,4 +1,4 @@
-use super::{AuthConfig, Socks5Error};
+use super::{format_target_addr, AuthConfig, Socks5Error};
 use super::{max_concurrent_connections, resolve, tcp, udp};
 use crate::net::tunnel::manager::TunnelManagerPool;
 use fast_socks5::server::Socks5ServerProtocol;
@@ -38,26 +38,23 @@ impl Socks5Server {
 
     pub async fn run(&self) -> Result<(), Socks5Error> {
         let listener = TcpListener::bind(self.bind_addr).await?;
-        log::info!("SOCKS5 server listening on {}", self.bind_addr);
+        log::info!("started SOCKS5 server on {}", self.bind_addr);
         if self.auth.is_some() {
             log::info!("SOCKS5 authentication enabled");
         }
+        log::info!("max concurrent connections: {}", max_concurrent_connections());
 
         let max_conns = max_concurrent_connections();
         let semaphore = Arc::new(Semaphore::new(max_conns));
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            log::debug!("New connection from {}", addr);
+            log::info!("inbound connection from {}", addr);
 
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    log::warn!(
-                        "Connection limit reached ({}), dropping {}",
-                        max_conns,
-                        addr
-                    );
+                    log::warn!("connection limit reached, rejected {}", addr);
                     continue;
                 }
             };
@@ -67,8 +64,8 @@ impl Socks5Server {
             let auth = self.auth.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = handle_client(stream, manager_pool, local_addr, auth).await {
-                    log::error!("Error handling client {}: {}", addr, e);
+                if let Err(e) = handle_client(stream, manager_pool, local_addr, auth, addr).await {
+                    log::debug!("connection closed: {}", e);
                 }
             });
         }
@@ -80,6 +77,7 @@ async fn handle_client(
     manager_pool: Arc<TunnelManagerPool>,
     local_addr: SocketAddr,
     auth: Option<AuthConfig>,
+    client_addr: SocketAddr,
 ) -> Result<(), Socks5Error> {
     let manager = manager_pool.pick();
     // Use fast-socks5 for protocol handling with optional authentication
@@ -98,11 +96,18 @@ async fn handle_client(
     .await?;
 
     match cmd {
-        Socks5Command::TCPConnect => tcp::handle_tcp_connect(proto, manager, &target_addr).await,
+        Socks5Command::TCPConnect => {
+            log::info!("inbound connection to {}", format_target_addr(&target_addr));
+            tcp::handle_tcp_connect(proto, manager, &target_addr, client_addr).await
+        }
         Socks5Command::TCPBind => {
+            log::info!("inbound BIND to {}", format_target_addr(&target_addr));
             let resolved_addr = resolve::resolve_target_addr(&manager, &target_addr).await?;
             tcp::handle_tcp_bind(proto, manager, local_addr, resolved_addr).await
         }
-        Socks5Command::UDPAssociate => udp::handle_udp_associate(proto, manager, local_addr).await,
+        Socks5Command::UDPAssociate => {
+            log::info!("inbound UDP ASSOCIATE from {}", client_addr);
+            udp::handle_udp_associate(proto, manager, local_addr).await
+        }
     }
 }

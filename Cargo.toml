@@ -9,6 +9,7 @@ boring = "4"
 bytes = "1.11.0"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive"] }
+colored = "3"
 der = "0.7.10"
 env_logger = "0.11.8"
 fast-socks5 = "1.0.0"

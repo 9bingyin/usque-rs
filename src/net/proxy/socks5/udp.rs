@@ -21,7 +21,7 @@ pub(crate) async fn handle_udp_associate<T: AsyncRead + AsyncWrite + Unpin + Sen
     // Bind UDP socket for client
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let udp_addr = udp_socket.local_addr()?;
-    log::debug!("UDP ASSOCIATE: relay socket bound to {}", udp_addr);
+    log::debug!("UDP relay bound to {}", udp_addr);
 
     // Register UDP session with manager
     let local_port = get_local_port();
@@ -85,7 +85,7 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
             result = tcp_stream.read(&mut tcp_buf) => {
                 match result {
                     Ok(0) | Err(_) => {
-                        log::debug!("UDP ASSOCIATE: TCP control connection closed");
+                        log::debug!("UDP session closed");
                         break;
                     }
                     Ok(_) => {}

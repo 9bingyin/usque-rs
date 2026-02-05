@@ -233,3 +233,24 @@ fn map_connect_error_to_reply(err: &Socks5Error) -> fast_socks5::ReplyError {
         _ => fast_socks5::ReplyError::GeneralFailure,
     }
 }
+
+/// Format TargetAddr for logging, converting IPv4-mapped IPv6 to IPv4
+fn format_target_addr(target: &fast_socks5::util::target_addr::TargetAddr) -> String {
+    use fast_socks5::util::target_addr::TargetAddr;
+    match target {
+        TargetAddr::Ip(addr) => {
+            let ip = match addr.ip() {
+                IpAddr::V6(v6) => {
+                    if let Some(v4) = v6.to_ipv4_mapped() {
+                        IpAddr::V4(v4)
+                    } else {
+                        IpAddr::V6(v6)
+                    }
+                }
+                ip => ip,
+            };
+            format!("{}:{}", ip, addr.port())
+        }
+        TargetAddr::Domain(domain, port) => format!("{}:{}", domain, port),
+    }
+}

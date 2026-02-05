@@ -188,11 +188,11 @@ impl QuicConnection {
                     total_sent += write;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    log::debug!("UDP send WouldBlock, dropping packet");
+                    log::trace!("UDP send WouldBlock, dropped packet");
                     continue;
                 }
                 Err(e) if is_enobufs(&e) => {
-                    log::debug!("UDP send ENOBUFS, dropping packet");
+                    log::trace!("UDP send ENOBUFS, dropped packet");
                     continue;
                 }
                 Err(e) => return Err(QuicError::IoError(e)),
@@ -276,7 +276,7 @@ pub async fn connect(
         }
     }
 
-    log::info!("QUIC connection established to {}", endpoint);
+    log::debug!("QUIC connection established to {}", endpoint);
     Ok(quic_conn)
 }
 
@@ -296,9 +296,9 @@ pub async fn connect_with_pinning(
             if !verify_peer_public_key(peer_cert, expected_key) {
                 return Err(QuicError::PublicKeyMismatch);
             }
-            log::info!("Server public key verified");
+            log::debug!("server public key verified");
         } else {
-            log::warn!("No peer certificate available for verification");
+            log::warn!("no peer certificate for verification");
         }
     }
 
@@ -312,7 +312,7 @@ fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool
     let cert = match Certificate::from_der(cert_der) {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("Failed to parse certificate: {}", e);
+            log::warn!("failed to parse certificate: {}", e);
             return false;
         }
     };
@@ -322,7 +322,7 @@ fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool
     let cert_spki_der = match pub_key_info.to_der() {
         Ok(der) => der,
         Err(e) => {
-            log::warn!("Failed to encode SPKI: {}", e);
+            log::warn!("failed to encode SPKI: {}", e);
             return false;
         }
     };

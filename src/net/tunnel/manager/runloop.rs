@@ -25,7 +25,7 @@ impl TunnelManager {
                 TunnelMode::Masque => "MASQUE",
                 TunnelMode::Wireguard => "WireGuard",
             };
-            log::info!("Establishing {} connection to {}", mode_name, params.endpoint);
+            log::info!("connecting {} to {}", mode_name, params.endpoint);
 
             let (conn_tx, mut conn_rx) = oneshot::channel();
             let params_clone = params.clone();
@@ -39,7 +39,7 @@ impl TunnelManager {
                         .map(|(t, s)| TunnelConn::Wg(Box::new(t), s)),
                 };
                 if conn_tx.send(res).is_err() {
-                    log::debug!("Connection result dropped: receiver closed");
+                    log::trace!("connection result dropped");
                 }
             });
 
@@ -48,7 +48,7 @@ impl TunnelManager {
                     res = &mut conn_rx => {
                         match res {
                             Ok(Ok(conn)) => {
-                                log::info!("Tunnel connected successfully");
+                                log::info!("tunnel established");
                                 backoff.reset();
                                 match conn {
                                     TunnelConn::Masque(tunnel, stack) => {
@@ -72,13 +72,13 @@ impl TunnelManager {
                                         .await;
                                     }
                                 }
-                                log::warn!("Connection lost, reconnecting...");
+                                log::warn!("tunnel disconnected, reconnecting");
                             }
                             Ok(Err(e)) => {
-                                log::error!("Failed to connect: {}", e);
+                                log::error!("connection failed: {}", e);
                             }
                             Err(_) => {
-                                log::error!("Connection task cancelled");
+                                log::error!("connection task cancelled");
                             }
                         }
                         break;
@@ -98,7 +98,7 @@ impl TunnelManager {
             }
 
             let delay = backoff.next_delay();
-            log::info!("Reconnecting in {:?}", delay);
+            log::info!("reconnecting in {:?}", delay);
             let sleep = tokio::time::sleep(delay);
             tokio::pin!(sleep);
             loop {
@@ -160,12 +160,7 @@ impl TunnelManager {
             dynamic_mtu.min(configured_mtu)
         };
 
-        log::info!(
-            "Using MTU {} (QUIC limit {}, configured {})",
-            mtu,
-            dynamic_mtu,
-            configured_mtu
-        );
+        log::info!("MTU {} (QUIC {}, configured {})", mtu, dynamic_mtu, configured_mtu);
 
         let ipv4 = if params.ipv4.trim().is_empty() {
             None
@@ -214,6 +209,7 @@ impl TunnelManager {
             params.mtu as usize
         };
         log::info!("WireGuard tunnel established, MTU {}", mtu);
+        log::info!("client IPv4: {}, IPv6: {:?}", params.ipv4, params.ipv6);
 
         let ipv4 = if params.ipv4.trim().is_empty() {
             None
@@ -251,7 +247,7 @@ impl TunnelManager {
 
     pub async fn close(&self, handle: SocketHandle) {
         if let Err(e) = self.cmd_tx.send(ManagerCommand::Close { handle }).await {
-            log::debug!("Failed to send close command: {}", e);
+            log::trace!("failed to send close command: {}", e);
         }
     }
 
@@ -389,7 +385,7 @@ impl TunnelManager {
                                 }
                                 buf.truncate(len);
                                 if incoming_tx.send(IncomingDatagram { data: buf, from }).await.is_err() {
-                                    log::trace!("Incoming datagram channel closed");
+                                    log::trace!("incoming datagram channel closed");
                                     break;
                                 }
                             }
@@ -417,7 +413,7 @@ impl TunnelManager {
         loop {
             // Check connection status at the start of each iteration
             if tunnel.quic_conn.is_closed() {
-                log::error!("QUIC connection closed");
+                log::error!("QUIC connection closed unexpectedly");
                 break;
             }
 
@@ -545,15 +541,15 @@ impl TunnelManager {
 
         // Phase 1: broadcast shutdown to all tasks
         if shutdown_tx.send(()).is_err() {
-            log::trace!("Failed to send shutdown signal: no receivers");
+            log::trace!("shutdown signal dropped");
         }
         // Phase 2: drop our guard and wait for all tasks to finish
         drop(completion_tx);
         let _ = completion_rx.recv().await; // returns None when all senders dropped
         if let Err(e) = recv_handle.await {
-            log::debug!("Recv task join error: {:?}", e);
+            log::trace!("recv task join error: {:?}", e);
         }
-        log::info!("TunnelManager run_loop ended");
+        log::debug!("MASQUE run_loop ended");
     }
 
     async fn run_loop_wg(
@@ -597,7 +593,7 @@ impl TunnelManager {
                                 }
                                 buf.truncate(len);
                                 if incoming_tx.send(IncomingDatagram { data: buf, from: peer_addr }).await.is_err() {
-                                    log::trace!("Incoming datagram channel closed");
+                                    log::trace!("incoming datagram channel closed");
                                     break;
                                 }
                             }
@@ -625,7 +621,7 @@ impl TunnelManager {
 
         loop {
             if tunnel.is_expired() {
-                log::error!("WireGuard tunnel expired");
+                log::error!("WireGuard tunnel session expired");
                 break;
             }
 
@@ -663,7 +659,7 @@ impl TunnelManager {
 
                 _ = &mut wg_timer => {
                     if let Err(e) = tunnel.tick_timers().await {
-                        log::warn!("WG timer error: {}", e);
+                        log::warn!("WireGuard timer error: {}", e);
                     }
                     wg_timer.as_mut().reset(TokioInstant::now() + WG_TIMER_INTERVAL);
                 }
@@ -735,14 +731,14 @@ impl TunnelManager {
         }
 
         if shutdown_tx.send(()).is_err() {
-            log::trace!("Failed to send shutdown signal: no receivers");
+            log::trace!("shutdown signal dropped");
         }
         drop(completion_tx);
         let _ = completion_rx.recv().await;
         if let Err(e) = recv_handle.await {
-            log::debug!("Recv task join error: {:?}", e);
+            log::trace!("recv task join error: {:?}", e);
         }
-        log::info!("TunnelManager WG run_loop ended");
+        log::debug!("WireGuard run_loop ended");
     }
 
     fn handle_command(
@@ -781,9 +777,9 @@ impl TunnelManager {
             } => {
                 // Check cache first
                 if let Some(ip) = dns_cache_get(&state.dns_cache, &domain, prefer_ipv6) {
-                    log::debug!("DNS cache hit: {} -> {:?}", domain, ip);
+                    log::debug!("DNS cached: {} -> {:?}", domain, ip);
                     if response.send(Ok(ip)).is_err() {
-                        log::trace!("Failed to send cached DNS response: receiver dropped");
+                        log::trace!("DNS response dropped: receiver closed");
                     }
                 } else {
                     Self::start_dns_query(state, &domain, prefer_ipv6, response, dns_servers);
@@ -792,9 +788,9 @@ impl TunnelManager {
             ManagerCommand::DnsResolveAll { domain, response } => {
                 // Check cache first for all addresses
                 if let Some(ips) = dns_cache_get_all(&state.dns_cache, &domain) {
-                    log::debug!("DNS cache hit (all): {} -> {} addresses", domain, ips.len());
+                    log::debug!("DNS cached: {} -> {} addresses", domain, ips.len());
                     if response.send(Ok(ips)).is_err() {
-                        log::trace!("Failed to send cached DNS response: receiver dropped");
+                        log::trace!("DNS response dropped: receiver closed");
                     }
                 } else {
                     Self::start_dns_query_all(state, &domain, response, dns_servers);
@@ -1055,9 +1051,9 @@ impl TunnelManager {
         );
         udp_ports.push(local_port);
 
-        log::debug!("UDP session registered on port {}", local_port);
+        log::info!("UDP session registered on port {}", local_port);
         if response.send(Ok(rx)).is_err() {
-            log::trace!("Failed to send UDP register response: receiver dropped");
+            log::trace!("UDP register response dropped: receiver closed");
         }
     }
 
@@ -1087,7 +1083,7 @@ impl TunnelManager {
     ) {
         if let Some(session) = udp_sessions.remove(&local_port) {
             stack.remove_socket(session.handle);
-            log::debug!("UDP session unregistered on port {}", local_port);
+            log::info!("UDP session closed on port {}", local_port);
         }
         udp_ports.retain(|p| *p != local_port);
     }
@@ -1191,7 +1187,7 @@ impl TunnelManager {
                             query_type: DnsRecordType::A,
                         },
                     );
-                    log::debug!("DNS A query sent: {} (id={})", domain, tx_id_a);
+                    log::debug!("DNS query: {} A", domain);
                 } else {
                     Self::record_dns_error(
                         &mut state.dns_groups,
@@ -1233,7 +1229,7 @@ impl TunnelManager {
                             query_type: DnsRecordType::AAAA,
                         },
                     );
-                    log::debug!("DNS AAAA query sent: {} (id={})", domain, tx_id_aaaa);
+                    log::debug!("DNS query: {} AAAA", domain);
                 } else {
                     Self::record_dns_error(
                         &mut state.dns_groups,
@@ -1326,7 +1322,7 @@ impl TunnelManager {
                             query_type: DnsRecordType::A,
                         },
                     );
-                    log::debug!("DNS A query sent (all): {} (id={})", domain, tx_id_a);
+                    log::debug!("DNS query: {} A (all)", domain);
                 } else {
                     Self::record_dns_error(
                         &mut state.dns_groups,
@@ -1368,7 +1364,7 @@ impl TunnelManager {
                             query_type: DnsRecordType::AAAA,
                         },
                     );
-                    log::debug!("DNS AAAA query sent (all): {} (id={})", domain, tx_id_aaaa);
+                    log::debug!("DNS query: {} AAAA (all)", domain);
                 } else {
                     Self::record_dns_error(
                         &mut state.dns_groups,
@@ -1500,11 +1496,11 @@ impl TunnelManager {
             let result = match group.prefer_ipv6 {
                 true => match (&group.ipv6_result, &group.ipv4_result) {
                     (Some(Ok(v6_records)), _) if !v6_records.is_empty() => {
-                        log::debug!("DNS resolved (IPv6): {:?}", v6_records[0].address);
+                        log::info!("DNS resolved: {} -> {:?}", group.domain, v6_records[0].address);
                         Some(Ok(v6_records[0].address))
                     }
                     (_, Some(Ok(v4_records))) if !v4_records.is_empty() => {
-                        log::debug!("DNS resolved (IPv4): {:?}", v4_records[0].address);
+                        log::info!("DNS resolved: {} -> {:?}", group.domain, v4_records[0].address);
                         Some(Ok(v4_records[0].address))
                     }
                     (Some(_), Some(_)) => {
@@ -1513,18 +1509,18 @@ impl TunnelManager {
                             (_, Some(Err(e4))) if !matches!(e4, DnsError::NoRecords) => e4.clone(),
                             _ => DnsError::NoRecords,
                         };
-                        log::debug!("DNS resolution failed: {:?}", err);
+                        log::warn!("DNS resolution failed: {} -> {:?}", group.domain, err);
                         Some(Err(err))
                     }
                     _ => None,
                 },
                 false => match (&group.ipv4_result, &group.ipv6_result) {
                     (Some(Ok(v4_records)), _) if !v4_records.is_empty() => {
-                        log::debug!("DNS resolved (IPv4): {:?}", v4_records[0].address);
+                        log::info!("DNS resolved: {} -> {:?}", group.domain, v4_records[0].address);
                         Some(Ok(v4_records[0].address))
                     }
                     (_, Some(Ok(v6_records))) if !v6_records.is_empty() => {
-                        log::debug!("DNS resolved (IPv6): {:?}", v6_records[0].address);
+                        log::info!("DNS resolved: {} -> {:?}", group.domain, v6_records[0].address);
                         Some(Ok(v6_records[0].address))
                     }
                     (Some(_), Some(_)) => {
@@ -1533,7 +1529,7 @@ impl TunnelManager {
                             (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
                             _ => DnsError::NoRecords,
                         };
-                        log::debug!("DNS resolution failed: {:?}", err);
+                        log::warn!("DNS resolution failed: {} -> {:?}", group.domain, err);
                         Some(Err(err))
                     }
                     _ => None,
@@ -1564,11 +1560,7 @@ impl TunnelManager {
             if !all_records.is_empty() {
                 let domain = group.domain.clone();
                 dns_cache_insert(dns_cache, domain.clone(), &all_records);
-                log::debug!(
-                    "DNS cache updated: {} ({} records)",
-                    domain,
-                    all_records.len()
-                );
+                log::debug!("DNS cache updated: {} ({} records)", domain, all_records.len());
             }
 
             // Handle response_all: return all addresses when both queries complete
@@ -1580,14 +1572,18 @@ impl TunnelManager {
                         (_, Some(Err(e6))) if !matches!(e6, DnsError::NoRecords) => e6.clone(),
                         _ => DnsError::NoRecords,
                     };
-                    log::debug!("DNS resolution (all) failed: {:?}", err);
+                    log::warn!("DNS resolution failed: {} -> {:?}", group.domain, err);
                     if response_all.send(Err(ManagerError::Dns(err))).is_err() {
-                        log::trace!("Failed to send DNS response (all): receiver dropped");
+                        log::trace!("DNS response dropped: receiver closed");
                     }
                 } else {
-                    log::debug!("DNS resolved (all): {} addresses", all_ips.len());
+                    log::info!(
+                        "DNS resolved: {} -> [{}]",
+                        group.domain,
+                        all_ips.iter().map(|ip| format!("{:?}", ip)).collect::<Vec<_>>().join(", ")
+                    );
                     if response_all.send(Ok(all_ips)).is_err() {
-                        log::trace!("Failed to send DNS response (all): receiver dropped");
+                        log::trace!("DNS response dropped: receiver closed");
                     }
                 }
             }
@@ -1613,7 +1609,7 @@ impl TunnelManager {
         };
 
         if let Err(e) = tunnel.quic_conn.conn.recv(data, recv_info) {
-            log::warn!("QUIC recv error: {:?}", e);
+            log::warn!("QUIC recv failed: {:?}", e);
             return;
         }
 
@@ -1637,7 +1633,7 @@ impl TunnelManager {
     /// stack poll, socket notifications, DNS/UDP processing, TCP I/O, cleanup.
     fn poll_stack_common(state: &mut RuntimeState) -> bool {
         if let Err(e) = state.stack.poll() {
-            log::error!("smoltcp poll failed, restarting tunnel: {}", e);
+            log::error!("network stack poll failed: {}", e);
             return false;
         }
         state.perf.inc_poll();
@@ -1701,7 +1697,7 @@ impl TunnelManager {
         for port in &stale_ports {
             if let Some(session) = state.udp_sessions.remove(port) {
                 state.stack.remove_socket(session.handle);
-                log::debug!("Cleaned up stale UDP session on port {}", port);
+                log::info!("UDP session expired on port {}", port);
             }
         }
         if !stale_ports.is_empty() {
@@ -1797,9 +1793,9 @@ impl TunnelManager {
         // Send keepalive PING if interval elapsed
         if last_keepalive.elapsed() >= keepalive_interval {
             if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
-                log::warn!("Failed to send keepalive PING: {:?}", e);
+                log::warn!("keepalive PING failed: {:?}", e);
             } else {
-                log::debug!("Sent keepalive PING frame");
+                log::trace!("sent keepalive PING");
             }
             *last_keepalive = Instant::now();
         }
@@ -1814,19 +1810,19 @@ impl TunnelManager {
             state.stack.recycle_tx_buffer(packet);
             match send_result {
                 Ok(Some(icmp)) => {
-                    log::debug!("Injecting ICMP Packet Too Big ({} bytes)", icmp.len());
+                    log::debug!("injecting ICMP Packet Too Big ({} bytes)", icmp.len());
                     state.stack
                         .inject_packet_owned(BytesMut::from(Bytes::from(icmp)));
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    log::warn!("Failed to send datagram: {:?}", e);
+                    log::debug!("datagram send failed: {:?}", e);
                 }
             }
         }
 
         if let Err(e) = tunnel.quic_conn.send_async().await {
-            log::warn!("Failed to send QUIC data: {:?}", e);
+            log::debug!("QUIC send failed: {:?}", e);
         }
         true
     }
@@ -1848,7 +1844,7 @@ impl TunnelManager {
     /// Common flush logic: poll stack + TCP read handling.
     fn flush_stack_reads(state: &mut RuntimeState) -> bool {
         if let Err(e) = state.stack.poll() {
-            log::error!("smoltcp poll failed, restarting tunnel: {}", e);
+            log::error!("network stack poll failed: {}", e);
             return false;
         }
         state.perf.inc_poll();

@@ -207,18 +207,17 @@ impl MasqueTunnel {
     }
 
     pub async fn establish(&mut self, timeout: Duration) -> Result<(), MasqueError> {
-        log::debug!("Initializing HTTP/3 connection");
+        log::debug!("H3 init");
         self.init_h3()?;
 
         // Step 1: Send our SETTINGS frame
-        let sent = self.quic_conn.send_async().await?;
-        log::debug!("SETTINGS frame sent ({} bytes)", sent);
+        self.quic_conn.send_async().await?;
+        log::debug!("H3 SETTINGS sent");
 
         let start = std::time::Instant::now();
         let mut buf = [0u8; 65535];
 
         // Step 2: Wait for peer's SETTINGS frame before sending CONNECT request
-        log::debug!("Waiting for peer SETTINGS...");
         while !self.peer_settings_received() {
             if start.elapsed() > timeout {
                 return Err(MasqueError::Timeout);
@@ -245,12 +244,11 @@ impl MasqueTunnel {
                 return Err(MasqueError::ConnectionError("connection closed".into()));
             }
         }
-        log::debug!("Peer SETTINGS received");
+        log::debug!("H3 SETTINGS received");
 
         // Step 3: Send Connect-IP request
-        log::debug!("Sending Connect-IP request");
         let stream_id = self.send_connect_ip_request()?;
-        log::debug!("Connect-IP request sent on stream {}", stream_id);
+        log::debug!("Connect-IP request sent (stream={})", stream_id);
 
         self.quic_conn.send_async().await?;
 
@@ -302,7 +300,7 @@ impl MasqueTunnel {
                 match self.quic_conn.conn.recv(&mut buf[..len], recv_info) {
                     Ok(_) => {}
                     Err(e) => {
-                        log::error!("QUIC recv error: {:?}", e);
+                        log::error!("QUIC recv failed: {:?}", e);
                         return Err(MasqueError::QuicError(QuicError::Quiche(e)));
                     }
                 }
@@ -330,19 +328,18 @@ impl MasqueTunnel {
         loop {
             match h3_conn.poll(&mut self.quic_conn.conn) {
                 Ok((stream_id, event)) => {
-                    log::debug!("H3 event on stream {}: {:?}", stream_id, event);
+                    log::trace!("H3 event: stream={} {:?}", stream_id, event);
                     match event {
                         quiche::h3::Event::Headers { list, .. } => {
-                            log::debug!("H3 headers on stream {}: {:?}", stream_id, list);
+                            log::trace!("H3 headers: stream={} {:?}", stream_id, list);
                             if Some(stream_id) == self.connect_stream_id {
                                 for header in &list {
                                     if header.name() == b":status" {
                                         let status = std::str::from_utf8(header.value())
                                             .unwrap_or("unknown");
-                                        log::info!("Connect-IP response status: {}", status);
+                                        log::debug!("Connect-IP response: status={}", status);
                                         if status == "200" {
                                             self.established = true;
-                                            log::info!("Connect-IP request accepted");
                                         } else {
                                             return Err(MasqueError::ConnectIpFailed(format!(
                                                 "status: {}",
@@ -354,7 +351,7 @@ impl MasqueTunnel {
                             }
                         }
                         quiche::h3::Event::Data => {
-                            log::debug!("H3 data on stream {}", stream_id);
+                            log::trace!("H3 data: stream={}", stream_id);
                         }
                         quiche::h3::Event::Finished => {}
                         quiche::h3::Event::Reset(_) => {}
@@ -483,7 +480,7 @@ fn process_outgoing_ip_packet(packet: &mut [u8]) -> Result<bool, MasqueError> {
             // Check TTL (byte 8)
             let ttl = packet[8];
             if ttl <= 1 {
-                log::debug!("Dropping packet: TTL too small ({})", ttl);
+                log::trace!("dropped packet: TTL={}", ttl);
                 return Ok(false);
             }
             // Decrement TTL
@@ -501,7 +498,7 @@ fn process_outgoing_ip_packet(packet: &mut [u8]) -> Result<bool, MasqueError> {
             // Check Hop Limit (byte 7)
             let hop_limit = packet[7];
             if hop_limit <= 1 {
-                log::debug!("Dropping packet: Hop Limit too small ({})", hop_limit);
+                log::trace!("dropped packet: Hop Limit={}", hop_limit);
                 return Ok(false);
             }
             // Decrement Hop Limit
@@ -509,7 +506,7 @@ fn process_outgoing_ip_packet(packet: &mut [u8]) -> Result<bool, MasqueError> {
             Ok(true)
         }
         _ => {
-            log::debug!("Unknown IP version: {}", version);
+            log::trace!("unknown IP version: {}", version);
             Ok(false)
         }
     }

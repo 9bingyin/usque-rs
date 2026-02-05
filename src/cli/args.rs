@@ -1,9 +1,36 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum LogLevel {
+    /// No output
+    Silent,
+    /// Only fatal errors
+    Error,
+    /// Recoverable errors + error level
+    Warning,
+    /// Normal operation info + warning + error
+    #[default]
+    Info,
+    /// All available information
+    Debug,
+}
 
 #[derive(Parser)]
 #[command(name = "usque-rs")]
 #[command(about = "Cloudflare WARP client (MASQUE / WireGuard)")]
 pub struct Cli {
+    /// Log level
+    #[arg(short, long, value_enum, default_value_t = LogLevel::Info, global = true)]
+    pub log: LogLevel,
+
+    /// Disable color output
+    #[arg(long = "disable-color", global = true)]
+    pub disable_color: bool,
+
+    /// Show full timestamp instead of elapsed seconds
+    #[arg(long, global = true)]
+    pub timestamp: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }

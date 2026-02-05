@@ -83,7 +83,7 @@ impl WgTunnel {
             .format_handshake_initiation(true)
             .ok_or(WgTunnelError::HandshakeInitFailed)?;
         self.send_wg_packet(init.into()).await?;
-        log::debug!("WireGuard handshake initiation sent");
+        log::debug!("WireGuard handshake initiated");
 
         let start = std::time::Instant::now();
         let mut buf = vec![0u8; 65535];
