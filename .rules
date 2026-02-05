@@ -66,6 +66,9 @@ SOCKS5 Client <-> SOCKS5 Server <-> smoltcp (TCP/IP) <-> WireGuard Tunnel <-> UD
 | `boring` / `ring` | TLS/加密原语 |
 | `boringtun` | WireGuard 协议实现 |
 | `x25519-dalek` | Curve25519 密钥操作 |
+| `colored` | 日志彩色输出 |
+| `chrono` | 时间戳格式化 |
+| `tikv-jemallocator` | jemalloc 内存分配器 |
 
 ---
 
@@ -144,9 +147,11 @@ src/
 | `TunnelManager` | 单个隧道管理器 |
 | `TunnelManagerPool` | 隧道池，支持多 worker |
 | `ManagerCommand` | 命令通道消息类型 |
-| `RuntimeState` | 运行时状态（协议栈、socket 映射、DNS 缓存等）|
+| `RuntimeState` | 运行时状态（协议栈、socket 映射、DNS 缓存、性能计数器等）|
 | `TunnelMode` | 隧道模式枚举（Masque/Wireguard）|
-| `ConnectionParams` | 连接参数（统一 MASQUE 和 WG 配置）|
+| `ConnectionParams` | 连接参数（统一 MASQUE 和 WG 配置，含性能监控开关）|
+| `PerfSnapshot` | 运行时性能快照（队列深度、丢包数、缓冲区占用等）|
+| `PerfCounters` | 性能计数器（吞吐量、循环次数，定时汇报）|
 
 **设计原则**：
 - 所有与隧道的交互通过 `ManagerCommand` 命令通道进行
@@ -191,7 +196,7 @@ src/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `idle_timeout` | 90000ms | QUIC 空闲超时 |
-| `congestion_control` | BBR2 | 拥塞控制算法 |
+| `congestion_control` | Cubic | 拥塞控制算法 |
 | `initial_packet_size` | 1242 | 初始包大小 |
 | `enable_dgram` | true | 启用 DATAGRAM 扩展 |
 
@@ -203,10 +208,15 @@ src/
 - IP 地址配置
 - 虚拟网络设备（`VirtualDevice`）
 
+**关键组件**：
+- `BufferPool`（`Arc<Mutex<Vec<BytesMut>>>`）- 跨设备共享的缓冲区池
+- `VirtualDevice` - 虚拟网络设备，支持零拷贝注入（`inject_packet_owned`）
+- `DeviceStats` - 设备统计信息（队列深度、丢包数）
+
 **设计原则**：
 - 使用 `valid_handles` 集合跟踪有效 socket，防止访问已移除的 socket
 - 所有 socket 操作需先检查 handle 有效性
-- 缓冲区池复用减少内存分配
+- 缓冲区池通过 `Arc<Mutex<>>` 在多个设备间共享复用，减少内存分配
 
 ### 4.6 net/proxy/socks5/ - SOCKS5 服务器
 
@@ -274,7 +284,17 @@ src/
 
 ### 5.4 日志规范
 
-- 使用 `log` crate（通过 `env_logger` 输出）
+- 使用 `log` crate + 自定义 `env_logger` 格式化器（`main.rs::init_logger`）
+- **日志消息格式**：首字母小写（如 `"tunnel established"` 而非 `"Tunnel established"`）
+- **输出格式**：
+  - 默认：`{LEVEL}[{elapsed_secs:04}] {message}`（如 `INFO[0042] tunnel established`）
+  - `--timestamp` 模式：`{YYYY-MM-DD HH:MM:SS.fff +ZZZZ} {LEVEL} {message}`
+- **彩色输出**：ERROR=红色加粗, WARN=黄色加粗, INFO=青色加粗, DEBUG=白色, TRACE=灰色
+- **CLI 日志参数**：
+  - `--log` / `-l`：日志级别枚举（`silent`/`error`/`warning`/`info`/`debug`），默认 `info`
+  - `--disable-color`：禁用彩色输出
+  - `--timestamp`：使用完整时间戳替代运行秒数
+- **IPv6 地址格式**：日志中 IPv6 地址统一使用方括号表示（如 `[2001:db8::1]:443`）
 - 日志级别：
   - `error!` - 不可恢复的错误
   - `warn!` - 可恢复的错误、异常情况
@@ -309,8 +329,9 @@ src/
 
 ### 5.7 内存管理
 
+- 使用 `tikv-jemallocator` 作为全局分配器
 - 使用 `bytes::Bytes` 进行零拷贝数据传递
-- `VirtualDevice` 实现缓冲区池复用
+- `VirtualDevice` 实现缓冲区池复用（通过 `Arc<Mutex<>>` 共享）
 - 避免在热路径上分配大型 Vec
 
 ### 5.8 文件组织
@@ -325,12 +346,13 @@ src/
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `USQUE_CC` | `bbr2` | 拥塞控制算法（reno/cubic/bbr2）|
+| `USQUE_CC` | `cubic` | 拥塞控制算法（reno/cubic/bbr2），仅 MASQUE 模式 |
 | `USQUE_TCP_BUFFER_SIZE` | `65536` | TCP 缓冲区大小（字节）|
-| `USQUE_QUIC_IDLE_TIMEOUT_MS` | `90000` | QUIC 空闲超时（毫秒）|
+| `USQUE_QUIC_IDLE_TIMEOUT_MS` | `90000` | QUIC 空闲超时（毫秒），仅 MASQUE 模式 |
 | `USQUE_TUNNEL_WORKERS` | `1` | 隧道 worker 数量 |
 | `USQUE_MAX_CONNECTIONS` | `1024` | 最大并发连接数 |
-| `RUST_LOG` | - | 日志级别（如 `usque_rs=debug`）|
+| `USQUE_PERF` | `false` | 启用性能监控报告 |
+| `USQUE_PERF_INTERVAL_SECS` | `5` | 性能报告输出间隔（秒）|
 
 ---
 
@@ -364,6 +386,8 @@ src/
 - 批量读取 TCP 数据（`MAX_TCP_READ_CHUNK = 64KB`）
 - 批量读取 UDP 数据（`UDP_BATCH_READ_BUDGET = 128`）
 - 反压控制防止内存无限增长
+- 共享缓冲区池（`BufferPool`）跨设备复用 `BytesMut`，减少堆分配
+- 性能监控：通过 `PerfCounters` 定时输出吞吐量、队列深度、丢包统计
 
 ### 8.2 DNS
 
