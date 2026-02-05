@@ -57,9 +57,7 @@ impl TunnelManager {
                                             stack,
                                             &mut cmd_rx,
                                             &mut udp_rx,
-                                            &params.dns_servers,
-                                            params.keepalive,
-                                            params.tcp_buffer_size,
+                                            &params,
                                         )
                                         .await;
                                     }
@@ -69,8 +67,7 @@ impl TunnelManager {
                                             stack,
                                             &mut cmd_rx,
                                             &mut udp_rx,
-                                            &params.dns_servers,
-                                            params.tcp_buffer_size,
+                                            &params,
                                         )
                                         .await;
                                     }
@@ -358,50 +355,60 @@ impl TunnelManager {
         stack: NetworkStack,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         udp_rx: &mut mpsc::Receiver<UdpSend>,
-        dns_servers: &[IpAddress],
-        keepalive_secs: u64,
-        tcp_buffer_size: usize,
+        params: &ConnectionParams,
     ) {
         let local_addr = tunnel.quic_conn.local_addr;
         let (incoming_tx, mut incoming_rx) = mpsc::channel(INCOMING_DGRAM_CAPACITY);
         let socket = tunnel.quic_conn.socket.clone();
+        let buffer_pool = stack.buffer_pool();
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut shutdown_sub = shutdown_tx.subscribe();
         // Guard: when all senders are dropped, the completion channel closes
         let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
         let recv_completion_tx = completion_tx.clone();
-        let recv_handle = tokio::spawn(async move {
+        let recv_handle = tokio::spawn({
+            let buffer_pool = buffer_pool.clone();
+            async move {
             let _guard = recv_completion_tx;
-            let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             loop {
                 tokio::select! {
                     _ = shutdown_sub.recv() => break,
-                    result = socket.recv_from(&mut buf) => {
+                    result = async {
+                        let mut buf = Self::take_pooled_buffer(&buffer_pool, UDP_RECV_BUFFER_SIZE);
+                        buf.resize(UDP_RECV_BUFFER_SIZE, 0);
+                        match socket.recv_from(&mut buf[..]).await {
+                            Ok((len, from)) => Ok((buf, len, from)),
+                            Err(e) => Err((buf, e)),
+                        }
+                    } => {
                         match result {
-                            Ok((len, from)) => {
+                            Ok((mut buf, len, from)) => {
                                 if len == 0 {
+                                    Self::return_pooled_buffer(&buffer_pool, buf);
                                     continue;
                                 }
-                                let data = BytesMut::from(&buf[..len]);
-                                if incoming_tx.send(IncomingDatagram { data, from }).await.is_err() {
+                                buf.truncate(len);
+                                if incoming_tx.send(IncomingDatagram { data: buf, from }).await.is_err() {
                                     log::trace!("Incoming datagram channel closed");
                                     break;
                                 }
                             }
-                            Err(e) => {
+                            Err((buf, e)) => {
+                                Self::return_pooled_buffer(&buffer_pool, buf);
                                 log::warn!("UDP recv error: {}", e);
                             }
                         }
                     }
                 }
             }
+        }
         });
 
-        let mut state = RuntimeState::new(stack);
+        let mut state = RuntimeState::new(stack, params.perf_enabled, params.perf_interval_secs);
 
         // Keepalive tracking
         let mut last_keepalive = Instant::now();
-        let keepalive_interval = Duration::from_secs(keepalive_secs);
+        let keepalive_interval = Duration::from_secs(params.keepalive);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
         const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
         let poll_timer = tokio::time::sleep(Duration::from_millis(0));
@@ -429,43 +436,37 @@ impl TunnelManager {
                 .as_mut()
                 .reset(TokioInstant::now() + poll_timeout);
 
+            state.perf.inc_loop();
+            let mut dirty = false;
+
             tokio::select! {
                 biased;
                 // Handle control commands from SOCKS5 connections
                 Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut state, dns_servers, tcp_buffer_size, cmd);
-                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    Self::handle_command(&mut state, &params.dns_servers, params.tcp_buffer_size, cmd);
+                    dirty = true;
                 }
 
                 // Handle UDP sends from SOCKS5
                 Some(udp_cmd) = udp_rx.recv() => {
                     Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
-                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    dirty = true;
                 }
 
                 // Receive UDP data from QUIC socket - batch read
                 Some(incoming) = incoming_rx.recv() => {
                     let mut data = incoming.data;
-                    Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data[..], incoming.from, local_addr);
-                    // Batch read remaining datagrams
-                    let mut budget = UDP_BATCH_READ_BUDGET - 1;
-                    while budget > 0 {
-                        match incoming_rx.try_recv() {
-                            Ok(incoming) => {
-                                let mut data = incoming.data;
-                                Self::handle_udp_recv(&mut tunnel, &mut state.stack, &mut data[..], incoming.from, local_addr);
-                                budget -= 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if !Self::flush_outbound(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    Self::handle_udp_recv(
+                        &mut tunnel,
+                        &mut state.stack,
+                        &state.buffer_pool,
+                        &mut state.perf,
+                        &mut data[..],
+                        incoming.from,
+                        local_addr,
+                    );
+                    Self::return_pooled_buffer(&state.buffer_pool, data);
+                    dirty = true;
                 }
 
                 // Dynamic timeout - replaces fixed interval polling
@@ -480,6 +481,65 @@ impl TunnelManager {
                         break;
                     }
                 }
+            }
+
+            if dirty {
+                let mut budget = CMD_BATCH_BUDGET;
+                while budget > 0 {
+                    match cmd_rx.try_recv() {
+                        Ok(cmd) => {
+                            Self::handle_command(&mut state, &params.dns_servers, params.tcp_buffer_size, cmd);
+                            budget -= 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut budget = UDP_BATCH_BUDGET;
+                while budget > 0 {
+                    match udp_rx.try_recv() {
+                        Ok(udp_cmd) => {
+                            Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
+                            budget -= 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut budget = UDP_BATCH_READ_BUDGET;
+                while budget > 0 {
+                    match incoming_rx.try_recv() {
+                        Ok(incoming) => {
+                            let mut data = incoming.data;
+                            Self::handle_udp_recv(
+                                &mut tunnel,
+                                &mut state.stack,
+                                &state.buffer_pool,
+                                &mut state.perf,
+                                &mut data[..],
+                                incoming.from,
+                                local_addr,
+                            );
+                            Self::return_pooled_buffer(&state.buffer_pool, data);
+                            budget -= 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if !Self::flush_outbound(&mut tunnel, &mut state).await {
+                    break;
+                }
+            }
+
+            if state.perf.due() {
+                let snapshot = Self::build_perf_snapshot(
+                    &mut state,
+                    cmd_rx.len(),
+                    udp_rx.len(),
+                    incoming_rx.len(),
+                );
+                state.perf.report(snapshot);
             }
         }
 
@@ -501,11 +561,11 @@ impl TunnelManager {
         stack: NetworkStack,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         udp_rx: &mut mpsc::Receiver<UdpSend>,
-        dns_servers: &[IpAddress],
-        tcp_buffer_size: usize,
+        params: &ConnectionParams,
     ) {
         let socket = tunnel.socket();
         let (incoming_tx, mut incoming_rx) = mpsc::channel(INCOMING_DGRAM_CAPACITY);
+        let buffer_pool = stack.buffer_pool();
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut shutdown_sub = shutdown_tx.subscribe();
         let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
@@ -514,32 +574,45 @@ impl TunnelManager {
         let peer_addr = socket
             .peer_addr()
             .expect("WG socket should be connected");
-        let recv_handle = tokio::spawn(async move {
+        let recv_handle = tokio::spawn({
+            let buffer_pool = buffer_pool.clone();
+            async move {
             let _guard = recv_completion_tx;
-            let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             loop {
                 tokio::select! {
                     _ = shutdown_sub.recv() => break,
-                    result = socket.recv(&mut buf) => {
+                    result = async {
+                        let mut buf = Self::take_pooled_buffer(&buffer_pool, UDP_RECV_BUFFER_SIZE);
+                        buf.resize(UDP_RECV_BUFFER_SIZE, 0);
+                        match socket.recv(&mut buf[..]).await {
+                            Ok(len) => Ok((buf, len)),
+                            Err(e) => Err((buf, e)),
+                        }
+                    } => {
                         match result {
-                            Ok(len) => {
-                                if len == 0 { continue; }
-                                let data = BytesMut::from(&buf[..len]);
-                                if incoming_tx.send(IncomingDatagram { data, from: peer_addr }).await.is_err() {
+                            Ok((mut buf, len)) => {
+                                if len == 0 {
+                                    Self::return_pooled_buffer(&buffer_pool, buf);
+                                    continue;
+                                }
+                                buf.truncate(len);
+                                if incoming_tx.send(IncomingDatagram { data: buf, from: peer_addr }).await.is_err() {
                                     log::trace!("Incoming datagram channel closed");
                                     break;
                                 }
                             }
-                            Err(e) => {
+                            Err((buf, e)) => {
+                                Self::return_pooled_buffer(&buffer_pool, buf);
                                 log::warn!("UDP recv error: {}", e);
                             }
                         }
                     }
                 }
             }
+        }
         });
 
-        let mut state = RuntimeState::new(stack);
+        let mut state = RuntimeState::new(stack, params.perf_enabled, params.perf_interval_secs);
 
         const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
         const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -556,8 +629,7 @@ impl TunnelManager {
                 break;
             }
 
-            state.perf.loop_iterations += 1;
-            state.perf.maybe_report();
+            state.perf.inc_loop();
 
             let smoltcp_timeout = state.stack.poll_delay().unwrap_or(DEFAULT_POLL_INTERVAL);
             let poll_timeout = smoltcp_timeout.min(MAX_POLL_INTERVAL);
@@ -565,43 +637,28 @@ impl TunnelManager {
                 .as_mut()
                 .reset(TokioInstant::now() + poll_timeout);
 
+            let mut dirty = false;
+            let mut handled_incoming = false;
+
             tokio::select! {
                 biased;
                 Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut state, dns_servers, tcp_buffer_size, cmd);
-                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    Self::handle_command(&mut state, &params.dns_servers, params.tcp_buffer_size, cmd);
+                    dirty = true;
                 }
 
                 Some(udp_cmd) = udp_rx.recv() => {
                     Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
-                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    dirty = true;
                 }
 
                 Some(incoming) = incoming_rx.recv() => {
-                    state.perf.rx_packets += 1;
-                    state.perf.rx_bytes += incoming.data.len() as u64;
-                    tunnel.decrypt_incoming(incoming.data, &mut state.stack);
-                    let mut budget = UDP_BATCH_READ_BUDGET - 1;
-                    while budget > 0 {
-                        match incoming_rx.try_recv() {
-                            Ok(incoming) => {
-                                state.perf.rx_packets += 1;
-                                state.perf.rx_bytes += incoming.data.len() as u64;
-                                tunnel.decrypt_incoming(incoming.data, &mut state.stack);
-                                budget -= 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    tunnel.drain_queued_to_send_queue();
-                    tunnel.flush_send_queue().await;
-                    if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
-                        break;
-                    }
+                    let mut data = incoming.data;
+                    state.perf.inc_rx(data.len());
+                    tunnel.decrypt_incoming(&mut data, &mut state.stack);
+                    Self::return_pooled_buffer(&state.buffer_pool, data);
+                    dirty = true;
+                    handled_incoming = true;
                 }
 
                 _ = &mut wg_timer => {
@@ -616,6 +673,64 @@ impl TunnelManager {
                         break;
                     }
                 }
+            }
+
+            if dirty {
+                let mut budget = CMD_BATCH_BUDGET;
+                while budget > 0 {
+                    match cmd_rx.try_recv() {
+                        Ok(cmd) => {
+                            Self::handle_command(&mut state, &params.dns_servers, params.tcp_buffer_size, cmd);
+                            budget -= 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut budget = UDP_BATCH_BUDGET;
+                while budget > 0 {
+                    match udp_rx.try_recv() {
+                        Ok(udp_cmd) => {
+                            Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
+                            budget -= 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut budget = UDP_BATCH_READ_BUDGET;
+                while budget > 0 {
+                    match incoming_rx.try_recv() {
+                        Ok(incoming) => {
+                            let mut data = incoming.data;
+                            state.perf.inc_rx(data.len());
+                            tunnel.decrypt_incoming(&mut data, &mut state.stack);
+                            Self::return_pooled_buffer(&state.buffer_pool, data);
+                            budget -= 1;
+                            handled_incoming = true;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if handled_incoming {
+                    tunnel.drain_queued_to_send_queue();
+                    tunnel.flush_send_queue().await;
+                }
+
+                if !Self::flush_outbound_wg(&mut tunnel, &mut state).await {
+                    break;
+                }
+            }
+
+            if state.perf.due() {
+                let snapshot = Self::build_perf_snapshot(
+                    &mut state,
+                    cmd_rx.len(),
+                    udp_rx.len(),
+                    incoming_rx.len(),
+                );
+                state.perf.report(snapshot);
             }
         }
 
@@ -646,6 +761,7 @@ impl TunnelManager {
                 let result = Self::create_connection(
                     &mut state.stack,
                     &mut state.sockets,
+                    &mut state.tcp_handles,
                     remote_ip,
                     remote_port,
                     local_port,
@@ -656,7 +772,7 @@ impl TunnelManager {
                 }
             }
             ManagerCommand::Close { handle } => {
-                Self::close_connection(&mut state.stack, &mut state.sockets, handle);
+                Self::close_connection(&mut state.stack, &mut state.sockets, &mut state.tcp_handles, handle);
             }
             ManagerCommand::DnsResolve {
                 domain,
@@ -691,12 +807,18 @@ impl TunnelManager {
                 Self::register_udp_session(
                     &mut state.stack,
                     &mut state.udp_sessions,
+                    &mut state.udp_ports,
                     local_port,
                     response,
                 );
             }
             ManagerCommand::UdpUnregister { local_port } => {
-                Self::unregister_udp_session(&mut state.stack, &mut state.udp_sessions, local_port);
+                Self::unregister_udp_session(
+                    &mut state.stack,
+                    &mut state.udp_sessions,
+                    &mut state.udp_ports,
+                    local_port,
+                );
             }
             ManagerCommand::GetSocketState { handle, response } => {
                 let socket_state =
@@ -790,6 +912,7 @@ impl TunnelManager {
     fn create_connection(
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        tcp_handles: &mut Vec<SocketHandle>,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
@@ -816,6 +939,7 @@ impl TunnelManager {
         };
 
         sockets.insert(handle, state);
+        tcp_handles.push(handle);
 
         Ok(SocketChannels {
             handle,
@@ -827,6 +951,7 @@ impl TunnelManager {
     fn close_connection(
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        tcp_handles: &mut Vec<SocketHandle>,
         handle: SocketHandle,
     ) {
         // Notify all waiters that the connection is closed
@@ -839,6 +964,7 @@ impl TunnelManager {
         }
         stack.tcp_close(handle);
         stack.remove_socket(handle);
+        tcp_handles.retain(|h| *h != handle);
     }
 
     fn get_tcp_socket_state(
@@ -904,6 +1030,7 @@ impl TunnelManager {
     fn register_udp_session(
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        udp_ports: &mut Vec<u16>,
         local_port: u16,
         response: UdpSessionResponse,
     ) {
@@ -926,6 +1053,7 @@ impl TunnelManager {
                 last_activity: Instant::now(),
             },
         );
+        udp_ports.push(local_port);
 
         log::debug!("UDP session registered on port {}", local_port);
         if response.send(Ok(rx)).is_err() {
@@ -954,12 +1082,14 @@ impl TunnelManager {
     fn unregister_udp_session(
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        udp_ports: &mut Vec<u16>,
         local_port: u16,
     ) {
         if let Some(session) = udp_sessions.remove(&local_port) {
             stack.remove_socket(session.handle);
             log::debug!("UDP session unregistered on port {}", local_port);
         }
+        udp_ports.retain(|p| *p != local_port);
     }
 
     fn record_dns_error(
@@ -1321,10 +1451,9 @@ impl TunnelManager {
     fn process_udp_responses(
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
+        udp_ports: &[u16],
     ) {
-        let ports: Vec<u16> = udp_sessions.keys().copied().collect();
-
-        for local_port in ports {
+        for &local_port in udp_ports {
             let handle = match udp_sessions.get(&local_port) {
                 Some(session) => session.handle,
                 None => continue,
@@ -1472,6 +1601,8 @@ impl TunnelManager {
     fn handle_udp_recv(
         tunnel: &mut MasqueTunnel,
         stack: &mut NetworkStack,
+        buffer_pool: &BufferPool,
+        perf: &mut PerfCounters,
         data: &mut [u8],
         from: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
@@ -1492,7 +1623,10 @@ impl TunnelManager {
         loop {
             match tunnel.recv_datagram(&mut dgram_buf) {
                 Ok(len) if len > 0 => {
-                    stack.inject_packet(&dgram_buf[..len]);
+                    let mut packet = Self::take_pooled_buffer(buffer_pool, len);
+                    packet.extend_from_slice(&dgram_buf[..len]);
+                    perf.inc_rx(len);
+                    stack.inject_packet_owned(packet);
                 }
                 _ => break,
             }
@@ -1506,6 +1640,7 @@ impl TunnelManager {
             log::error!("smoltcp poll failed, restarting tunnel: {}", e);
             return false;
         }
+        state.perf.inc_poll();
 
         Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
 
@@ -1517,7 +1652,7 @@ impl TunnelManager {
             &state.dns_sockets,
         );
 
-        Self::process_udp_responses(&mut state.stack, &mut state.udp_sessions);
+        Self::process_udp_responses(&mut state.stack, &mut state.udp_sessions, &state.udp_ports);
 
         // Cleanup timed out DNS groups (5 second timeout)
         let now = Instant::now();
@@ -1563,17 +1698,19 @@ impl TunnelManager {
             .filter(|(_, session)| now.duration_since(session.last_activity) > UDP_SESSION_TIMEOUT)
             .map(|(port, _)| *port)
             .collect();
-        for port in stale_ports {
-            if let Some(session) = state.udp_sessions.remove(&port) {
+        for port in &stale_ports {
+            if let Some(session) = state.udp_sessions.remove(port) {
                 state.stack.remove_socket(session.handle);
                 log::debug!("Cleaned up stale UDP session on port {}", port);
             }
         }
+        if !stale_ports.is_empty() {
+            state.udp_ports.retain(|p| !stale_ports.contains(p));
+        }
 
-        let handles: Vec<SocketHandle> = state.sockets.keys().copied().collect();
         let mut closed_handles = Vec::new();
 
-        for handle in handles {
+        for handle in state.tcp_handles.iter().copied() {
             if !state.stack.tcp_is_active(handle) {
                 closed_handles.push(handle);
                 continue;
@@ -1639,9 +1776,13 @@ impl TunnelManager {
             }
         }
 
-        for handle in closed_handles {
-            state.sockets.remove(&handle);
-            state.stack.remove_socket(handle);
+        for handle in &closed_handles {
+            state.sockets.remove(handle);
+            state.stack.remove_socket(*handle);
+        }
+        if !closed_handles.is_empty() {
+            state.tcp_handles
+                .retain(|h| !closed_handles.contains(h));
         }
 
         true
@@ -1667,13 +1808,15 @@ impl TunnelManager {
             return false;
         }
 
-        while let Some(packet) = state.stack.take_packet() {
-            let send_result = tunnel.send_datagram(packet.as_ref());
+        while let Some(mut packet) = state.stack.take_packet() {
+            state.perf.inc_tx(packet.len());
+            let send_result = tunnel.send_datagram(&mut packet);
             state.stack.recycle_tx_buffer(packet);
             match send_result {
                 Ok(Some(icmp)) => {
                     log::debug!("Injecting ICMP Packet Too Big ({} bytes)", icmp.len());
-                    state.stack.inject_packet(&icmp);
+                    state.stack
+                        .inject_packet_owned(BytesMut::from(Bytes::from(icmp)));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1689,14 +1832,12 @@ impl TunnelManager {
     }
 
     async fn poll_all_wg(tunnel: &mut WgTunnel, state: &mut RuntimeState) -> bool {
-        state.perf.poll_count += 1;
         if !Self::poll_stack_common(state) {
             return false;
         }
 
         while let Some(packet) = state.stack.take_packet() {
-            state.perf.tx_packets += 1;
-            state.perf.tx_bytes += packet.len() as u64;
+            state.perf.inc_tx(packet.len());
             tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
@@ -1710,9 +1851,9 @@ impl TunnelManager {
             log::error!("smoltcp poll failed, restarting tunnel: {}", e);
             return false;
         }
+        state.perf.inc_poll();
 
-        let handles: Vec<SocketHandle> = state.sockets.keys().copied().collect();
-        for handle in handles {
+        for handle in state.tcp_handles.iter().copied() {
             let Some(socket_state) = state.sockets.get_mut(&handle) else {
                 continue;
             };
@@ -1763,8 +1904,9 @@ impl TunnelManager {
             return false;
         }
 
-        while let Some(packet) = state.stack.take_packet() {
-            let send_result = tunnel.send_datagram(packet.as_ref());
+        while let Some(mut packet) = state.stack.take_packet() {
+            state.perf.inc_tx(packet.len());
+            let send_result = tunnel.send_datagram(&mut packet);
             state.stack.recycle_tx_buffer(packet);
             if let Err(e) = send_result {
                 log::debug!("Failed to send datagram: {:?}", e);
@@ -1781,14 +1923,12 @@ impl TunnelManager {
         tunnel: &mut WgTunnel,
         state: &mut RuntimeState,
     ) -> bool {
-        state.perf.poll_count += 1;
         if !Self::flush_stack_reads(state) {
             return false;
         }
 
         while let Some(packet) = state.stack.take_packet() {
-            state.perf.tx_packets += 1;
-            state.perf.tx_bytes += packet.len() as u64;
+            state.perf.inc_tx(packet.len());
             tunnel.encrypt_ip_packet(packet.as_ref());
             state.stack.recycle_tx_buffer(packet);
         }
@@ -1903,6 +2043,69 @@ impl TunnelManager {
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::Closed),
+        }
+    }
+
+    fn take_pooled_buffer(pool: &BufferPool, capacity: usize) -> BytesMut {
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(mut buf) = guard.pop() {
+            buf.clear();
+            if buf.capacity() < capacity {
+                buf.reserve(capacity - buf.capacity());
+            }
+            buf
+        } else {
+            BytesMut::with_capacity(capacity)
+        }
+    }
+
+    fn return_pooled_buffer(pool: &BufferPool, mut buf: BytesMut) {
+        buf.clear();
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.len() < POOL_MAX_SIZE {
+            guard.push(buf);
+        }
+    }
+
+    fn build_perf_snapshot(
+        state: &mut RuntimeState,
+        cmd_queue_len: usize,
+        udp_queue_len: usize,
+        incoming_queue_len: usize,
+    ) -> PerfSnapshot {
+        let DeviceStats {
+            rx_queue_len,
+            tx_queue_len,
+            rx_drops,
+            tx_drops,
+        } = state.stack.take_device_stats();
+
+        let mut pending_from_client_bytes = 0usize;
+        let mut pending_to_client_bytes = 0usize;
+        for socket_state in state.sockets.values() {
+            pending_from_client_bytes += socket_state.pending_from_client_bytes;
+            pending_to_client_bytes += socket_state.pending_to_client_bytes;
+        }
+
+        PerfSnapshot {
+            sockets: state.sockets.len(),
+            udp_sessions: state.udp_sessions.len(),
+            dns_groups: state.dns_groups.len(),
+            pending_from_client_bytes,
+            pending_to_client_bytes,
+            rx_queue_len,
+            tx_queue_len,
+            rx_drops,
+            tx_drops,
+            cmd_queue_len,
+            udp_queue_len,
+            incoming_queue_len,
         }
     }
 

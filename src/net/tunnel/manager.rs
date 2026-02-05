@@ -5,7 +5,7 @@ use crate::net::tunnel::dns::{
 use crate::net::tunnel::masque::MasqueTunnel;
 use crate::net::tunnel::quic;
 use crate::net::tunnel::wireguard::WgTunnel;
-use crate::net::tunnel::stack::{NetworkStack, StackError};
+use crate::net::tunnel::stack::{BufferPool, DeviceStats, NetworkStack, StackError};
 use bytes::{Bytes, BytesMut};
 use quick_cache::unsync::Cache;
 use rand::Rng;
@@ -45,6 +45,8 @@ pub struct ConnectionParams {
     pub wg_private_key: Option<[u8; 32]>,
     pub wg_peer_public_key: Option<[u8; 32]>,
     pub wg_client_id: Option<[u8; 3]>,
+    pub perf_enabled: bool,
+    pub perf_interval_secs: u64,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -201,7 +203,24 @@ struct IncomingDatagram {
     from: SocketAddr,
 }
 
+struct PerfSnapshot {
+    sockets: usize,
+    udp_sessions: usize,
+    dns_groups: usize,
+    pending_from_client_bytes: usize,
+    pending_to_client_bytes: usize,
+    rx_queue_len: usize,
+    tx_queue_len: usize,
+    rx_drops: u64,
+    tx_drops: u64,
+    cmd_queue_len: usize,
+    udp_queue_len: usize,
+    incoming_queue_len: usize,
+}
+
 struct PerfCounters {
+    enabled: bool,
+    interval: Duration,
     last_report: Instant,
     rx_packets: u64,
     rx_bytes: u64,
@@ -212,8 +231,11 @@ struct PerfCounters {
 }
 
 impl PerfCounters {
-    fn new() -> Self {
+    fn new(enabled: bool, interval_secs: u64) -> Self {
+        let interval = Duration::from_secs(interval_secs.max(1));
         Self {
+            enabled,
+            interval,
             last_report: Instant::now(),
             rx_packets: 0,
             rx_bytes: 0,
@@ -224,49 +246,109 @@ impl PerfCounters {
         }
     }
 
-    fn maybe_report(&mut self) {
+    fn due(&self) -> bool {
+        self.enabled && self.last_report.elapsed() >= self.interval
+    }
+
+    fn inc_loop(&mut self) {
+        if self.enabled {
+            self.loop_iterations += 1;
+        }
+    }
+
+    fn inc_poll(&mut self) {
+        if self.enabled {
+            self.poll_count += 1;
+        }
+    }
+
+    fn inc_rx(&mut self, bytes: usize) {
+        if self.enabled {
+            self.rx_packets += 1;
+            self.rx_bytes += bytes as u64;
+        }
+    }
+
+    fn inc_tx(&mut self, bytes: usize) {
+        if self.enabled {
+            self.tx_packets += 1;
+            self.tx_bytes += bytes as u64;
+        }
+    }
+
+    fn report(&mut self, snapshot: PerfSnapshot) {
+        if !self.enabled {
+            return;
+        }
         let elapsed = self.last_report.elapsed();
-        if elapsed < Duration::from_secs(5) {
+        if elapsed < self.interval {
             return;
         }
         let secs = elapsed.as_secs_f64();
         log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s",
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={}",
             self.rx_packets as f64 / secs,
             self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.tx_packets as f64 / secs,
             self.tx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.poll_count as f64 / secs,
             self.loop_iterations as f64 / secs,
+            snapshot.sockets,
+            snapshot.udp_sessions,
+            snapshot.dns_groups,
+            snapshot.pending_from_client_bytes,
+            snapshot.pending_to_client_bytes,
+            snapshot.rx_queue_len,
+            snapshot.tx_queue_len,
+            snapshot.rx_drops,
+            snapshot.tx_drops,
+            snapshot.cmd_queue_len,
+            snapshot.udp_queue_len,
+            snapshot.incoming_queue_len,
         );
-        *self = Self::new();
+        self.last_report = Instant::now();
+        self.rx_packets = 0;
+        self.rx_bytes = 0;
+        self.tx_packets = 0;
+        self.tx_bytes = 0;
+        self.poll_count = 0;
+        self.loop_iterations = 0;
     }
 }
 
 struct RuntimeState {
     stack: NetworkStack,
     sockets: HashMap<SocketHandle, SocketState>,
+    // Keep in sync with sockets for fast iteration without per-loop allocations.
+    tcp_handles: Vec<SocketHandle>,
     dns_queries: HashMap<u16, DnsQueryState>,
     dns_groups: HashMap<u32, DnsQueryGroup>,
     dns_sockets: DnsSockets,
     dns_cache: Cache<String, DnsCacheValue>,
     udp_sessions: HashMap<u16, UdpSessionState>,
+    // Keep in sync with udp_sessions for fast iteration without per-loop allocations.
+    udp_ports: Vec<u16>,
     read_buffer: BytesMut,
+    buffer_pool: BufferPool,
     perf: PerfCounters,
 }
 
 impl RuntimeState {
-    fn new(stack: NetworkStack) -> Self {
+    fn new(stack: NetworkStack, perf_enabled: bool, perf_interval_secs: u64) -> Self {
+        let buffer_pool = stack.buffer_pool();
         Self {
             stack,
             sockets: HashMap::new(),
+            tcp_handles: Vec::new(),
             dns_queries: HashMap::new(),
             dns_groups: HashMap::new(),
             dns_sockets: DnsSockets::new(),
             dns_cache: Cache::new(DNS_CACHE_CAPACITY),
             udp_sessions: HashMap::new(),
+            udp_ports: Vec::new(),
             read_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
-            perf: PerfCounters::new(),
+            buffer_pool,
+            perf: PerfCounters::new(perf_enabled, perf_interval_secs),
         }
     }
 }
@@ -284,6 +366,9 @@ const MAX_PENDING_DATA: usize = 128 * 1024; // 128KB per socket (for partial wri
 // Backpressure: to_client uses try_send + pending queue, must never block manager
 const MAX_PENDING_TO_CLIENT: usize = 256 * 1024; // 256KB per socket
 const UDP_BATCH_READ_BUDGET: usize = 128;
+const CMD_BATCH_BUDGET: usize = 64;
+const UDP_BATCH_BUDGET: usize = 64;
+const POOL_MAX_SIZE: usize = 256;
 
 enum DeliverError {
     Backpressure,

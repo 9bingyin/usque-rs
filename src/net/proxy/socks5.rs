@@ -1,4 +1,4 @@
-use crate::net::tunnel::manager::{ManagerError, TcpSocketState, TunnelManager};
+use crate::net::tunnel::manager::ManagerError;
 use bytes::Bytes;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use std::collections::HashMap;
@@ -181,32 +181,6 @@ fn max_concurrent_connections() -> usize {
         .and_then(|val| val.parse::<usize>().ok())
         .filter(|val| *val > 0)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_CONNECTIONS)
-}
-
-async fn wait_for_connection(
-    manager: &TunnelManager,
-    handle: smoltcp::iface::SocketHandle,
-) -> Result<(), Socks5Error> {
-    let start = Instant::now();
-
-    loop {
-        let state = manager.get_socket_state(handle).await;
-
-        match state {
-            TcpSocketState::Established => return Ok(()),
-            TcpSocketState::Closed => {
-                return Err(Socks5Error::ConnectionFailed("Connection closed".into()));
-            }
-            TcpSocketState::Connecting => {
-                if start.elapsed() > CONNECT_TIMEOUT {
-                    return Err(Socks5Error::Timeout);
-                }
-                let elapsed = start.elapsed().as_millis() as u64;
-                let wait = if elapsed < 1000 { 10 } else { 50 };
-                tokio::time::sleep(Duration::from_millis(wait)).await;
-            }
-        }
-    }
 }
 
 #[derive(Error, Debug)]

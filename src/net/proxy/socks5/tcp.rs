@@ -1,7 +1,6 @@
 use super::{
     interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
-    wait_for_connection, CONNECTION_ATTEMPT_DELAY, CONNECT_TIMEOUT, IDLE_TIMEOUT,
-    TCP_READ_BUFFER_SIZE,
+    CONNECTION_ATTEMPT_DELAY, CONNECT_TIMEOUT, IDLE_TIMEOUT, TCP_READ_BUFFER_SIZE,
 };
 use super::{Socks5Error, get_local_port};
 use crate::net::tunnel::manager::{SocketChannels, TcpSocketState, TunnelManager};
@@ -74,13 +73,32 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let handle = channels.handle;
-    if let Err(e) = wait_for_connection(&manager, handle).await {
-        let reply = map_connect_error_to_reply(&e);
+    let ready = match tokio::time::timeout(CONNECT_TIMEOUT, manager.wait_socket_ready(handle)).await
+    {
+        Ok(state) => state,
+        Err(_) => {
+            let err = Socks5Error::Timeout;
+            let reply = map_connect_error_to_reply(&err);
+            if let Err(rep_err) = proto.reply_error(&reply).await {
+                log::debug!("Failed to send connect error reply: {}", rep_err);
+            }
+            manager.close(handle).await;
+            return Err(err);
+        }
+    };
+
+    if ready != TcpSocketState::Established {
+        let err = match ready {
+            TcpSocketState::Closed => Socks5Error::ConnectionFailed("Connection closed".into()),
+            TcpSocketState::Connecting => Socks5Error::Timeout,
+            TcpSocketState::Established => unreachable!(),
+        };
+        let reply = map_connect_error_to_reply(&err);
         if let Err(rep_err) = proto.reply_error(&reply).await {
             log::debug!("Failed to send connect error reply: {}", rep_err);
         }
         manager.close(handle).await;
-        return Err(e);
+        return Err(err);
     }
 
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);

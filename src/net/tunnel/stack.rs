@@ -9,6 +9,7 @@ use smoltcp::socket::{
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 use thiserror::Error;
 
@@ -16,9 +17,12 @@ const MAX_QUEUE_SIZE: usize = 4096;
 const BUFFER_POOL_SIZE: usize = 256;
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
+pub(crate) type BufferPool = Arc<Mutex<Vec<BytesMut>>>;
+
 struct DropLogger {
     label: &'static str,
-    count: u64,
+    log_count: u64,  // for periodic warning logs
+    perf_count: u64, // for PERF snapshot (reset every report)
     last_log: StdInstant,
 }
 
@@ -26,37 +30,45 @@ impl DropLogger {
     fn new(label: &'static str) -> Self {
         Self {
             label,
-            count: 0,
+            log_count: 0,
+            perf_count: 0,
             last_log: StdInstant::now(),
         }
     }
 
     fn log_drop(&mut self) {
-        self.count += 1;
+        self.log_count += 1;
+        self.perf_count += 1;
         let now = StdInstant::now();
         if now.duration_since(self.last_log) >= DROP_LOG_INTERVAL {
-            log::warn!("{} queue full, dropped {} packets", self.label, self.count);
-            self.count = 0;
+            log::warn!(
+                "{} queue full, dropped {} packets",
+                self.label,
+                self.log_count
+            );
+            self.log_count = 0;
             self.last_log = now;
         }
+    }
+
+    fn take_perf_count(&mut self) -> u64 {
+        let count = self.perf_count;
+        self.perf_count = 0;
+        count
     }
 }
 
 pub struct VirtualDevice {
     rx_queue: VecDeque<BytesMut>,
     tx_queue: VecDeque<BytesMut>,
-    buffer_pool: Vec<BytesMut>,
+    buffer_pool: BufferPool,
     mtu: usize,
     rx_drop_logger: DropLogger,
     tx_drop_logger: DropLogger,
 }
 
 impl VirtualDevice {
-    pub fn new(mtu: usize) -> Self {
-        let buffer_pool = (0..BUFFER_POOL_SIZE)
-            .map(|_| BytesMut::with_capacity(mtu))
-            .collect();
-
+    pub fn new(mtu: usize, buffer_pool: BufferPool) -> Self {
         Self {
             rx_queue: VecDeque::with_capacity(1024),
             tx_queue: VecDeque::with_capacity(1024),
@@ -67,16 +79,30 @@ impl VirtualDevice {
         }
     }
 
-    fn get_buffer(&mut self) -> BytesMut {
-        self.buffer_pool
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(self.mtu))
+    fn get_buffer(&self, capacity: usize) -> BytesMut {
+        let mut pool = match self.buffer_pool.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(mut buf) = pool.pop() {
+            buf.clear();
+            if buf.capacity() < capacity {
+                buf.reserve(capacity - buf.capacity());
+            }
+            buf
+        } else {
+            BytesMut::with_capacity(capacity)
+        }
     }
 
-    fn return_buffer(&mut self, mut buf: BytesMut) {
-        if self.buffer_pool.len() < BUFFER_POOL_SIZE {
-            buf.clear();
-            self.buffer_pool.push(buf);
+    fn return_buffer(&self, mut buf: BytesMut) {
+        buf.clear();
+        let mut pool = match self.buffer_pool.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if pool.len() < BUFFER_POOL_SIZE {
+            pool.push(buf);
         }
     }
 
@@ -87,9 +113,19 @@ impl VirtualDevice {
             }
             self.rx_drop_logger.log_drop();
         }
-        let mut buf = self.get_buffer();
+        let mut buf = self.get_buffer(self.mtu);
         buf.extend_from_slice(data);
         self.rx_queue.push_back(buf);
+    }
+
+    pub fn inject_packet_owned(&mut self, data: BytesMut) {
+        while self.rx_queue.len() >= MAX_QUEUE_SIZE {
+            if let Some(old) = self.rx_queue.pop_front() {
+                self.return_buffer(old);
+            }
+            self.rx_drop_logger.log_drop();
+        }
+        self.rx_queue.push_back(data);
     }
 
     pub fn take_packet(&mut self) -> Option<BytesMut> {
@@ -98,6 +134,21 @@ impl VirtualDevice {
 
     pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
         self.return_buffer(buf);
+    }
+
+    pub fn queue_lengths(&self) -> (usize, usize) {
+        (self.rx_queue.len(), self.tx_queue.len())
+    }
+
+    pub fn take_drop_counts(&mut self) -> (u64, u64) {
+        (
+            self.rx_drop_logger.take_perf_count(),
+            self.tx_drop_logger.take_perf_count(),
+        )
+    }
+
+    pub fn buffer_pool(&self) -> BufferPool {
+        self.buffer_pool.clone()
     }
 }
 
@@ -116,12 +167,12 @@ impl Device for VirtualDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx_queue.pop_front()?;
-        let buffer = self
-            .buffer_pool
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(self.mtu));
+        let buffer = self.get_buffer(self.mtu);
         Some((
-            VirtualRxToken { data: packet },
+            VirtualRxToken {
+                data: packet,
+                buffer_pool: self.buffer_pool.clone(),
+            },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
                 buffer,
@@ -131,10 +182,7 @@ impl Device for VirtualDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        let buffer = self
-            .buffer_pool
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(self.mtu));
+        let buffer = self.get_buffer(self.mtu);
         Some(VirtualTxToken {
             queue: &mut self.tx_queue,
             buffer,
@@ -159,6 +207,22 @@ impl Device for VirtualDevice {
 
 pub struct VirtualRxToken {
     data: BytesMut,
+    buffer_pool: BufferPool,
+}
+
+impl Drop for VirtualRxToken {
+    fn drop(&mut self) {
+        // Return the buffer to the pool for reuse; content is cleared on return.
+        let mut buf = std::mem::take(&mut self.data);
+        buf.clear();
+        let mut pool = match self.buffer_pool.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if pool.len() < BUFFER_POOL_SIZE {
+            pool.push(buf);
+        }
+    }
 }
 
 impl RxToken for VirtualRxToken {
@@ -203,6 +267,13 @@ pub enum StackError {
     PollPanic,
 }
 
+pub struct DeviceStats {
+    pub rx_queue_len: usize,
+    pub tx_queue_len: usize,
+    pub rx_drops: u64,
+    pub tx_drops: u64,
+}
+
 pub struct NetworkStack {
     device: VirtualDevice,
     iface: Interface,
@@ -210,6 +281,7 @@ pub struct NetworkStack {
     valid_handles: HashSet<SocketHandle>,
     local_ipv4: Option<Ipv4Address>,
     local_ipv6: Option<Ipv6Address>,
+    buffer_pool: BufferPool,
 }
 
 impl NetworkStack {
@@ -262,7 +334,18 @@ impl NetworkStack {
     }
 
     pub fn new(ipv4: Option<&str>, ipv6: Option<&str>, mtu: usize) -> Self {
-        let mut device = VirtualDevice::new(mtu);
+        let buffer_pool: BufferPool = Arc::new(Mutex::new(Vec::with_capacity(BUFFER_POOL_SIZE)));
+        {
+            let mut pool = match buffer_pool.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for _ in 0..BUFFER_POOL_SIZE {
+                pool.push(BytesMut::with_capacity(mtu));
+            }
+        }
+
+        let mut device = VirtualDevice::new(mtu, buffer_pool.clone());
 
         let mut local_ipv4 = match ipv4.filter(|s| !s.trim().is_empty()) {
             Some(s) => match s.parse() {
@@ -326,6 +409,7 @@ impl NetworkStack {
             valid_handles: HashSet::new(),
             local_ipv4,
             local_ipv6,
+            buffer_pool,
         }
     }
 
@@ -452,12 +536,31 @@ impl NetworkStack {
         self.device.inject_packet(packet);
     }
 
+    pub fn inject_packet_owned(&mut self, packet: BytesMut) {
+        self.device.inject_packet_owned(packet);
+    }
+
     pub fn take_packet(&mut self) -> Option<BytesMut> {
         self.device.take_packet()
     }
 
     pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
         self.device.recycle_tx_buffer(buf);
+    }
+
+    pub fn buffer_pool(&self) -> BufferPool {
+        self.buffer_pool.clone()
+    }
+
+    pub fn take_device_stats(&mut self) -> DeviceStats {
+        let (rx_queue_len, tx_queue_len) = self.device.queue_lengths();
+        let (rx_drops, tx_drops) = self.device.take_drop_counts();
+        DeviceStats {
+            rx_queue_len,
+            tx_queue_len,
+            rx_drops,
+            tx_drops,
+        }
     }
 
     fn local_addr_for_remote(&self, remote_ip: IpAddress) -> Result<IpAddress, StackError> {

@@ -3,6 +3,20 @@ use crate::core::crypto;
 use crate::net::{proxy, tunnel};
 use std::net::SocketAddr;
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -92,6 +106,8 @@ pub async fn run_socks_server(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    let perf_enabled = env_bool("USQUE_PERF", false);
+    let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
 
     let cfg = Config::load(&config_path)?;
     println!("Config loaded from {}", config_path);
@@ -164,6 +180,8 @@ pub async fn run_socks_server(
         wg_private_key: None,
         wg_peer_public_key: None,
         wg_client_id: None,
+        perf_enabled,
+        perf_interval_secs,
     };
 
     let available = std::thread::available_parallelism()
@@ -230,6 +248,8 @@ pub async fn run_socks_server_wg(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    let perf_enabled = env_bool("USQUE_PERF", false);
+    let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
 
     let wg_cfg = WgConfig::load(&config_path)?;
     println!("WireGuard config loaded from {}", config_path);
@@ -280,6 +300,8 @@ pub async fn run_socks_server_wg(
         wg_private_key: Some(private_key),
         wg_peer_public_key: Some(peer_public_key),
         wg_client_id: Some(client_id),
+        perf_enabled,
+        perf_interval_secs,
     };
 
     let available = std::thread::available_parallelism()

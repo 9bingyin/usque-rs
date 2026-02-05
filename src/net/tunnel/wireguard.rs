@@ -155,10 +155,11 @@ impl WgTunnel {
     /// Synchronously decrypt an incoming WG packet and inject IP payload into smoltcp.
     /// WG control responses (handshake, cookie) are queued in send_queue for batch sending.
     /// Call drain_queued_to_send_queue() + flush_send_queue() after processing a batch.
-    pub fn decrypt_incoming(&mut self, mut data: BytesMut, stack: &mut NetworkStack) {
-        strip_reserved(&mut data);
+    pub fn decrypt_incoming(&mut self, data: &mut BytesMut, stack: &mut NetworkStack) {
+        strip_reserved(data.as_mut());
 
-        let packet = Packet::from_bytes(data);
+        let packet_buf = data.split();
+        let packet = Packet::from_bytes(packet_buf);
         let wg_kind = match packet.try_into_wg() {
             Ok(wg) => wg,
             Err(e) => {
