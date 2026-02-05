@@ -22,6 +22,14 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::net::tunnel::quic::CongestionControl;
 
+/// Format IpAddress for logging (IPv6 uses bracket notation)
+fn format_ip(ip: IpAddress) -> String {
+    match ip {
+        IpAddress::Ipv4(v4) => format!("{}", v4),
+        IpAddress::Ipv6(v6) => format!("[{}]", v6),
+    }
+}
+
 include!("manager/backoff.rs");
 
 // Connection parameters for establishing and reconnecting tunnel

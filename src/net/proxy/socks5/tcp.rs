@@ -1,5 +1,5 @@
 use super::{
-    interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
+    format_ip_addr, interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
     CONNECTION_ATTEMPT_DELAY, CONNECT_TIMEOUT, IDLE_TIMEOUT, TCP_READ_BUFFER_SIZE,
 };
 use super::{Socks5Error, get_local_port};
@@ -31,7 +31,7 @@ pub(crate) async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
                 Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
             })?;
             let sorted = interleave_addresses(ips);
-            log::debug!("resolved [{}]", sorted.iter().map(|ip| format!("{:?}", ip)).collect::<Vec<_>>().join(", "));
+            log::debug!("resolved [{}]", sorted.iter().map(|ip| format_ip_addr(*ip)).collect::<Vec<_>>().join(", "));
             (sorted, *port)
         }
     };
@@ -100,7 +100,7 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
         return Err(err);
     }
 
-    log::info!("outbound connection to {:?}:{}", remote_ip, remote_port);
+    log::info!("outbound connection to {}:{}", format_ip_addr(remote_ip), remote_port);
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut stream = proto.reply_success(reply_addr).await?;
     let result = forward_tcp_data(&mut stream, channels).await;
@@ -129,11 +129,11 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
     if let Some(ip) = addr_iter.next() {
         match start_connection(&manager, ip, remote_port).await {
             Ok(channels) => {
-                log::debug!("started connection to {:?}", ip);
+                log::debug!("started connection to {}", format_ip_addr(ip));
                 pending.push((channels.handle, channels));
             }
             Err(e) => {
-                log::debug!("connection failed to {:?}: {}", ip, e);
+                log::debug!("connection failed to {}: {}", format_ip_addr(ip), e);
                 last_error = Some(e);
             }
         }
@@ -262,7 +262,7 @@ async fn race_connections_event_driven(
             // Start next connection after delay (RFC 8305: 250ms)
             _ = &mut next_attempt, if has_more_addresses => {
                 if let Some(ip) = addr_iter.next() {
-                    log::debug!("started connection to {:?}", ip);
+                    log::debug!("started connection to {}", format_ip_addr(ip));
                     match start_connection(manager, ip, remote_port).await {
                         Ok(channels) => {
                             let handle = channels.handle;
@@ -278,7 +278,7 @@ async fn race_connections_event_driven(
                             });
                         }
                         Err(e) => {
-                            log::debug!("connection failed to {:?}: {}", ip, e);
+                            log::debug!("connection failed to {}: {}", format_ip_addr(ip), e);
                             *last_error = Some(e);
                         }
                     }

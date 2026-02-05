@@ -110,11 +110,11 @@ pub async fn run_socks_server(
     let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
 
     let cfg = Config::load(&config_path)?;
-    println!("Config loaded from {}", config_path);
+    log::debug!("config loaded from {}", config_path);
 
     let signing_key = cfg.get_signing_key()?;
     let (cert_der, key_der) = crypto::generate_self_signed_cert(&signing_key)?;
-    println!("Generated self-signed certificate");
+    log::debug!("self-signed certificate generated");
 
     let endpoint_raw = if !cfg.endpoint_v4.trim().is_empty() {
         cfg.endpoint_v4.as_str()
@@ -131,8 +131,7 @@ pub async fn run_socks_server(
     } else {
         return Err(format!("Invalid endpoint address: {}", endpoint_raw).into());
     };
-    println!("Will connect to endpoint: {}", endpoint);
-    println!("Using SNI: {}", sni);
+    log::debug!("endpoint: {}, SNI: {}", endpoint, sni);
 
     let endpoint_pub_key = if cfg.endpoint_pub_key.trim().is_empty() {
         return Err("Endpoint public key is required for security".into());
@@ -142,11 +141,11 @@ pub async fn run_socks_server(
 
     // Parse DNS servers
     let dns_addrs = tunnel::dns::parse_dns_servers(&dns_servers)?;
-    println!("Using DNS servers: {:?}", dns_servers);
+    log::debug!("DNS servers: {}", dns_servers.join(", "));
 
     // Parse congestion control algorithm
     let cc: tunnel::CongestionControl = congestion_control.parse().map_err(|e: String| e)?;
-    println!("Using congestion control: {}", cc);
+    log::debug!("congestion control: {}", cc);
 
     let keepalive_ms = keepalive.saturating_mul(1000);
     if keepalive_ms >= quic_idle_timeout_ms {
@@ -194,13 +193,12 @@ pub async fn run_socks_server(
     };
 
     let tunnel_pool = Arc::new(tunnel::TunnelManagerPool::new(params, worker_count));
-    println!("Tunnel manager pool started (workers: {})", worker_count);
+    log::debug!("tunnel pool started (workers: {})", worker_count);
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
 
     let server = match (username, password) {
         (Some(user), Some(pass)) => {
-            println!("SOCKS5 authentication enabled");
             proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
         }
         (Some(_), None) => {
@@ -208,8 +206,6 @@ pub async fn run_socks_server(
         }
         _ => proxy::Socks5Server::new(addr, tunnel_pool),
     };
-
-    println!("Starting SOCKS5 server on {}:{}", bind, port);
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
@@ -252,7 +248,7 @@ pub async fn run_socks_server_wg(
     let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
 
     let wg_cfg = WgConfig::load(&config_path)?;
-    println!("WireGuard config loaded from {}", config_path);
+    log::debug!("config loaded from {}", config_path);
 
     let private_key = wg_cfg.get_private_key_bytes()?;
     let peer_public_key = wg_cfg.get_peer_public_key_bytes()?;
@@ -264,11 +260,8 @@ pub async fn run_socks_server_wg(
     }
     let keepalive = wg_cfg.keepalive as u64;
 
-    println!("Will connect to WG endpoint: {}", endpoint);
-    println!(
-        "Client ID (reserved): [{}, {}, {}]",
-        client_id[0], client_id[1], client_id[2]
-    );
+    log::debug!("endpoint: {}", endpoint);
+    log::trace!("client_id: [{}, {}, {}]", client_id[0], client_id[1], client_id[2]);
 
     // Use DNS from config if CLI didn't override defaults,
     // otherwise use the CLI-provided DNS servers
@@ -277,7 +270,7 @@ pub async fn run_socks_server_wg(
     } else {
         tunnel::dns::parse_dns_servers(&dns_servers)?
     };
-    println!("Using DNS servers: {:?}", dns_addrs);
+    log::debug!("DNS servers: {:?}", dns_addrs);
 
     let wg_mtu = if mtu == 0 { wg_cfg.mtu } else { mtu };
 
@@ -314,13 +307,12 @@ pub async fn run_socks_server_wg(
     };
 
     let tunnel_pool = Arc::new(tunnel::TunnelManagerPool::new(params, worker_count));
-    println!("WireGuard tunnel manager pool started (workers: {})", worker_count);
+    log::debug!("tunnel pool started (workers: {})", worker_count);
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
 
     let server = match (username, password) {
         (Some(user), Some(pass)) => {
-            println!("SOCKS5 authentication enabled");
             proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
         }
         (Some(_), None) => {
@@ -328,8 +320,6 @@ pub async fn run_socks_server_wg(
         }
         _ => proxy::Socks5Server::new(addr, tunnel_pool),
     };
-
-    println!("Starting SOCKS5 server (WireGuard mode) on {}:{}", bind, port);
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {

@@ -12,29 +12,29 @@ pub async fn register_device(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use base64::Engine;
 
-    println!("Registering new device...");
+    log::info!("registering new device...");
     if jwt.is_some() {
-        println!("Using ZeroTrust authentication");
+        log::info!("using ZeroTrust authentication");
     }
 
     let client = CloudflareClient::new();
 
     // Step 1: Register with random WG key
     let account = client.register(model, locale, jwt).await?;
-    println!("Account created: {}", account.id);
+    log::info!("account created: {}", account.id);
 
     let token = account.token.clone().ok_or("No token in response")?;
 
     // Step 2: Generate ECDSA key pair
     let key_pair = crypto::generate_ec_key_pair()?;
-    println!("Generated ECDSA key pair");
+    log::info!("ECDSA key pair generated");
 
     // Step 3: Enroll MASQUE key
     let name = device_name.unwrap_or("usque-rs");
     let updated = client
         .enroll_key(&account.id, &token, &key_pair.public_key_der, Some(name))
         .await?;
-    println!("MASQUE key enrolled");
+    log::info!("MASQUE key enrolled");
 
     // Step 4: Build and save config
     let endpoint_v4 = updated
@@ -103,7 +103,7 @@ pub async fn register_device(
     };
 
     cfg.save(config_path)?;
-    println!("Config saved to {}", config_path);
+    log::info!("config saved to {}", config_path);
 
     Ok(())
 }
@@ -117,21 +117,21 @@ pub async fn register_wg_device(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use base64::Engine;
 
-    println!("Registering new WireGuard device...");
+    log::info!("registering new WireGuard device...");
     if jwt.is_some() {
-        println!("Using ZeroTrust authentication");
+        log::info!("using ZeroTrust authentication");
     }
 
     // Step 1: Generate Curve25519 key pair
     let wg_keys = crypto::generate_wg_key_pair()?;
-    println!("Generated WireGuard key pair");
+    log::info!("WireGuard key pair generated");
 
     // Step 2: Register with real WG public key
     let client = CloudflareClient::new();
     let account = client
         .register_wg(&wg_keys.public_key_base64, model, locale, jwt)
         .await?;
-    println!("Account created: {}", account.id);
+    log::info!("account created: {}", account.id);
 
     let token = account.token.clone().ok_or("No token in response")?;
 
@@ -224,13 +224,13 @@ pub async fn register_wg_device(
     };
 
     wg_cfg.save(config_path)?;
-    println!("WireGuard config saved to {}", config_path);
+    log::info!("config saved to {}", config_path);
 
     // Print reserved value for reference
     let client_id_bytes = base64::engine::general_purpose::STANDARD
         .decode(&client_id)
         .unwrap_or_default();
-    println!("reserved: {:?} (base64: {})", client_id_bytes, client_id);
+    log::debug!("reserved: {:?} (base64: {})", client_id_bytes, client_id);
 
     Ok(())
 }

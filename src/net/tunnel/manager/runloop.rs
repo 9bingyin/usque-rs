@@ -209,7 +209,11 @@ impl TunnelManager {
             params.mtu as usize
         };
         log::info!("WireGuard tunnel established, MTU {}", mtu);
-        log::info!("client IPv4: {}, IPv6: {:?}", params.ipv4, params.ipv6);
+        if let Some(ref v6) = params.ipv6 {
+            log::info!("client IP: {}, {}", params.ipv4, v6);
+        } else {
+            log::info!("client IP: {}", params.ipv4);
+        }
 
         let ipv4 = if params.ipv4.trim().is_empty() {
             None
@@ -777,7 +781,7 @@ impl TunnelManager {
             } => {
                 // Check cache first
                 if let Some(ip) = dns_cache_get(&state.dns_cache, &domain, prefer_ipv6) {
-                    log::debug!("DNS cached: {} -> {:?}", domain, ip);
+                    log::debug!("DNS cached: {} -> {}", domain, format_ip(ip));
                     if response.send(Ok(ip)).is_err() {
                         log::trace!("DNS response dropped: receiver closed");
                     }
@@ -1496,11 +1500,11 @@ impl TunnelManager {
             let result = match group.prefer_ipv6 {
                 true => match (&group.ipv6_result, &group.ipv4_result) {
                     (Some(Ok(v6_records)), _) if !v6_records.is_empty() => {
-                        log::info!("DNS resolved: {} -> {:?}", group.domain, v6_records[0].address);
+                        log::info!("DNS resolved: {} -> {}", group.domain, format_ip(v6_records[0].address));
                         Some(Ok(v6_records[0].address))
                     }
                     (_, Some(Ok(v4_records))) if !v4_records.is_empty() => {
-                        log::info!("DNS resolved: {} -> {:?}", group.domain, v4_records[0].address);
+                        log::info!("DNS resolved: {} -> {}", group.domain, format_ip(v4_records[0].address));
                         Some(Ok(v4_records[0].address))
                     }
                     (Some(_), Some(_)) => {
@@ -1516,11 +1520,11 @@ impl TunnelManager {
                 },
                 false => match (&group.ipv4_result, &group.ipv6_result) {
                     (Some(Ok(v4_records)), _) if !v4_records.is_empty() => {
-                        log::info!("DNS resolved: {} -> {:?}", group.domain, v4_records[0].address);
+                        log::info!("DNS resolved: {} -> {}", group.domain, format_ip(v4_records[0].address));
                         Some(Ok(v4_records[0].address))
                     }
                     (_, Some(Ok(v6_records))) if !v6_records.is_empty() => {
-                        log::info!("DNS resolved: {} -> {:?}", group.domain, v6_records[0].address);
+                        log::info!("DNS resolved: {} -> {}", group.domain, format_ip(v6_records[0].address));
                         Some(Ok(v6_records[0].address))
                     }
                     (Some(_), Some(_)) => {
@@ -1580,7 +1584,7 @@ impl TunnelManager {
                     log::info!(
                         "DNS resolved: {} -> [{}]",
                         group.domain,
-                        all_ips.iter().map(|ip| format!("{:?}", ip)).collect::<Vec<_>>().join(", ")
+                        all_ips.iter().map(|ip| format_ip(*ip)).collect::<Vec<_>>().join(", ")
                     );
                     if response_all.send(Ok(all_ips)).is_err() {
                         log::trace!("DNS response dropped: receiver closed");

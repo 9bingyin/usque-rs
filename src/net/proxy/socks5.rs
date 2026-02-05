@@ -254,3 +254,11 @@ fn format_target_addr(target: &fast_socks5::util::target_addr::TargetAddr) -> St
         TargetAddr::Domain(domain, port) => format!("{}:{}", domain, port),
     }
 }
+
+/// Format smoltcp IpAddress for logging (IPv6 uses bracket notation)
+fn format_ip_addr(ip: IpAddress) -> String {
+    match ip {
+        IpAddress::Ipv4(v4) => format!("{}", v4),
+        IpAddress::Ipv6(v6) => format!("[{}]", v6),
+    }
+}

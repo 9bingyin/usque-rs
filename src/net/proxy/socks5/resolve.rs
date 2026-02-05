@@ -1,4 +1,4 @@
-use super::{Socks5Error, std_ip_to_smoltcp};
+use super::{format_ip_addr, Socks5Error, std_ip_to_smoltcp};
 use crate::net::tunnel::manager::TunnelManager;
 use fast_socks5::util::target_addr::TargetAddr;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
@@ -11,11 +11,11 @@ pub(crate) async fn resolve_target_addr(
     match target {
         TargetAddr::Ip(addr) => Ok((std_ip_to_smoltcp(addr.ip()), addr.port())),
         TargetAddr::Domain(domain, port) => {
-            log::debug!("Resolving {} through tunnel", domain);
+            log::debug!("resolving {} through tunnel", domain);
             let ip = manager.resolve(domain, true).await.map_err(|e| {
                 Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
             })?;
-            log::debug!("Resolved {} -> {:?}", domain, ip);
+            log::debug!("resolved {} -> {}", domain, format_ip_addr(ip));
             Ok((ip, *port))
         }
     }

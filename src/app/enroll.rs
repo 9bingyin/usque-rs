@@ -10,15 +10,15 @@ pub async fn enroll_device(
     use base64::Engine;
     use p256::pkcs8::EncodePublicKey;
 
-    println!("Enrolling device key...");
+    log::info!("enrolling device key...");
 
     // Load existing config
     let cfg = Config::load(config_path)?;
-    println!("Config loaded from {}", config_path);
+    log::debug!("config loaded from {}", config_path);
 
     // Get or regenerate key pair
     let (private_key_der, public_key_der) = if regen_key {
-        println!("Regenerating key pair...");
+        log::info!("regenerating key pair...");
         let key_pair = crypto::generate_ec_key_pair()?;
         (key_pair.private_key_der, key_pair.public_key_der)
     } else {
@@ -37,7 +37,7 @@ pub async fn enroll_device(
     let updated = client
         .enroll_key(&cfg.id, &cfg.access_token, &public_key_der, device_name)
         .await?;
-    println!("MASQUE key enrolled");
+    log::info!("MASQUE key enrolled");
 
     // Build updated config
     let endpoint_v4 = updated
@@ -113,7 +113,7 @@ pub async fn enroll_device(
     };
 
     new_cfg.save(config_path)?;
-    println!("Config saved to {}", config_path);
+    log::info!("config saved to {}", config_path);
 
     Ok(())
 }
