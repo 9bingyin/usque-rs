@@ -1055,7 +1055,7 @@ impl TunnelManager {
         );
         udp_ports.push(local_port);
 
-        log::info!("UDP session registered on port {}", local_port);
+        log::debug!("UDP session registered on port {}", local_port);
         if response.send(Ok(rx)).is_err() {
             log::trace!("UDP register response dropped: receiver closed");
         }
@@ -1087,7 +1087,7 @@ impl TunnelManager {
     ) {
         if let Some(session) = udp_sessions.remove(&local_port) {
             stack.remove_socket(session.handle);
-            log::info!("UDP session closed on port {}", local_port);
+            log::debug!("UDP session closed on port {}", local_port);
         }
         udp_ports.retain(|p| *p != local_port);
     }
@@ -1701,7 +1701,7 @@ impl TunnelManager {
         for port in &stale_ports {
             if let Some(session) = state.udp_sessions.remove(port) {
                 state.stack.remove_socket(session.handle);
-                log::info!("UDP session expired on port {}", port);
+                log::debug!("UDP session expired on port {}", port);
             }
         }
         if !stale_ports.is_empty() {

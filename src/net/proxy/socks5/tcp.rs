@@ -100,7 +100,7 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
         return Err(err);
     }
 
-    log::info!("outbound connection to {}:{}", format_ip_addr(remote_ip), remote_port);
+    log::debug!("connected to {}:{}", format_ip_addr(remote_ip), remote_port);
     let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut stream = proto.reply_success(reply_addr).await?;
     let result = forward_tcp_data(&mut stream, channels).await;
@@ -154,7 +154,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
 
     match result {
         Ok(Ok((winner_handle, winner_channels))) => {
-            log::info!("outbound connection established (racing)");
+            log::debug!("connected (racing winner)");
             let reply_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
             let mut stream = proto.reply_success(reply_addr).await?;
             let result = forward_tcp_data(&mut stream, winner_channels).await;
@@ -339,7 +339,7 @@ pub(crate) async fn handle_tcp_bind<T: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    log::info!("TCP BIND accepted from {}", peer_addr);
+    log::debug!("BIND accepted from {}", peer_addr);
 
     // Second reply: tell client the peer address (using same format as first reply)
     // Note: In standard SOCKS5, we should send a second reply here, but fast-socks5

@@ -46,7 +46,7 @@ impl Socks5Server {
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            log::info!("inbound connection from {}", addr);
+            log::debug!("accepted connection from {}", addr);
 
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -94,16 +94,16 @@ async fn handle_client(
 
     match cmd {
         Socks5Command::TCPConnect => {
-            log::info!("inbound connection to {}", format_target_addr(&target_addr));
+            log::info!("CONNECT to {}", format_target_addr(&target_addr));
             tcp::handle_tcp_connect(proto, manager, &target_addr, client_addr).await
         }
         Socks5Command::TCPBind => {
-            log::info!("inbound BIND to {}", format_target_addr(&target_addr));
+            log::info!("BIND to {}", format_target_addr(&target_addr));
             let resolved_addr = resolve::resolve_target_addr(&manager, &target_addr).await?;
             tcp::handle_tcp_bind(proto, manager, local_addr, resolved_addr).await
         }
         Socks5Command::UDPAssociate => {
-            log::info!("inbound UDP ASSOCIATE from {}", client_addr);
+            log::info!("UDP ASSOCIATE from {}", client_addr);
             udp::handle_udp_associate(proto, manager, local_addr).await
         }
     }
