@@ -1,4 +1,4 @@
-use crate::tunnel::quic::{QuicConnection, QuicError};
+use crate::net::tunnel::quic::{QuicConnection, QuicError};
 use quiche::h3::NameValue;
 use std::time::Duration;
 use thiserror::Error;

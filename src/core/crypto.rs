@@ -55,8 +55,7 @@ pub fn generate_wg_key_pair() -> Result<WgKeyPair, CryptoError> {
     let secret = StaticSecret::from(key_bytes);
     let public = PublicKey::from(&secret);
     let private_bytes: [u8; 32] = secret.to_bytes();
-    let public_b64 =
-        base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
+    let public_b64 = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
     Ok(WgKeyPair {
         private_key: private_bytes,
         public_key_base64: public_b64,

@@ -4,27 +4,41 @@
 
 ## 1. 项目概述
 
-usque-rs 是一个基于 Cloudflare WARP 的 MASQUE (Multiplexed Application Substrate over QUIC Encryption) 代理客户端，使用 Rust 实现。
+usque-rs 是一个基于 Cloudflare WARP 的代理客户端，支持 MASQUE 和 WireGuard 两种隧道模式，使用 Rust 实现。
 
 ### 1.1 核心功能
 
 - **SOCKS5 代理服务器**：支持 CONNECT、BIND、UDP ASSOCIATE 命令
 - **MASQUE 隧道**：通过 QUIC/HTTP3 协议与 Cloudflare 建立加密隧道
+- **WireGuard 隧道**：通过 WireGuard 协议与 Cloudflare 建立加密隧道
 - **用户态协议栈**：基于 smoltcp 实现的 TCP/IP 协议栈，无需系统权限
 - **设备注册**：与 Cloudflare API 交互，自动注册设备并获取配置
 
 ### 1.2 技术架构
 
+**MASQUE 模式**：
 ```
 SOCKS5 Client <-> SOCKS5 Server <-> smoltcp (TCP/IP) <-> MASQUE Tunnel <-> QUIC/H3 <-> Cloudflare
 ```
 
-数据流：
+**WireGuard 模式**：
+```
+SOCKS5 Client <-> SOCKS5 Server <-> smoltcp (TCP/IP) <-> WireGuard Tunnel <-> UDP <-> Cloudflare
+```
+
+数据流（MASQUE）：
 1. SOCKS5 客户端发送连接请求
 2. SOCKS5 服务器通过 TunnelManager 创建 TCP 连接
 3. smoltcp 协议栈生成 IP 包
 4. MASQUE 隧道将 IP 包封装为 HTTP/3 Datagram
 5. QUIC 连接将数据发送到 Cloudflare 服务器
+
+数据流（WireGuard）：
+1. SOCKS5 客户端发送连接请求
+2. SOCKS5 服务器通过 TunnelManager 创建 TCP 连接
+3. smoltcp 协议栈生成 IP 包
+4. WireGuard 隧道加密 IP 包
+5. UDP socket 将数据发送到 Cloudflare 服务器
 
 ---
 
@@ -50,44 +64,75 @@ SOCKS5 Client <-> SOCKS5 Server <-> smoltcp (TCP/IP) <-> MASQUE Tunnel <-> QUIC/
 | `fast-socks5` | SOCKS5 协议处理 |
 | `p256` | ECDSA 密钥操作 |
 | `boring` / `ring` | TLS/加密原语 |
+| `boringtun` | WireGuard 协议实现 |
+| `x25519-dalek` | Curve25519 密钥操作 |
 
 ---
 
 ## 3. 项目结构
 
+项目采用分层架构，按职责划分为以下模块：
+
 ```
 src/
-  main.rs          # CLI 入口，命令行参数解析
-  lib.rs           # 库入口
-  config.rs        # 配置文件管理（JSON 格式）
-  api/
-    mod.rs         # API 模块导出
-    cloudflare.rs  # Cloudflare API 客户端
-    models.rs      # API 数据模型
-  crypto/
-    mod.rs         # 加密模块导出
-    keys.rs        # 密钥生成、证书生成
-  tunnel/
-    mod.rs         # 隧道模块导出
-    quic.rs        # QUIC 连接管理（quiche）
-    masque.rs      # MASQUE 隧道（HTTP/3 CONNECT-IP）
-    stack.rs       # 用户态 TCP/IP 协议栈（smoltcp）
-    device.rs      # 虚拟网络设备
-    dns.rs         # DNS 查询与解析
-    manager.rs     # 隧道管理器（连接池、重连、数据转发）
-  proxy/
-    mod.rs         # 代理模块导出
-    socks5.rs      # SOCKS5 服务器实现
+├── main.rs              # CLI 入口
+├── lib.rs               # 库入口，导出所有公开模块
+├── app.rs               # 应用层模块入口
+├── app/
+│   ├── enroll.rs        # 设备重新登记命令
+│   ├── register.rs      # 设备注册命令（MASQUE/WireGuard）
+│   └── socks.rs         # SOCKS5 服务器启动逻辑
+├── cli.rs               # CLI 模块入口
+├── cli/
+│   └── args.rs          # clap 命令行参数定义
+├── core.rs              # 核心模块入口
+├── core/
+│   ├── config.rs        # 配置文件管理（Config, WgConfig）
+│   └── crypto.rs        # 密钥生成、证书生成
+├── infra.rs             # 基础设施模块入口
+├── infra/
+│   └── cloudflare.rs    # Cloudflare API 客户端
+│       └── models.rs    # API 数据模型（子模块）
+├── net.rs               # 网络层模块入口
+├── net/
+│   ├── proxy.rs         # 代理模块入口
+│   ├── proxy/
+│   │   └── socks5.rs    # SOCKS5 公共定义
+│   │       ├── server.rs    # SOCKS5 服务器
+│   │       ├── tcp.rs       # TCP CONNECT/BIND 处理
+│   │       ├── udp.rs       # UDP ASSOCIATE 处理
+│   │       └── resolve.rs   # 地址解析工具
+│   ├── tunnel.rs        # 隧道模块入口
+│   └── tunnel/
+│       ├── dns.rs           # DNS 查询与解析
+│       ├── masque.rs        # MASQUE 隧道（HTTP/3 CONNECT-IP）
+│       ├── quic.rs          # QUIC 连接管理
+│       ├── stack.rs         # 用户态 TCP/IP 协议栈（含 VirtualDevice）
+│       ├── wireguard.rs     # WireGuard 隧道
+│       └── manager.rs       # 隧道管理器
+│           ├── backoff.rs       # 指数退避重连（include!）
+│           ├── dns_cache.rs     # DNS 缓存（include!）
+│           └── runloop.rs       # 主运行循环（include!）
 ```
+
+### 3.1 分层说明
+
+| 层 | 目录 | 职责 |
+|----|------|------|
+| 应用层 | `app/` | CLI 命令处理，组装业务流程 |
+| CLI 层 | `cli/` | 命令行参数定义（clap） |
+| 核心层 | `core/` | 配置管理、密钥生成等核心业务逻辑 |
+| 基础设施层 | `infra/` | 外部服务交互（Cloudflare API） |
+| 网络层 | `net/` | 代理服务器、隧道实现 |
 
 ---
 
 ## 4. 核心模块规范
 
-### 4.1 tunnel/manager.rs - 隧道管理器
+### 4.1 net/tunnel/manager.rs - 隧道管理器
 
 **职责**：
-- 管理 MASQUE 隧道连接的生命周期
+- 管理 MASQUE/WireGuard 隧道连接的生命周期
 - 处理 SOCKS5 连接与隧道之间的数据转发
 - DNS 解析与缓存
 - 断线重连（指数退避 + 抖动）
@@ -100,14 +145,17 @@ src/
 | `TunnelManagerPool` | 隧道池，支持多 worker |
 | `ManagerCommand` | 命令通道消息类型 |
 | `RuntimeState` | 运行时状态（协议栈、socket 映射、DNS 缓存等）|
+| `TunnelMode` | 隧道模式枚举（Masque/Wireguard）|
+| `ConnectionParams` | 连接参数（统一 MASQUE 和 WG 配置）|
 
 **设计原则**：
 - 所有与隧道的交互通过 `ManagerCommand` 命令通道进行
 - 使用事件驱动模式而非轮询（`wait_socket_ready`）
 - DNS 查询实现 Happy Eyeballs（同时发送 A/AAAA 查询）
 - 反压控制：每个 socket 有独立的发送/接收缓冲区限制（`MAX_PENDING_DATA`）
+- 统一的运行循环：`run_loop`（MASQUE）和 `run_loop_wg`（WireGuard）
 
-### 4.2 tunnel/masque.rs - MASQUE 隧道
+### 4.2 net/tunnel/masque.rs - MASQUE 隧道
 
 **职责**：
 - 实现 Cloudflare 的 `cf-connect-ip` 协议
@@ -119,7 +167,19 @@ src/
 - `CONTEXT_ID_ZERO = 0x00` - IP 包的 Context ID（RFC 9484）
 - `MIN_MTU = 1280` - 最小 MTU
 
-### 4.3 tunnel/quic.rs - QUIC 连接
+### 4.3 net/tunnel/wireguard.rs - WireGuard 隧道
+
+**职责**：
+- WireGuard 协议实现（基于 boringtun）
+- 密钥握手与会话管理
+- IP 包加密/解密
+- Keepalive 维护
+
+**关键组件**：
+- `WgTunnel` - WireGuard 隧道封装
+- 批量加密/发送队列优化
+
+### 4.4 net/tunnel/quic.rs - QUIC 连接
 
 **职责**：
 - QUIC 连接建立与维护
@@ -131,29 +191,31 @@ src/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `idle_timeout` | 90000ms | QUIC 空闲超时 |
-| `congestion_control` | CUBIC | 拥塞控制算法 |
+| `congestion_control` | BBR2 | 拥塞控制算法 |
 | `initial_packet_size` | 1242 | 初始包大小 |
 | `enable_dgram` | true | 启用 DATAGRAM 扩展 |
 
-### 4.4 tunnel/stack.rs - 协议栈
+### 4.5 net/tunnel/stack.rs - 协议栈
 
 **职责**：
 - smoltcp 接口封装
 - TCP/UDP socket 管理
 - IP 地址配置
+- 虚拟网络设备（`VirtualDevice`）
 
 **设计原则**：
 - 使用 `valid_handles` 集合跟踪有效 socket，防止访问已移除的 socket
 - 所有 socket 操作需先检查 handle 有效性
+- 缓冲区池复用减少内存分配
 
-### 4.5 proxy/socks5.rs - SOCKS5 服务器
+### 4.6 net/proxy/socks5/ - SOCKS5 服务器
 
-**职责**：
-- SOCKS5 协议握手与认证
-- TCP CONNECT 命令处理
-- TCP BIND 命令处理
-- UDP ASSOCIATE 命令处理
-- 数据转发
+**文件结构**：
+- `socks5.rs` - 公共定义、常量、工具函数
+- `server.rs` - 服务器主循环、连接处理
+- `tcp.rs` - TCP CONNECT/BIND 命令处理
+- `udp.rs` - UDP ASSOCIATE 命令处理
+- `resolve.rs` - 地址解析工具
 
 **关键参数**：
 
@@ -164,10 +226,24 @@ src/
 | `CONNECTION_ATTEMPT_DELAY` | 250ms | Happy Eyeballs 连接间隔 |
 
 **Happy Eyeballs 实现**（RFC 8305）：
-- 解析域名时同时获取所有地址
-- IPv6/IPv4 地址交错排序
+- 解析域名时同时获取所有地址（`resolve_all`）
+- IPv6/IPv4 地址交错排序（`interleave_addresses`）
 - 并发连接尝试，间隔 250ms
+- 事件驱动：使用 `wait_socket_ready` 而非轮询
 - 首个成功连接获胜，关闭其他连接
+
+### 4.7 core/config.rs - 配置管理
+
+**配置类型**：
+- `Config` - MASQUE 模式配置（JSON 格式）
+- `WgConfig` - WireGuard 模式配置（INI 格式）
+
+### 4.8 infra/cloudflare.rs - Cloudflare API
+
+**职责**：
+- 设备注册（MASQUE/WireGuard）
+- 密钥登记（enroll）
+- API 数据模型（`models.rs` 子模块）
 
 ---
 
@@ -241,6 +317,7 @@ src/
 
 - **禁止创建 `mod.rs`** - 使用 `src/some_module.rs` 而非 `src/some_module/mod.rs`
 - 新建 crate 时，在 `Cargo.toml` 中使用 `[lib] path = "..."` 指定库入口文件，而非默认的 `lib.rs`
+- **`include!` 宏的使用**：在大型模块（如 `manager.rs`）中，可使用 `include!` 将逻辑拆分到子文件以保持可读性。这些子文件不是独立模块，而是被包含到父文件中编译
 
 ---
 
@@ -248,7 +325,7 @@ src/
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `USQUE_CC` | `cubic` | 拥塞控制算法（reno/cubic/bbr2）|
+| `USQUE_CC` | `bbr2` | 拥塞控制算法（reno/cubic/bbr2）|
 | `USQUE_TCP_BUFFER_SIZE` | `65536` | TCP 缓冲区大小（字节）|
 | `USQUE_QUIC_IDLE_TIMEOUT_MS` | `90000` | QUIC 空闲超时（毫秒）|
 | `USQUE_TUNNEL_WORKERS` | `1` | 隧道 worker 数量 |
@@ -285,6 +362,7 @@ src/
 
 - 使用事件驱动而非轮询检查 socket 状态
 - 批量读取 TCP 数据（`MAX_TCP_READ_CHUNK = 64KB`）
+- 批量读取 UDP 数据（`UDP_BATCH_READ_BUDGET = 128`）
 - 反压控制防止内存无限增长
 
 ### 8.2 DNS
@@ -292,9 +370,17 @@ src/
 - DNS 缓存（容量 1024 条）
 - 缓存条目带 TTL 过期
 - 负载均衡：随机选择缓存中的地址
+- DNS 服务器轮询选择
 
 ### 8.3 连接管理
 
 - 隧道池支持多 worker 并行处理
 - 断线重连使用指数退避（1s - 60s）+ 抖动（50%）
-- Keepalive PING 保持连接活跃
+- Keepalive PING 保持连接活跃（MASQUE）
+- WireGuard 定时器维护会话状态
+
+### 8.4 WireGuard 优化
+
+- 批量加密 + 批量发送两阶段模型
+- 增大 UDP socket 缓冲区（4MB recv / 2MB send）
+- 同步解密 incoming 路径减少延迟

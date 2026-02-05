@@ -1,8 +1,10 @@
-use crate::api::models::*;
-use crate::crypto::{generate_random_serial, generate_random_wg_pubkey, time_as_cf_string};
+use crate::core::crypto::{generate_random_serial, generate_random_wg_pubkey, time_as_cf_string};
+use crate::infra::cloudflare::models::*;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::time::Duration;
 use thiserror::Error;
+
+pub mod models;
 
 pub const API_URL: &str = "https://api.cloudflareclient.com";
 pub const API_VERSION: &str = "v0a4471";
@@ -114,8 +116,7 @@ impl CloudflareClient {
         locale: &str,
         jwt: Option<&str>,
     ) -> Result<AccountData, ApiClientError> {
-        let serial =
-            generate_random_serial().map_err(|e| ApiClientError::Crypto(e.to_string()))?;
+        let serial = generate_random_serial().map_err(|e| ApiClientError::Crypto(e.to_string()))?;
 
         let registration = Registration {
             key: wg_public_key.to_string(),
