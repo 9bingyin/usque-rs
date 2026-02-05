@@ -117,7 +117,7 @@ pub enum SocksMode {
         #[arg(
             short,
             long,
-            default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()]
+            default_values_t = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
         )]
         dns: Vec<String>,
         /// MTU
@@ -158,7 +158,7 @@ pub enum SocksMode {
         #[arg(
             short,
             long,
-            default_values_t = vec!["9.9.9.10".to_string(), "149.112.112.10".to_string()]
+            default_values_t = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
         )]
         dns: Vec<String>,
         /// MTU

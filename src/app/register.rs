@@ -27,14 +27,14 @@ pub async fn register_device(
 
     // Step 2: Generate ECDSA key pair
     let key_pair = crypto::generate_ec_key_pair()?;
-    log::info!("ECDSA key pair generated");
+    log::debug!("ECDSA key pair generated");
 
     // Step 3: Enroll MASQUE key
     let name = device_name.unwrap_or("usque-rs");
     let updated = client
         .enroll_key(&account.id, &token, &key_pair.public_key_der, Some(name))
         .await?;
-    log::info!("MASQUE key enrolled");
+    log::debug!("MASQUE key enrolled");
 
     // Step 4: Build and save config
     let endpoint_v4 = updated
@@ -103,7 +103,8 @@ pub async fn register_device(
     };
 
     cfg.save(config_path)?;
-    log::info!("config saved to {}", config_path);
+    log::debug!("config saved to {}", config_path);
+    log::info!("registration successful");
 
     Ok(())
 }
@@ -124,7 +125,7 @@ pub async fn register_wg_device(
 
     // Step 1: Generate Curve25519 key pair
     let wg_keys = crypto::generate_wg_key_pair()?;
-    log::info!("WireGuard key pair generated");
+    log::debug!("WireGuard key pair generated");
 
     // Step 2: Register with real WG public key
     let client = CloudflareClient::new();
@@ -224,7 +225,8 @@ pub async fn register_wg_device(
     };
 
     wg_cfg.save(config_path)?;
-    log::info!("config saved to {}", config_path);
+    log::debug!("config saved to {}", config_path);
+    log::info!("registration successful");
 
     // Print reserved value for reference
     let client_id_bytes = base64::engine::general_purpose::STANDARD

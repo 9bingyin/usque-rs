@@ -20,7 +20,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            log::error!("Failed to install Ctrl+C handler: {}", e);
+            log::error!("failed to install Ctrl+C handler: {}", e);
         }
     };
 
@@ -31,7 +31,7 @@ async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(e) => {
-                log::error!("Failed to install SIGTERM handler: {}", e);
+                log::error!("failed to install SIGTERM handler: {}", e);
             }
         }
     };
@@ -141,7 +141,6 @@ pub async fn run_socks_server(
 
     // Parse DNS servers
     let dns_addrs = tunnel::dns::parse_dns_servers(&dns_servers)?;
-    log::debug!("DNS servers: {}", dns_servers.join(", "));
 
     // Parse congestion control algorithm
     let cc: tunnel::CongestionControl = congestion_control.parse().map_err(|e: String| e)?;
@@ -150,7 +149,7 @@ pub async fn run_socks_server(
     let keepalive_ms = keepalive.saturating_mul(1000);
     if keepalive_ms >= quic_idle_timeout_ms {
         log::warn!(
-            "Keepalive period {}ms >= QUIC idle timeout {}ms; connection may time out",
+            "keepalive period {}ms >= QUIC idle timeout {}ms; connection may time out",
             keepalive_ms,
             quic_idle_timeout_ms
         );
@@ -197,6 +196,7 @@ pub async fn run_socks_server(
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
 
+    let has_auth = username.is_some();
     let server = match (username, password) {
         (Some(user), Some(pass)) => {
             proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
@@ -206,14 +206,23 @@ pub async fn run_socks_server(
         }
         _ => proxy::Socks5Server::new(addr, tunnel_pool),
     };
+
+    log::info!("starting SOCKS5 proxy on {} (masque mode)", addr);
+    if has_auth {
+        log::info!("SOCKS5 authentication: enabled");
+    } else {
+        log::info!("SOCKS5 authentication: disabled");
+    }
+    log::info!("DNS servers: {}", dns_servers.join(", "));
+
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
-                log::error!("Server error: {}", e);
+                log::error!("server error: {}", e);
             }
         }
         _ = shutdown_signal() => {
-            log::info!("Shutdown signal received, exiting");
+            log::info!("shutdown signal received, exiting");
         }
     }
 
@@ -255,7 +264,7 @@ pub async fn run_socks_server_wg(
     let client_id = wg_cfg.get_client_id_bytes()?;
     let mut endpoint = wg_cfg.get_endpoint_addr()?;
     if endpoint.port() == 0 {
-        log::warn!("Endpoint port is 0, using default WG port 2408");
+        log::warn!("endpoint port is 0, using default WG port 2408");
         endpoint.set_port(2408);
     }
     let keepalive = wg_cfg.keepalive as u64;
@@ -263,14 +272,14 @@ pub async fn run_socks_server_wg(
     log::debug!("endpoint: {}", endpoint);
     log::trace!("client_id: [{}, {}, {}]", client_id[0], client_id[1], client_id[2]);
 
-    // Use DNS from config if CLI didn't override defaults,
-    // otherwise use the CLI-provided DNS servers
-    let dns_addrs = if !wg_cfg.dns.trim().is_empty() {
-        tunnel::dns::parse_dns_servers(std::slice::from_ref(&wg_cfg.dns))?
+    // Use DNS from config if available, otherwise use CLI-provided servers
+    let (dns_addrs, dns_display) = if !wg_cfg.dns.trim().is_empty() {
+        let addrs = tunnel::dns::parse_dns_servers(std::slice::from_ref(&wg_cfg.dns))?;
+        (addrs, wg_cfg.dns.clone())
     } else {
-        tunnel::dns::parse_dns_servers(&dns_servers)?
+        let addrs = tunnel::dns::parse_dns_servers(&dns_servers)?;
+        (addrs, dns_servers.join(", "))
     };
-    log::debug!("DNS servers: {:?}", dns_addrs);
 
     let wg_mtu = if mtu == 0 { wg_cfg.mtu } else { mtu };
 
@@ -311,6 +320,7 @@ pub async fn run_socks_server_wg(
 
     let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
 
+    let has_auth = username.is_some();
     let server = match (username, password) {
         (Some(user), Some(pass)) => {
             proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
@@ -320,14 +330,23 @@ pub async fn run_socks_server_wg(
         }
         _ => proxy::Socks5Server::new(addr, tunnel_pool),
     };
+
+    log::info!("starting SOCKS5 proxy on {} (wireguard mode)", addr);
+    if has_auth {
+        log::info!("SOCKS5 authentication: enabled");
+    } else {
+        log::info!("SOCKS5 authentication: disabled");
+    }
+    log::info!("DNS servers: {}", dns_display);
+
     tokio::select! {
         result = server.run() => {
             if let Err(e) = result {
-                log::error!("Server error: {}", e);
+                log::error!("server error: {}", e);
             }
         }
         _ = shutdown_signal() => {
-            log::info!("Shutdown signal received, exiting");
+            log::info!("shutdown signal received, exiting");
         }
     }
 

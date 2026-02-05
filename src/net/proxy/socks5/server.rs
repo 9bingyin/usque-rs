@@ -38,11 +38,8 @@ impl Socks5Server {
 
     pub async fn run(&self) -> Result<(), Socks5Error> {
         let listener = TcpListener::bind(self.bind_addr).await?;
-        log::info!("started SOCKS5 server on {}", self.bind_addr);
-        if self.auth.is_some() {
-            log::info!("SOCKS5 authentication enabled");
-        }
-        log::info!("max concurrent connections: {}", max_concurrent_connections());
+        log::debug!("TCP listener bound on {}", self.bind_addr);
+        log::debug!("max concurrent connections: {}", max_concurrent_connections());
 
         let max_conns = max_concurrent_connections();
         let semaphore = Arc::new(Semaphore::new(max_conns));
