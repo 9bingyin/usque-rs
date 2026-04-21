@@ -99,6 +99,22 @@ impl MasqueTunnel {
         let socket = UdpSocket::from_std(std_socket)?;
         let socket: TokioQuicSocket<Arc<UdpSocket>, Arc<UdpSocket>> =
             TokioQuicSocket::<Arc<UdpSocket>, Arc<UdpSocket>>::from_udp(socket)?;
+        #[cfg(target_os = "linux")]
+        let socket = {
+            let mut socket = socket;
+            let apply_max_capabilities = std::env::var("USQUE_QUIC_APPLY_MAX_CAPABILITIES")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(true);
+            if apply_max_capabilities {
+                socket.apply_max_capabilities();
+                log::debug!(
+                    "tokio-quiche socket capabilities: {:?}",
+                    socket.capabilities
+                );
+            }
+            socket
+        };
         let socket_ref = socket.send.clone();
         let local_addr = socket.local_addr;
         let peer_addr = socket.peer_addr;

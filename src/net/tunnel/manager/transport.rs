@@ -314,7 +314,7 @@ impl TunnelManager {
                 Self::handle_incoming_datagram(tunnel, state, incoming)
             }
             TransportIoEvent::QuicFlush(status) => {
-                state.perf.record_quic_flush(status);
+                state.perf.record_masque_send_batch(status);
                 IncomingHandling::default()
             }
             TransportIoEvent::MasqueBlocked => {

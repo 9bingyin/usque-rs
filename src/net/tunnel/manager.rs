@@ -479,7 +479,8 @@ struct PerfCounters {
     loop_iterations: u64,
     scheduler_yields: u64,
     masque_blocked_events: u64,
-    quic_flushes: u64,
+    masque_send_batches: u64,
+    masque_send_packets: u64,
     quic_socket_blocked: u64,
     quic_send_enobufs: u64,
     quic_pacing_events: u64,
@@ -505,7 +506,8 @@ impl PerfCounters {
             loop_iterations: 0,
             scheduler_yields: 0,
             masque_blocked_events: 0,
-            quic_flushes: 0,
+            masque_send_batches: 0,
+            masque_send_packets: 0,
             quic_socket_blocked: 0,
             quic_send_enobufs: 0,
             quic_pacing_events: 0,
@@ -559,12 +561,13 @@ impl PerfCounters {
         }
     }
 
-    fn record_quic_flush(&mut self, status: QuicSendStatus) {
+    fn record_masque_send_batch(&mut self, status: QuicSendStatus) {
         if !self.enabled {
             return;
         }
         if status.packets_sent > 0 {
-            self.quic_flushes += 1;
+            self.masque_send_batches += 1;
+            self.masque_send_packets += status.packets_sent as u64;
         }
         if status.blocked {
             self.quic_socket_blocked += 1;
@@ -610,7 +613,7 @@ impl PerfCounters {
         }
         let secs = elapsed.as_secs_f64();
         log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s quic_flushes={:.0}/s quic_socket_blocked={:.0}/s quic_enobufs={:.0}/s quic_pacing={:.0}/s quic_rtt={}ms quic_cwnd={} quic_lost={} quic_pto={} quic_delivery={:.1}Mbps quic_dgram_rx={} quic_dgram_tx={} wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s masque_send_batches={:.0}/s masque_send_pkts={:.0}/s quic_socket_blocked={:.0}/s quic_enobufs={:.0}/s quic_pacing={:.0}/s quic_rtt={}ms quic_cwnd={} quic_lost={} quic_pto={} quic_delivery_est={:.1}Mbps quic_dgram_rx_total={} quic_dgram_tx_total={} wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
             self.rx_packets as f64 / secs,
             self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.tx_packets as f64 / secs,
@@ -619,7 +622,8 @@ impl PerfCounters {
             self.loop_iterations as f64 / secs,
             self.scheduler_yields as f64 / secs,
             self.masque_blocked_events as f64 / secs,
-            self.quic_flushes as f64 / secs,
+            self.masque_send_batches as f64 / secs,
+            self.masque_send_packets as f64 / secs,
             self.quic_socket_blocked as f64 / secs,
             self.quic_send_enobufs as f64 / secs,
             self.quic_pacing_events as f64 / secs,
@@ -661,7 +665,8 @@ impl PerfCounters {
         self.loop_iterations = 0;
         self.scheduler_yields = 0;
         self.masque_blocked_events = 0;
-        self.quic_flushes = 0;
+        self.masque_send_batches = 0;
+        self.masque_send_packets = 0;
         self.quic_socket_blocked = 0;
         self.quic_send_enobufs = 0;
         self.quic_pacing_events = 0;

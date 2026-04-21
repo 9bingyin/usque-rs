@@ -33,7 +33,7 @@ spki = "0.7.3"
 thiserror = "2.0.18"
 tikv-jemallocator = "0.6.1"
 tokio = { version = "1.52.1", features = ["full"] }
-tokio-quiche = { version = "0.18.0", features = ["gcongestion"] }
+tokio-quiche = { version = "0.18.0", features = ["gcongestion", "zero-copy"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 x509-cert = { version = "0.2.5", features = ["builder"] }
 gotatun = { git = "https://github.com/mullvad/gotatun", default-features = false, features = ["ring"] }
