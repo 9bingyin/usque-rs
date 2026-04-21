@@ -1,3 +1,18 @@
+struct LoopSchedule {
+    stack_poll_deadline: Option<TokioInstant>,
+    blocked_send_deadline: Option<TokioInstant>,
+    poll_deadline: Option<TokioInstant>,
+    maintenance_deadline: Option<TokioInstant>,
+    needs_socket_writable: bool,
+}
+
+#[derive(Default)]
+struct LoopSelectOutcome {
+    dirty: bool,
+    needs_transport_flush: bool,
+    should_break: bool,
+}
+
 impl TunnelManager {
     pub fn new(params: ConnectionParams) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(params.manager_tunables.cmd_channel_capacity);
@@ -426,8 +441,8 @@ impl TunnelManager {
             params.perf_enabled,
             params.perf_interval_secs,
         );
-        let poll_timer = tokio::time::sleep(Duration::from_millis(0));
-        tokio::pin!(poll_timer);
+        let mut poll_timer = Box::pin(tokio::time::sleep(Duration::from_millis(0)));
+        let mut maintenance_timer = Box::pin(tokio::time::sleep(Duration::from_millis(0)));
 
         loop {
             if !tunnel.check_alive() {
@@ -435,133 +450,37 @@ impl TunnelManager {
             }
 
             state.perf.inc_loop();
-            let stack_poll_deadline = tunnel.stack_poll_deadline(&mut state);
-            let transport_timeout_deadline =
-                tunnel.transport_timeout_deadline(state.tunables.max_poll_interval);
-            let transport_send_deadline =
-                tunnel.transport_send_deadline(state.tunables.max_poll_interval);
-            let poll_deadline = [stack_poll_deadline, transport_timeout_deadline, transport_send_deadline]
-                .into_iter()
-                .flatten()
-                .min();
-            let has_poll_timer = poll_deadline.is_some();
-            let socket = tunnel.socket();
-            let needs_socket_writable = tunnel.needs_socket_writable();
-            poll_timer.as_mut().reset(
-                poll_deadline
-                    .unwrap_or_else(|| {
-                        TokioInstant::now() + Duration::from_secs(365 * 24 * 60 * 60)
-                    }),
+            let schedule = Self::compute_loop_schedule(
+                &tunnel,
+                &mut state,
+                &mut poll_timer,
+                &mut maintenance_timer,
             );
-
-            let has_maintenance = tunnel.maintenance_deadline().is_some();
-            let maintenance_deadline = tunnel
-                .maintenance_deadline()
-                .unwrap_or_else(|| TokioInstant::now() + Duration::from_secs(365 * 24 * 60 * 60));
-            let maintenance_timer = tokio::time::sleep_until(maintenance_deadline);
-            tokio::pin!(maintenance_timer);
-
-            let mut dirty = false;
-            let mut needs_transport_flush = false;
-
-            tokio::select! {
-                biased;
-                Some(cmd) = cmd_rx.recv() => {
-                    Self::handle_command(&mut state, &params.dns_servers, params.tcp_buffer_size, cmd);
-                    dirty = true;
-                }
-
-                Some(udp_cmd) = udp_rx.recv() => {
-                    Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
-                    dirty = true;
-                }
-
-                Some(event) = incoming_task.incoming_rx.recv() => {
-                    let handled = Self::handle_transport_io_event(&mut tunnel, &mut state, event);
-                    needs_transport_flush |= handled.needs_transport_flush;
-                    dirty = true;
-                }
-
-                Some(event) = state.socket_event_rx.recv() => {
-                    Self::handle_socket_event(&mut state, event);
-                    dirty = true;
-                }
-
-                writable = socket.writable(), if needs_socket_writable => {
-                    match writable {
-                        Ok(()) => {
-                            needs_transport_flush = true;
-                        }
-                        Err(e) => {
-                            log::debug!("UDP writable wait failed: {}", e);
-                        }
-                    }
-                }
-
-                _ = &mut maintenance_timer, if has_maintenance => {
-                    Self::run_maintenance_tick(&mut tunnel, &state.tunables).await;
-                    needs_transport_flush = true;
-                }
-
-                _ = &mut poll_timer, if has_poll_timer => {
-                    let now = TokioInstant::now();
-                    let stack_due = stack_poll_deadline.is_some_and(|deadline| deadline <= now);
-                    let transport_timeout_due =
-                        transport_timeout_deadline.is_some_and(|deadline| deadline <= now);
-                    let transport_send_due =
-                        transport_send_deadline.is_some_and(|deadline| deadline <= now);
-                    if !Self::poll_active_tunnel(
-                        &mut tunnel,
-                        &mut state,
-                        stack_due,
-                        transport_timeout_due,
-                        transport_send_due,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                }
-            }
-
-            if !dirty && needs_transport_flush {
-                Self::flush_transport_side_effects(&mut tunnel, &mut state.perf).await;
-            }
-
-            if dirty {
-                if !Self::process_dirty_cycle(
-                    &mut tunnel,
-                    &mut state,
-                    cmd_rx,
-                    udp_rx,
-                    &mut incoming_task,
-                    params,
-                )
-                .await
-                {
-                    break;
-                }
-            }
-
-            if state.perf.due() {
-                let snapshot = Self::build_perf_snapshot(
-                    &mut state,
-                    &tunnel,
-                    cmd_rx.len(),
-                    udp_rx.len(),
-                    incoming_task.incoming_rx.len(),
-                );
-                state.perf.report(snapshot);
-            }
-
-            let should_yield = poll_deadline.is_some_and(|deadline| deadline <= TokioInstant::now() + Duration::from_millis(1))
-                || (dirty
-                    && (cmd_rx.len() > 0
-                        || udp_rx.len() > 0
-                        || incoming_task.incoming_rx.len() > 0));
-            if should_yield {
-                state.perf.inc_yield();
-                tokio::task::yield_now().await;
+            let outcome = Self::run_loop_select_once(
+                &mut tunnel,
+                &mut state,
+                &schedule,
+                cmd_rx,
+                udp_rx,
+                &mut incoming_task,
+                params,
+                &mut poll_timer,
+                &mut maintenance_timer,
+            )
+            .await;
+            if !Self::finish_loop_iteration(
+                &mut tunnel,
+                &mut state,
+                &schedule,
+                outcome,
+                cmd_rx,
+                udp_rx,
+                &mut incoming_task,
+                params,
+            )
+            .await
+            {
+                break;
             }
         }
 
@@ -571,11 +490,230 @@ impl TunnelManager {
         log::debug!("{} run_loop ended", mode_name);
     }
 
+    fn compute_loop_schedule(
+        tunnel: &ActiveTunnel,
+        state: &mut RuntimeState,
+        poll_timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+        maintenance_timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    ) -> LoopSchedule {
+        let stack_poll_deadline = tunnel.stack_poll_deadline(state);
+        let blocked_send_deadline = tunnel.blocked_send_deadline(state.tunables.max_poll_interval);
+        let poll_deadline = [stack_poll_deadline, blocked_send_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        let maintenance_deadline = tunnel.maintenance_deadline();
+
+        Self::reset_sleep_timer(poll_timer, poll_deadline);
+        Self::reset_sleep_timer(maintenance_timer, maintenance_deadline);
+
+        LoopSchedule {
+            stack_poll_deadline,
+            blocked_send_deadline,
+            poll_deadline,
+            maintenance_deadline,
+            needs_socket_writable: tunnel.needs_socket_writable(),
+        }
+    }
+
+    fn reset_sleep_timer(
+        timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+        deadline: Option<TokioInstant>,
+    ) {
+        timer
+            .as_mut()
+            .reset(deadline.unwrap_or_else(Self::disabled_timer_deadline));
+    }
+
+    fn disabled_timer_deadline() -> TokioInstant {
+        TokioInstant::now() + Duration::from_secs(365 * 24 * 60 * 60)
+    }
+
+    async fn run_loop_select_once(
+        tunnel: &mut ActiveTunnel,
+        state: &mut RuntimeState,
+        schedule: &LoopSchedule,
+        cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
+        udp_rx: &mut mpsc::Receiver<UdpSend>,
+        incoming_task: &mut IncomingTask,
+        params: &ConnectionParams,
+        poll_timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+        maintenance_timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    ) -> LoopSelectOutcome {
+        let socket = tunnel.socket();
+        let mut outcome = LoopSelectOutcome::default();
+
+        tokio::select! {
+            biased;
+            Some(cmd) = cmd_rx.recv() => {
+                Self::handle_command(state, &params.dns_servers, params.tcp_buffer_size, cmd);
+                outcome.dirty = true;
+            }
+
+            Some(udp_cmd) = udp_rx.recv() => {
+                Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
+                outcome.dirty = true;
+            }
+
+            Some(event) = incoming_task.incoming_rx.recv() => {
+                let handled = Self::handle_transport_io_event(tunnel, state, event);
+                outcome.needs_transport_flush |= handled.needs_transport_flush;
+                outcome.dirty = true;
+            }
+
+            Some(event) = state.socket_event_rx.recv() => {
+                Self::handle_socket_event(state, event);
+                outcome.dirty = true;
+            }
+
+            writable = socket.writable(), if schedule.needs_socket_writable => {
+                match writable {
+                    Ok(()) => {
+                        outcome.needs_transport_flush = true;
+                    }
+                    Err(e) => {
+                        log::debug!("UDP writable wait failed: {}", e);
+                    }
+                }
+            }
+
+            _ = maintenance_timer.as_mut(), if schedule.maintenance_deadline.is_some() => {
+                Self::run_maintenance_tick(tunnel, &state.tunables).await;
+                outcome.needs_transport_flush = true;
+            }
+
+            _ = poll_timer.as_mut(), if schedule.poll_deadline.is_some() => {
+                let now = TokioInstant::now();
+                let stack_due = schedule
+                    .stack_poll_deadline
+                    .is_some_and(|deadline| deadline <= now);
+                let transport_send_due = schedule
+                    .blocked_send_deadline
+                    .is_some_and(|deadline| deadline <= now);
+                if !Self::poll_active_tunnel(
+                    tunnel,
+                    state,
+                    stack_due,
+                    transport_send_due,
+                )
+                .await
+                {
+                    outcome.should_break = true;
+                }
+            }
+        }
+
+        outcome
+    }
+
+    async fn finish_loop_iteration(
+        tunnel: &mut ActiveTunnel,
+        state: &mut RuntimeState,
+        schedule: &LoopSchedule,
+        outcome: LoopSelectOutcome,
+        cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
+        udp_rx: &mut mpsc::Receiver<UdpSend>,
+        incoming_task: &mut IncomingTask,
+        params: &ConnectionParams,
+    ) -> bool {
+        if outcome.should_break {
+            return false;
+        }
+
+        if !outcome.dirty && outcome.needs_transport_flush {
+            Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
+        }
+
+        if outcome.dirty
+            && !Self::process_dirty_cycle(
+                tunnel,
+                state,
+                cmd_rx,
+                udp_rx,
+                incoming_task,
+                params,
+            )
+            .await
+        {
+            return false;
+        }
+
+        if state.perf.due() {
+            let snapshot = Self::build_perf_snapshot(
+                state,
+                tunnel,
+                cmd_rx.len(),
+                udp_rx.len(),
+                incoming_task.incoming_rx.len(),
+            );
+            state.perf.report(snapshot);
+        }
+
+        if Self::should_yield(
+            schedule,
+            outcome.dirty,
+            cmd_rx.len(),
+            udp_rx.len(),
+            incoming_task.incoming_rx.len(),
+        ) {
+            state.perf.inc_yield();
+            tokio::task::yield_now().await;
+        }
+
+        true
+    }
+
+    fn should_yield(
+        schedule: &LoopSchedule,
+        dirty: bool,
+        cmd_queue_len: usize,
+        udp_queue_len: usize,
+        incoming_queue_len: usize,
+    ) -> bool {
+        let now = TokioInstant::now();
+        schedule.poll_deadline.is_some_and(|deadline| deadline <= now)
+            || schedule
+                .maintenance_deadline
+                .is_some_and(|deadline| deadline <= now)
+            || (dirty && (cmd_queue_len > 0 || udp_queue_len > 0 || incoming_queue_len > 0))
+    }
+
     fn reported_load(&self) -> ManagerLoadSnapshot {
         self.stats.snapshot()
     }
 
     fn try_reserve_tcp_slot(&self) -> bool {
         self.stats.try_reserve_tcp_slot()
+    }
+}
+
+#[cfg(test)]
+mod runloop_tests {
+    use super::*;
+
+    #[test]
+    fn should_yield_when_deadline_is_overdue() {
+        let schedule = LoopSchedule {
+            stack_poll_deadline: None,
+            blocked_send_deadline: None,
+            poll_deadline: Some(TokioInstant::now()),
+            maintenance_deadline: None,
+            needs_socket_writable: false,
+        };
+
+        assert!(TunnelManager::should_yield(&schedule, false, 0, 0, 0));
+    }
+
+    #[test]
+    fn should_not_yield_without_overdue_deadline_or_backlog() {
+        let schedule = LoopSchedule {
+            stack_poll_deadline: None,
+            blocked_send_deadline: None,
+            poll_deadline: Some(TokioInstant::now() + Duration::from_millis(20)),
+            maintenance_deadline: Some(TokioInstant::now() + Duration::from_millis(20)),
+            needs_socket_writable: false,
+        };
+
+        assert!(!TunnelManager::should_yield(&schedule, false, 0, 0, 0));
     }
 }

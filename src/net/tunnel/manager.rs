@@ -544,14 +544,6 @@ impl RuntimeState {
             return true;
         }
 
-        if self.sockets.values().any(|socket| {
-            socket.buffered_from_client_bytes() > 0
-                || socket.buffered_to_client_bytes() > 0
-                || socket.close_requested
-        }) {
-            return true;
-        }
-
         let (rx_queue_len, tx_queue_len) = self.stack.queue_lengths();
         rx_queue_len > 0 || tx_queue_len > 0 || !self.tcp_handles.is_empty()
     }

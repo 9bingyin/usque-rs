@@ -16,14 +16,7 @@ impl ActiveTunnel {
         Some(TokioInstant::now() + timeout)
     }
 
-    fn transport_timeout_deadline(&self, _max_poll_interval: Duration) -> Option<TokioInstant> {
-        match self {
-            ActiveTunnel::Masque { .. } => None,
-            ActiveTunnel::Wg { .. } => None,
-        }
-    }
-
-    fn transport_send_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
+    fn blocked_send_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
         match self {
             ActiveTunnel::Masque { blocked_until, .. } => blocked_until
                 .as_ref()
@@ -192,43 +185,25 @@ impl TunnelManager {
             loop {
                 tokio::select! {
                     _ = shutdown_sub.recv() => break,
-                    result = async {
-                        let mut buf = Self::take_pooled_buffer(&buffer_pool, udp_recv_buffer_size);
-                        buf.resize(udp_recv_buffer_size, 0);
-                        match socket.recv(&mut buf[..]).await {
-                            Ok(len) => Ok((buf, len)),
-                            Err(e) => Err((buf, e)),
-                        }
-                    } => {
-                        match result {
-                            Ok((mut buf, len)) => {
-                                if len == 0 {
-                                    Self::return_pooled_buffer(
-                                        &buffer_pool,
-                                        buf,
-                                        pool_max_size,
-                                        buffer_reuse_max_capacity,
-                                    );
-                                    continue;
-                                }
-                                buf.truncate(len);
-                                if incoming_tx
-                                    .send(TransportIoEvent::Incoming(IncomingDatagram { data: buf }))
-                                    .await
-                                    .is_err()
+                    readable = socket.readable() => {
+                        match readable {
+                            Ok(()) => {
+                                if Self::drain_ready_udp_socket(
+                                    socket.as_ref(),
+                                    &incoming_tx,
+                                    &buffer_pool,
+                                    udp_recv_buffer_size,
+                                    pool_max_size,
+                                    buffer_reuse_max_capacity,
+                                )
+                                .await
+                                .is_err()
                                 {
-                                    log::trace!("incoming datagram channel closed");
                                     break;
                                 }
                             }
-                            Err((buf, e)) => {
-                                Self::return_pooled_buffer(
-                                    &buffer_pool,
-                                    buf,
-                                    pool_max_size,
-                                    buffer_reuse_max_capacity,
-                                );
-                                log::warn!("UDP recv error: {}", e);
+                            Err(e) => {
+                                log::warn!("UDP readable wait failed: {}", e);
                             }
                         }
                     }
@@ -243,6 +218,64 @@ impl TunnelManager {
             completion_rx: Some(completion_rx),
             recv_handle: Some(recv_handle),
         }
+    }
+
+    async fn drain_ready_udp_socket(
+        socket: &tokio::net::UdpSocket,
+        incoming_tx: &mpsc::Sender<TransportIoEvent>,
+        buffer_pool: &BufferPool,
+        udp_recv_buffer_size: usize,
+        pool_max_size: usize,
+        buffer_reuse_max_capacity: usize,
+    ) -> Result<usize, ()> {
+        let mut drained = 0usize;
+        loop {
+            let mut buf = Self::take_pooled_buffer(buffer_pool, udp_recv_buffer_size);
+            buf.resize(udp_recv_buffer_size, 0);
+            match socket.try_recv(&mut buf[..]) {
+                Ok(0) => {
+                    Self::return_pooled_buffer(
+                        buffer_pool,
+                        buf,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                    break;
+                }
+                Ok(len) => {
+                    drained += 1;
+                    buf.truncate(len);
+                    if incoming_tx
+                        .send(TransportIoEvent::Incoming(IncomingDatagram { data: buf }))
+                        .await
+                        .is_err()
+                    {
+                        log::trace!("incoming datagram channel closed");
+                        return Err(());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Self::return_pooled_buffer(
+                        buffer_pool,
+                        buf,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                    break;
+                }
+                Err(e) => {
+                    Self::return_pooled_buffer(
+                        buffer_pool,
+                        buf,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                    log::warn!("UDP recv error: {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(drained)
     }
 
     async fn shutdown_incoming_task(mut task: IncomingTask) {
@@ -364,11 +397,8 @@ impl TunnelManager {
         tunnel: &mut ActiveTunnel,
         state: &mut RuntimeState,
         stack_due: bool,
-        transport_timeout_due: bool,
         transport_send_due: bool,
     ) -> bool {
-        let _ = transport_timeout_due;
-
         if stack_due && !Self::poll_stack_common(state, true) {
             return false;
         }
@@ -467,5 +497,49 @@ impl TunnelManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn test_buffer_pool() -> BufferPool {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    #[tokio::test]
+    async fn drain_ready_udp_socket_drains_multiple_datagrams() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+
+        sender.send(b"one").await.unwrap();
+        sender.send(b"two").await.unwrap();
+
+        receiver.readable().await.unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let drained = TunnelManager::drain_ready_udp_socket(
+            &receiver,
+            &event_tx,
+            &test_buffer_pool(),
+            2048,
+            8,
+            2048,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(drained, 2);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"one"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"two"
+        ));
     }
 }
