@@ -80,8 +80,15 @@ impl TunnelManager {
             Self::poll_tcp_sockets(state, false);
         }
 
-        if needs_stack_poll || needs_targeted_tcp_service || incoming_result.needs_transport_flush {
+        let needs_transport_drain = needs_stack_poll || state.stack.has_tx_packets();
+        let needs_transport_flush = incoming_result.needs_transport_flush
+            || tunnel.transport_pending_send_packets() > 0
+            || needs_transport_drain;
+
+        if needs_transport_drain {
             Self::drain_stack_packets(tunnel, state).await;
+        }
+        if needs_transport_flush {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
 
@@ -170,12 +177,11 @@ impl TunnelManager {
     }
 
     fn handle_socket_event(state: &mut RuntimeState, event: SocketEvent) {
-        if let Some(socket_state) = state.sockets.get_mut(&event.handle) {
-            socket_state.stream.clear_event(event.kind);
-            if matches!(event.kind, SocketEventKind::Closed) {
+        if let Some(socket_state) = state.sockets.get_mut(&event.handle)
+            && matches!(event.kind, SocketEventKind::Closed)
+        {
                 socket_state.close_requested = true;
                 socket_state.write_shutdown = true;
-            }
         }
         state.enqueue_ready_tcp_handle(event.handle);
     }
@@ -433,6 +439,7 @@ impl TunnelManager {
             }
 
             if let Some(socket_state) = state.sockets.get_mut(&handle) {
+                socket_state.stream.clear_all_events();
                 if socket_state
                     .stream
                     .socket_dropped
