@@ -301,6 +301,7 @@ fn cleanup_fragments(
 fn map_manager_error_to_reply(err: &ManagerError) -> fast_socks5::ReplyError {
     match err {
         ManagerError::NotConnected => fast_socks5::ReplyError::GeneralFailure,
+        ManagerError::Overloaded => fast_socks5::ReplyError::ConnectionRefused,
         ManagerError::Dns(_) => fast_socks5::ReplyError::HostUnreachable,
         ManagerError::Stack(_) => fast_socks5::ReplyError::GeneralFailure,
         ManagerError::ChannelClosed => fast_socks5::ReplyError::GeneralFailure,

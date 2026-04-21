@@ -43,7 +43,9 @@ pub struct ManagerTunables {
     pub masque_send_batch_size: usize,
     pub masque_stack_drain_budget: usize,
     pub wg_stack_drain_budget: usize,
+    pub manager_max_tcp_sockets_per_worker: usize,
     pub pool_max_size: usize,
+    pub buffer_reuse_max_capacity: usize,
     pub max_poll_interval: Duration,
     pub wg_timer_interval: Duration,
     pub wg_udp_recv_buffer_size: usize,
@@ -55,23 +57,25 @@ impl Default for ManagerTunables {
         Self {
             cmd_channel_capacity: 1024,
             udp_data_channel_capacity: 1024,
-            incoming_dgram_capacity: 4096,
+            incoming_dgram_capacity: 1024,
             udp_recv_buffer_size: 65535,
             tcp_chunk_size: 64 * 1024,
             udp_session_timeout: Duration::from_secs(300),
-            max_pending_data: 256 * 1024,
-            max_pending_to_client: 256 * 1024,
+            max_pending_data: 128 * 1024,
+            max_pending_to_client: 128 * 1024,
             udp_batch_read_budget: 128,
             stack_ingress_budget: 64,
             cmd_batch_budget: 128,
             udp_batch_budget: 128,
             socket_event_batch_budget: 128,
             targeted_tcp_sweep_budget: 64,
-            masque_io_channel_capacity: 1024,
+            masque_io_channel_capacity: 256,
             masque_send_batch_size: 32,
             masque_stack_drain_budget: 128,
             wg_stack_drain_budget: 256,
+            manager_max_tcp_sockets_per_worker: 1024,
             pool_max_size: 256,
+            buffer_reuse_max_capacity: 2048,
             max_poll_interval: Duration::from_millis(50),
             wg_timer_interval: Duration::from_millis(250),
             wg_udp_recv_buffer_size: 4 * 1024 * 1024,
@@ -168,7 +172,17 @@ impl ManagerTunables {
                 "USQUE_WG_STACK_DRAIN_BUDGET",
                 defaults.wg_stack_drain_budget,
             ),
+            manager_max_tcp_sockets_per_worker: env_usize(
+                "USQUE_MANAGER_MAX_TCP_SOCKETS_PER_WORKER",
+                defaults.manager_max_tcp_sockets_per_worker,
+            )
+            .max(1),
             pool_max_size: env_usize("USQUE_BUFFER_POOL_MAX_SIZE", defaults.pool_max_size),
+            buffer_reuse_max_capacity: env_usize(
+                "USQUE_BUFFER_POOL_KEEP_CAPACITY",
+                defaults.buffer_reuse_max_capacity,
+            )
+            .max(512),
             max_poll_interval: env_duration_ms(
                 "USQUE_MAX_POLL_INTERVAL_MS",
                 defaults.max_poll_interval,
@@ -241,6 +255,8 @@ pub enum ManagerError {
     ResponseChannelClosed,
     #[error("tunnel not connected")]
     NotConnected,
+    #[error("manager overloaded")]
+    Overloaded,
     #[error("dns error: {0}")]
     Dns(#[from] DnsError),
     #[error("stack error: {0}")]
@@ -257,6 +273,7 @@ pub enum ManagerCommand {
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
+        reserved_slot: bool,
         response: oneshot::Sender<Result<SocketStream, ManagerError>>,
     },
     // Close a TCP connection
@@ -456,234 +473,7 @@ struct IncomingTask {
     recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-struct PerfSnapshot {
-    sockets: usize,
-    udp_sessions: usize,
-    dns_groups: usize,
-    pending_from_client_bytes: usize,
-    pending_to_client_bytes: usize,
-    rx_queue_len: usize,
-    tx_queue_len: usize,
-    rx_drops: u64,
-    tx_drops: u64,
-    cmd_queue_len: usize,
-    udp_queue_len: usize,
-    incoming_queue_len: usize,
-    ready_tcp_queue_len: usize,
-    transport_pending_send_packets: usize,
-    quic_stats: Option<QuicPerfStats>,
-}
-
-struct PerfCounters {
-    enabled: bool,
-    interval: Duration,
-    last_report: Instant,
-    rx_packets: u64,
-    rx_bytes: u64,
-    tx_packets: u64,
-    tx_bytes: u64,
-    poll_count: u64,
-    loop_iterations: u64,
-    scheduler_yields: u64,
-    masque_blocked_events: u64,
-    masque_send_batches: u64,
-    masque_send_packets: u64,
-    quic_socket_blocked: u64,
-    quic_send_enobufs: u64,
-    quic_pacing_events: u64,
-    wg_flushes: u64,
-    socket_event_batches: u64,
-    socket_events: u64,
-    full_tcp_sweeps: u64,
-    targeted_tcp_sweeps: u64,
-}
-
-impl PerfCounters {
-    fn new(enabled: bool, interval_secs: u64) -> Self {
-        let interval = Duration::from_secs(interval_secs.max(1));
-        Self {
-            enabled,
-            interval,
-            last_report: Instant::now(),
-            rx_packets: 0,
-            rx_bytes: 0,
-            tx_packets: 0,
-            tx_bytes: 0,
-            poll_count: 0,
-            loop_iterations: 0,
-            scheduler_yields: 0,
-            masque_blocked_events: 0,
-            masque_send_batches: 0,
-            masque_send_packets: 0,
-            quic_socket_blocked: 0,
-            quic_send_enobufs: 0,
-            quic_pacing_events: 0,
-            wg_flushes: 0,
-            socket_event_batches: 0,
-            socket_events: 0,
-            full_tcp_sweeps: 0,
-            targeted_tcp_sweeps: 0,
-        }
-    }
-
-    fn due(&self) -> bool {
-        self.enabled && self.last_report.elapsed() >= self.interval
-    }
-
-    fn inc_loop(&mut self) {
-        if self.enabled {
-            self.loop_iterations += 1;
-        }
-    }
-
-    fn inc_poll(&mut self) {
-        if self.enabled {
-            self.poll_count += 1;
-        }
-    }
-
-    fn inc_rx(&mut self, bytes: usize) {
-        if self.enabled {
-            self.rx_packets += 1;
-            self.rx_bytes += bytes as u64;
-        }
-    }
-
-    fn inc_tx(&mut self, bytes: usize) {
-        if self.enabled {
-            self.tx_packets += 1;
-            self.tx_bytes += bytes as u64;
-        }
-    }
-
-    fn inc_yield(&mut self) {
-        if self.enabled {
-            self.scheduler_yields += 1;
-        }
-    }
-
-    fn inc_masque_blocked(&mut self) {
-        if self.enabled {
-            self.masque_blocked_events += 1;
-        }
-    }
-
-    fn record_masque_send_batch(&mut self, status: QuicSendStatus) {
-        if !self.enabled {
-            return;
-        }
-        if status.packets_sent > 0 {
-            self.masque_send_batches += 1;
-            self.masque_send_packets += status.packets_sent as u64;
-        }
-        if status.blocked {
-            self.quic_socket_blocked += 1;
-        }
-        if status.enobufs {
-            self.quic_send_enobufs += 1;
-        }
-        if status.paced {
-            self.quic_pacing_events += 1;
-        }
-    }
-
-    fn inc_wg_flush(&mut self) {
-        if self.enabled {
-            self.wg_flushes += 1;
-        }
-    }
-
-    fn inc_socket_event_batch(&mut self, count: usize) {
-        if self.enabled && count > 0 {
-            self.socket_event_batches += 1;
-            self.socket_events += count as u64;
-        }
-    }
-
-    fn inc_tcp_sweep(&mut self, full_sweep: bool) {
-        if self.enabled {
-            if full_sweep {
-                self.full_tcp_sweeps += 1;
-            } else {
-                self.targeted_tcp_sweeps += 1;
-            }
-        }
-    }
-
-    fn report(&mut self, snapshot: PerfSnapshot) {
-        if !self.enabled {
-            return;
-        }
-        let elapsed = self.last_report.elapsed();
-        if elapsed < self.interval {
-            return;
-        }
-        let secs = elapsed.as_secs_f64();
-        log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s masque_send_batches={:.0}/s masque_send_pkts={:.0}/s quic_socket_blocked={:.0}/s quic_enobufs={:.0}/s quic_pacing={:.0}/s quic_rtt={}ms quic_cwnd={} quic_lost={} quic_pto={} quic_delivery_est={:.1}Mbps quic_dgram_rx_total={} quic_dgram_tx_total={} wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
-            self.rx_packets as f64 / secs,
-            self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
-            self.tx_packets as f64 / secs,
-            self.tx_bytes as f64 * 8.0 / secs / 1_000_000.0,
-            self.poll_count as f64 / secs,
-            self.loop_iterations as f64 / secs,
-            self.scheduler_yields as f64 / secs,
-            self.masque_blocked_events as f64 / secs,
-            self.masque_send_batches as f64 / secs,
-            self.masque_send_packets as f64 / secs,
-            self.quic_socket_blocked as f64 / secs,
-            self.quic_send_enobufs as f64 / secs,
-            self.quic_pacing_events as f64 / secs,
-            snapshot.quic_stats.map_or(0, |stats| stats.rtt_ms),
-            snapshot.quic_stats.map_or(0, |stats| stats.cwnd),
-            snapshot.quic_stats.map_or(0, |stats| stats.lost),
-            snapshot.quic_stats.map_or(0, |stats| stats.total_pto_count),
-            snapshot.quic_stats.map_or(0.0, |stats| {
-                stats.delivery_rate_bps as f64 * 8.0 / 1_000_000.0
-            }),
-            snapshot.quic_stats.map_or(0, |stats| stats.dgram_recv),
-            snapshot.quic_stats.map_or(0, |stats| stats.dgram_sent),
-            self.wg_flushes as f64 / secs,
-            self.socket_event_batches as f64 / secs,
-            self.socket_events as f64 / secs,
-            self.full_tcp_sweeps as f64 / secs,
-            self.targeted_tcp_sweeps as f64 / secs,
-            snapshot.sockets,
-            snapshot.udp_sessions,
-            snapshot.dns_groups,
-            snapshot.pending_from_client_bytes,
-            snapshot.pending_to_client_bytes,
-            snapshot.rx_queue_len,
-            snapshot.tx_queue_len,
-            snapshot.rx_drops,
-            snapshot.tx_drops,
-            snapshot.cmd_queue_len,
-            snapshot.udp_queue_len,
-            snapshot.incoming_queue_len,
-            snapshot.ready_tcp_queue_len,
-            snapshot.transport_pending_send_packets,
-        );
-        self.last_report = Instant::now();
-        self.rx_packets = 0;
-        self.rx_bytes = 0;
-        self.tx_packets = 0;
-        self.tx_bytes = 0;
-        self.poll_count = 0;
-        self.loop_iterations = 0;
-        self.scheduler_yields = 0;
-        self.masque_blocked_events = 0;
-        self.masque_send_batches = 0;
-        self.masque_send_packets = 0;
-        self.quic_socket_blocked = 0;
-        self.quic_send_enobufs = 0;
-        self.quic_pacing_events = 0;
-        self.wg_flushes = 0;
-        self.socket_event_batches = 0;
-        self.socket_events = 0;
-        self.full_tcp_sweeps = 0;
-        self.targeted_tcp_sweeps = 0;
-    }
-}
+include!("manager/metrics.rs");
 
 struct RuntimeState {
     stack: NetworkStack,
@@ -706,18 +496,20 @@ struct RuntimeState {
     udp_buffer: BytesMut,
     read_buffer: BytesMut,
     write_buffer: BytesMut,
-    buffer_pool: BufferPool,
+    datagram_pool: BufferPool,
+    runtime_stats: Arc<ManagerRuntimeStats>,
     perf: PerfCounters,
 }
 
 impl RuntimeState {
     fn new(
         stack: NetworkStack,
+        datagram_pool: BufferPool,
         tunables: ManagerTunables,
+        runtime_stats: Arc<ManagerRuntimeStats>,
         perf_enabled: bool,
         perf_interval_secs: u64,
     ) -> Self {
-        let buffer_pool = stack.buffer_pool();
         let (socket_event_tx, socket_event_rx) = mpsc::unbounded_channel();
         let tcp_chunk_size = tunables.tcp_chunk_size;
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
@@ -740,7 +532,8 @@ impl RuntimeState {
             udp_buffer: BytesMut::zeroed(udp_recv_buffer_size),
             read_buffer: BytesMut::zeroed(tcp_chunk_size),
             write_buffer: BytesMut::zeroed(tcp_chunk_size),
-            buffer_pool,
+            datagram_pool,
+            runtime_stats,
             perf: PerfCounters::new(perf_enabled, perf_interval_secs),
         }
     }
@@ -783,6 +576,7 @@ static DNS_SERVER_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 pub struct TunnelManager {
     cmd_tx: mpsc::Sender<ManagerCommand>,
     udp_tx: mpsc::Sender<UdpSend>,
+    stats: Arc<ManagerRuntimeStats>,
 }
 
 pub struct TunnelManagerPool {
@@ -805,8 +599,130 @@ impl TunnelManagerPool {
     }
 
     pub fn pick(&self) -> Arc<TunnelManager> {
-        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.managers[idx % self.managers.len()].clone()
+        self.pick_loaded_manager(false)
+            .expect("manager pool is never empty")
+    }
+
+    pub fn pick_for_tcp(&self) -> Result<Arc<TunnelManager>, ManagerError> {
+        self.pick_loaded_manager(true)
+            .ok_or(ManagerError::Overloaded)
+    }
+
+    fn pick_loaded_manager(&self, reserve_tcp_slot: bool) -> Option<Arc<TunnelManager>> {
+        if self.managers.is_empty() {
+            return None;
+        }
+
+        let len = self.managers.len();
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % len;
+        let mut candidates = Vec::with_capacity(len);
+
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let manager = &self.managers[idx];
+            candidates.push((idx, manager.reported_load()));
+        }
+
+        candidates.sort_by_key(|(idx, load)| {
+            (
+                load.active_tcp_sockets
+                    .saturating_add(load.pending_connects),
+                load.transport_pending_send_packets,
+                load.pending_to_client_bytes,
+                (idx + len - start) % len,
+            )
+        });
+
+        for (idx, _) in candidates {
+            let manager = &self.managers[idx];
+            if !reserve_tcp_slot || manager.try_reserve_tcp_slot() {
+                return Some(manager.clone());
+            }
+        }
+
+        None
+    }
+}
+
+#[cfg(test)]
+impl TunnelManager {
+    fn new_for_test(max_tcp_sockets_per_worker: usize) -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (udp_tx, _udp_rx) = mpsc::channel(1);
+        Self {
+            cmd_tx,
+            udp_tx,
+            stats: Arc::new(ManagerRuntimeStats::new(max_tcp_sockets_per_worker)),
+        }
+    }
+
+    fn set_test_load(
+        &self,
+        active_tcp_sockets: usize,
+        pending_connects: usize,
+        pending_to_client_bytes: usize,
+        transport_pending_send_packets: usize,
+    ) {
+        self.stats.update(
+            active_tcp_sockets,
+            pending_to_client_bytes,
+            transport_pending_send_packets,
+        );
+        self.stats
+            .pending_connects
+            .store(pending_connects, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl TunnelManagerPool {
+    fn from_managers(managers: Vec<Arc<TunnelManager>>) -> Self {
+        Self {
+            managers,
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod manager_pool_tests {
+    use super::*;
+
+    #[test]
+    fn pick_prefers_less_loaded_worker() {
+        let manager0 = Arc::new(TunnelManager::new_for_test(8));
+        let manager1 = Arc::new(TunnelManager::new_for_test(8));
+        let manager2 = Arc::new(TunnelManager::new_for_test(8));
+
+        manager0.set_test_load(4, 0, 16 * 1024, 8);
+        manager1.set_test_load(1, 0, 1024, 0);
+        manager2.set_test_load(1, 0, 4 * 1024, 3);
+
+        let pool = TunnelManagerPool::from_managers(vec![
+            manager0.clone(),
+            manager1.clone(),
+            manager2.clone(),
+        ]);
+
+        let picked = pool.pick();
+        assert!(Arc::ptr_eq(&picked, &manager1));
+    }
+
+    #[test]
+    fn pick_for_tcp_skips_full_worker_and_errors_when_all_full() {
+        let manager0 = Arc::new(TunnelManager::new_for_test(2));
+        let manager1 = Arc::new(TunnelManager::new_for_test(2));
+
+        manager0.set_test_load(2, 0, 0, 0);
+        manager1.set_test_load(1, 0, 0, 0);
+
+        let pool = TunnelManagerPool::from_managers(vec![manager0.clone(), manager1.clone()]);
+
+        let picked = pool.pick_for_tcp().expect("one worker still has capacity");
+        assert!(Arc::ptr_eq(&picked, &manager1));
+        assert_eq!(manager1.reported_load().pending_connects, 1);
+
+        assert!(matches!(pool.pick_for_tcp(), Err(ManagerError::Overloaded)));
     }
 }
 

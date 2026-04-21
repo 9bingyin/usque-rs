@@ -185,6 +185,7 @@ impl TunnelManager {
         let recv_completion_tx = completion_tx.clone();
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
         let pool_max_size = tunables.pool_max_size;
+        let buffer_reuse_max_capacity = tunables.buffer_reuse_max_capacity;
 
         let recv_handle = tokio::spawn(async move {
             let _guard = recv_completion_tx;
@@ -202,7 +203,12 @@ impl TunnelManager {
                         match result {
                             Ok((mut buf, len)) => {
                                 if len == 0 {
-                                    Self::return_pooled_buffer(&buffer_pool, buf, pool_max_size);
+                                    Self::return_pooled_buffer(
+                                        &buffer_pool,
+                                        buf,
+                                        pool_max_size,
+                                        buffer_reuse_max_capacity,
+                                    );
                                     continue;
                                 }
                                 buf.truncate(len);
@@ -216,7 +222,12 @@ impl TunnelManager {
                                 }
                             }
                             Err((buf, e)) => {
-                                Self::return_pooled_buffer(&buffer_pool, buf, pool_max_size);
+                                Self::return_pooled_buffer(
+                                    &buffer_pool,
+                                    buf,
+                                    pool_max_size,
+                                    buffer_reuse_max_capacity,
+                                );
                                 log::warn!("UDP recv error: {}", e);
                             }
                         }
@@ -298,7 +309,12 @@ impl TunnelManager {
                         needs_transport_flush: true,
                     }
                 };
-                Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
+                Self::return_pooled_buffer(
+                    &state.datagram_pool,
+                    data,
+                    state.tunables.pool_max_size,
+                    state.tunables.buffer_reuse_max_capacity,
+                );
                 handling
             }
         }

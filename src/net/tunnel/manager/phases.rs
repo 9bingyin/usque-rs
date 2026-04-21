@@ -106,6 +106,8 @@ impl TunnelManager {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
 
+        Self::refresh_runtime_stats(state, tunnel);
+
         true
     }
 
@@ -678,6 +680,12 @@ impl TunnelManager {
             pending_to_client_bytes += socket_state.buffered_to_client_bytes();
         }
 
+        state.runtime_stats.update(
+            state.sockets.len(),
+            pending_to_client_bytes,
+            tunnel.transport_pending_send_packets(),
+        );
+
         PerfSnapshot {
             sockets: state.sockets.len(),
             udp_sessions: state.udp_sessions.len(),
@@ -695,5 +703,18 @@ impl TunnelManager {
             transport_pending_send_packets: tunnel.transport_pending_send_packets(),
             quic_stats: tunnel.quic_perf_stats(),
         }
+    }
+
+    fn refresh_runtime_stats(state: &RuntimeState, tunnel: &ActiveTunnel) {
+        let pending_to_client_bytes = state
+            .sockets
+            .values()
+            .map(SocketState::buffered_to_client_bytes)
+            .sum();
+        state.runtime_stats.update(
+            state.sockets.len(),
+            pending_to_client_bytes,
+            tunnel.transport_pending_send_packets(),
+        );
     }
 }

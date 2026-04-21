@@ -40,8 +40,16 @@ impl TunnelManager {
         }
     }
 
-    fn return_pooled_buffer(pool: &BufferPool, mut buf: BytesMut, pool_max_size: usize) {
+    fn return_pooled_buffer(
+        pool: &BufferPool,
+        mut buf: BytesMut,
+        pool_max_size: usize,
+        buffer_reuse_max_capacity: usize,
+    ) {
         buf.clear();
+        if buf.capacity() > buffer_reuse_max_capacity {
+            return;
+        }
         let mut guard = match pool.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

@@ -2,14 +2,23 @@ impl TunnelManager {
     pub fn new(params: ConnectionParams) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(params.manager_tunables.cmd_channel_capacity);
         let (udp_tx, udp_rx) = mpsc::channel(params.manager_tunables.udp_data_channel_capacity);
+        let stats = Arc::new(ManagerRuntimeStats::new(
+            params.manager_tunables.manager_max_tcp_sockets_per_worker,
+        ));
 
-        tokio::spawn(Self::maintain_tunnel(params, cmd_rx, udp_rx));
+        tokio::spawn(Self::maintain_tunnel(
+            params,
+            stats.clone(),
+            cmd_rx,
+            udp_rx,
+        ));
 
-        Self { cmd_tx, udp_tx }
+        Self { cmd_tx, udp_tx, stats }
     }
 
     async fn maintain_tunnel(
         params: ConnectionParams,
+        stats: Arc<ManagerRuntimeStats>,
         mut cmd_rx: mpsc::Receiver<ManagerCommand>,
         mut udp_rx: mpsc::Receiver<UdpSend>,
     ) {
@@ -51,6 +60,7 @@ impl TunnelManager {
                                     active_tunnel,
                                     stack,
                                     incoming_task,
+                                    stats.clone(),
                                     &mut cmd_rx,
                                     &mut udp_rx,
                                     &params,
@@ -69,7 +79,7 @@ impl TunnelManager {
                     }
                     cmd = cmd_rx.recv() => {
                         match cmd {
-                            Some(cmd) => Self::handle_command_disconnected(cmd),
+                            Some(cmd) => Self::handle_command_disconnected(&stats, cmd),
                             None => return,
                         }
                     }
@@ -90,7 +100,7 @@ impl TunnelManager {
                     _ = &mut sleep => break,
                     cmd = cmd_rx.recv() => {
                         match cmd {
-                            Some(cmd) => Self::handle_command_disconnected(cmd),
+                            Some(cmd) => Self::handle_command_disconnected(&stats, cmd),
                             None => return,
                         }
                     }
@@ -242,6 +252,27 @@ impl TunnelManager {
         remote_port: u16,
         local_port: u16,
     ) -> Result<SocketStream, ManagerError> {
+        if !self.stats.try_reserve_tcp_slot() {
+            return Err(ManagerError::Overloaded);
+        }
+        self.connect_inner(remote_ip, remote_port, local_port).await
+    }
+
+    pub async fn connect_reserved(
+        &self,
+        remote_ip: IpAddress,
+        remote_port: u16,
+        local_port: u16,
+    ) -> Result<SocketStream, ManagerError> {
+        self.connect_inner(remote_ip, remote_port, local_port).await
+    }
+
+    async fn connect_inner(
+        &self,
+        remote_ip: IpAddress,
+        remote_port: u16,
+        local_port: u16,
+    ) -> Result<SocketStream, ManagerError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.cmd_tx
@@ -249,14 +280,21 @@ impl TunnelManager {
                 remote_ip,
                 remote_port,
                 local_port,
+                reserved_slot: true,
                 response: response_tx,
             })
             .await
-            .map_err(|_| ManagerError::ChannelClosed)?;
+            .map_err(|_| {
+                self.stats.finish_reserved_tcp_connect();
+                ManagerError::ChannelClosed
+            })?;
 
         response_rx
             .await
-            .map_err(|_| ManagerError::ResponseChannelClosed)?
+            .map_err(|_| {
+                self.stats.finish_reserved_tcp_connect();
+                ManagerError::ResponseChannelClosed
+            })?
     }
 
     pub async fn close(&self, handle: SocketHandle) {
@@ -364,21 +402,27 @@ impl TunnelManager {
         mut tunnel: ActiveTunnel,
         stack: NetworkStack,
         incoming_task: Option<IncomingTask>,
+        runtime_stats: Arc<ManagerRuntimeStats>,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         udp_rx: &mut mpsc::Receiver<UdpSend>,
         params: &ConnectionParams,
     ) {
+        let datagram_pool: BufferPool = Arc::new(std::sync::Mutex::new(Vec::with_capacity(
+            params.manager_tunables.pool_max_size,
+        )));
         let mut incoming_task = incoming_task.unwrap_or_else(|| {
             Self::spawn_incoming_task(
                 tunnel.socket(),
-                stack.buffer_pool(),
+                datagram_pool.clone(),
                 tunnel.peer_addr(),
                 &params.manager_tunables,
             )
         });
         let mut state = RuntimeState::new(
             stack,
+            datagram_pool,
             params.manager_tunables.clone(),
+            runtime_stats.clone(),
             params.perf_enabled,
             params.perf_interval_secs,
         );
@@ -522,7 +566,16 @@ impl TunnelManager {
         }
 
         let mode_name = tunnel.mode_name();
+        state.runtime_stats.reset();
         Self::shutdown_incoming_task(incoming_task).await;
         log::debug!("{} run_loop ended", mode_name);
+    }
+
+    fn reported_load(&self) -> ManagerLoadSnapshot {
+        self.stats.snapshot()
+    }
+
+    fn try_reserve_tcp_slot(&self) -> bool {
+        self.stats.try_reserve_tcp_slot()
     }
 }

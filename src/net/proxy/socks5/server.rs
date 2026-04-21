@@ -79,7 +79,6 @@ async fn handle_client(
     auth: Option<AuthConfig>,
     client_addr: SocketAddr,
 ) -> Result<(), Socks5Error> {
-    let manager = manager_pool.pick();
     // Use fast-socks5 for protocol handling with optional authentication
     let (proto, cmd, target_addr) = if let Some(auth_config) = auth {
         let username = auth_config.username;
@@ -97,15 +96,18 @@ async fn handle_client(
 
     match cmd {
         Socks5Command::TCPConnect => {
+            let manager = manager_pool.pick_for_tcp()?;
             log::info!("CONNECT to {}", format_target_addr(&target_addr));
             tcp::handle_tcp_connect(proto, manager, &target_addr, client_addr).await
         }
         Socks5Command::TCPBind => {
+            let manager = manager_pool.pick_for_tcp()?;
             log::info!("BIND to {}", format_target_addr(&target_addr));
             let resolved_addr = resolve::resolve_target_addr(&manager, &target_addr).await?;
             tcp::handle_tcp_bind(proto, manager, local_addr, resolved_addr).await
         }
         Socks5Command::UDPAssociate => {
+            let manager = manager_pool.pick();
             log::info!("UDP ASSOCIATE from {}", client_addr);
             udp::handle_udp_associate(proto, manager, local_addr).await
         }

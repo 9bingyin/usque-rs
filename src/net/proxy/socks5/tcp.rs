@@ -69,7 +69,10 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
     tunables: &SocksTunables,
 ) -> Result<(), Socks5Error> {
     let local_port = get_local_port();
-    let channels = match manager.connect(remote_ip, remote_port, local_port).await {
+    let channels = match manager
+        .connect_reserved(remote_ip, remote_port, local_port)
+        .await
+    {
         Ok(channels) => channels,
         Err(err) => {
             let reply = map_manager_error_to_reply(&err);
@@ -139,7 +142,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
 
     // Start first connection immediately
     if let Some(ip) = addr_iter.next() {
-        match start_connection(&manager, ip, remote_port).await {
+        match start_connection_reserved(&manager, ip, remote_port).await {
             Ok(channels) => {
                 log::debug!("started connection to {}", format_ip_addr(ip));
                 pending.push((channels.handle, channels));
@@ -312,6 +315,18 @@ async fn start_connection(
     let local_port = get_local_port();
     manager
         .connect(remote_ip, remote_port, local_port)
+        .await
+        .map_err(Socks5Error::TunnelError)
+}
+
+async fn start_connection_reserved(
+    manager: &TunnelManager,
+    remote_ip: IpAddress,
+    remote_port: u16,
+) -> Result<SocketStream, Socks5Error> {
+    let local_port = get_local_port();
+    manager
+        .connect_reserved(remote_ip, remote_port, local_port)
         .await
         .map_err(Socks5Error::TunnelError)
 }

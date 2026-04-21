@@ -23,6 +23,7 @@ pub(crate) type BufferPool = Arc<Mutex<Vec<BytesMut>>>;
 pub struct StackTunables {
     pub device_queue_capacity: usize,
     pub buffer_pool_size: usize,
+    pub buffer_pool_keep_capacity: usize,
     pub tcp_ack_delay: Option<Duration>,
     pub tcp_keepalive: Option<Duration>,
     pub tcp_timeout: Option<Duration>,
@@ -35,6 +36,7 @@ impl Default for StackTunables {
         Self {
             device_queue_capacity: 4096,
             buffer_pool_size: 256,
+            buffer_pool_keep_capacity: 2048,
             tcp_ack_delay: Some(Duration::from_millis(10)),
             tcp_keepalive: Some(Duration::from_secs(28)),
             tcp_timeout: Some(Duration::from_secs(7200)),
@@ -82,6 +84,11 @@ impl StackTunables {
                 defaults.device_queue_capacity,
             ),
             buffer_pool_size: env_usize("USQUE_STACK_BUFFER_POOL_SIZE", defaults.buffer_pool_size),
+            buffer_pool_keep_capacity: env_usize(
+                "USQUE_STACK_BUFFER_POOL_KEEP_CAPACITY",
+                defaults.buffer_pool_keep_capacity,
+            )
+            .max(512),
             tcp_ack_delay: env_optional_duration_ms(
                 "USQUE_TCP_ACK_DELAY_MS",
                 defaults.tcp_ack_delay,
@@ -149,6 +156,7 @@ pub struct VirtualDevice {
     mtu: usize,
     queue_capacity: usize,
     pool_capacity: usize,
+    pool_keep_capacity: usize,
     rx_drop_logger: DropLogger,
     tx_drop_logger: DropLogger,
 }
@@ -162,6 +170,7 @@ impl VirtualDevice {
             mtu,
             queue_capacity: tunables.device_queue_capacity,
             pool_capacity: tunables.buffer_pool_size,
+            pool_keep_capacity: tunables.buffer_pool_keep_capacity,
             rx_drop_logger: DropLogger::new("RX"),
             tx_drop_logger: DropLogger::new("TX"),
         }
@@ -185,6 +194,9 @@ impl VirtualDevice {
 
     fn return_buffer(&self, mut buf: BytesMut) {
         buf.clear();
+        if buf.capacity() > self.pool_keep_capacity {
+            return;
+        }
         let mut pool = match self.buffer_pool.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -272,6 +284,7 @@ impl Device for VirtualDevice {
                 data: packet,
                 buffer_pool: self.buffer_pool.clone(),
                 pool_capacity: self.pool_capacity,
+                pool_keep_capacity: self.pool_keep_capacity,
             },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
@@ -279,6 +292,7 @@ impl Device for VirtualDevice {
                 buffer_pool: self.buffer_pool.clone(),
                 queue_capacity: self.queue_capacity,
                 pool_capacity: self.pool_capacity,
+                pool_keep_capacity: self.pool_keep_capacity,
                 drop_logger: &mut self.tx_drop_logger,
             },
         ))
@@ -295,6 +309,7 @@ impl Device for VirtualDevice {
             buffer_pool: self.buffer_pool.clone(),
             queue_capacity: self.queue_capacity,
             pool_capacity: self.pool_capacity,
+            pool_keep_capacity: self.pool_keep_capacity,
             drop_logger: &mut self.tx_drop_logger,
         })
     }
@@ -318,6 +333,7 @@ pub struct VirtualRxToken {
     data: BytesMut,
     buffer_pool: BufferPool,
     pool_capacity: usize,
+    pool_keep_capacity: usize,
 }
 
 impl Drop for VirtualRxToken {
@@ -325,6 +341,9 @@ impl Drop for VirtualRxToken {
         // Return the buffer to the pool for reuse; content is cleared on return.
         let mut buf = std::mem::take(&mut self.data);
         buf.clear();
+        if buf.capacity() > self.pool_keep_capacity {
+            return;
+        }
         let mut pool = match self.buffer_pool.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -350,6 +369,7 @@ pub struct VirtualTxToken<'a> {
     buffer_pool: BufferPool,
     queue_capacity: usize,
     pool_capacity: usize,
+    pool_keep_capacity: usize,
     drop_logger: &'a mut DropLogger,
 }
 
@@ -366,6 +386,9 @@ impl<'a> TxToken for VirtualTxToken<'a> {
             self.drop_logger.log_drop();
             let mut dropped = std::mem::take(&mut self.buffer);
             dropped.clear();
+            if dropped.capacity() > self.pool_keep_capacity {
+                return result;
+            }
             let mut pool = match self.buffer_pool.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),

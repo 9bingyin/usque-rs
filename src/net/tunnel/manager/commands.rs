@@ -10,19 +10,16 @@ impl TunnelManager {
                 remote_ip,
                 remote_port,
                 local_port,
+                reserved_slot,
                 response,
             } => {
                 let result = Self::create_connection(
-                    &mut state.stack,
-                    &mut state.sockets,
-                    &mut state.tcp_flow_map,
-                    &mut state.tcp_handles,
-                    state.socket_event_tx.clone(),
-                    &state.tunables,
+                    state,
                     remote_ip,
                     remote_port,
                     local_port,
                     tcp_buffer_size,
+                    reserved_slot,
                 );
                 if response.send(result).is_err() {
                     log::trace!("Failed to send connect response: receiver dropped");
@@ -104,9 +101,19 @@ impl TunnelManager {
         }
     }
 
-    fn handle_command_disconnected(cmd: ManagerCommand) {
+    fn handle_command_disconnected(
+        runtime_stats: &Arc<ManagerRuntimeStats>,
+        cmd: ManagerCommand,
+    ) {
         match cmd {
-            ManagerCommand::Connect { response, .. } => {
+            ManagerCommand::Connect {
+                response,
+                reserved_slot,
+                ..
+            } => {
+                if reserved_slot {
+                    runtime_stats.finish_reserved_tcp_connect();
+                }
                 if response.send(Err(ManagerError::NotConnected)).is_err() {
                     log::trace!("Failed to send connect error: receiver dropped");
                 }
@@ -166,29 +173,35 @@ impl TunnelManager {
     }
 
     fn create_connection(
-        stack: &mut NetworkStack,
-        sockets: &mut HashMap<SocketHandle, SocketState>,
-        tcp_flow_map: &mut HashMap<TcpFlowKey, SocketHandle>,
-        tcp_handles: &mut Vec<SocketHandle>,
-        socket_event_tx: mpsc::UnboundedSender<SocketEvent>,
-        tunables: &ManagerTunables,
+        state: &mut RuntimeState,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
         tcp_buffer_size: usize,
+        reserved_slot: bool,
     ) -> Result<SocketStream, ManagerError> {
-        let handle = stack.create_tcp_socket_with_buffer(tcp_buffer_size);
+        if state.sockets.len() >= state.tunables.manager_max_tcp_sockets_per_worker {
+            if reserved_slot {
+                state.runtime_stats.finish_reserved_tcp_connect();
+            }
+            return Err(ManagerError::Overloaded);
+        }
 
-        if let Err(e) = stack.connect_tcp(handle, remote_ip, remote_port, local_port) {
-            stack.remove_socket(handle);
+        let handle = state.stack.create_tcp_socket_with_buffer(tcp_buffer_size);
+
+        if let Err(e) = state.stack.connect_tcp(handle, remote_ip, remote_port, local_port) {
+            state.stack.remove_socket(handle);
+            if reserved_slot {
+                state.runtime_stats.finish_reserved_tcp_connect();
+            }
             return Err(ManagerError::Stack(e));
         }
 
         let (stream, control) = SocketStream::new(
             handle,
-            tunables.max_pending_data,
-            tunables.max_pending_to_client,
-            socket_event_tx,
+            state.tunables.max_pending_data,
+            state.tunables.max_pending_to_client,
+            state.socket_event_tx.clone(),
         );
 
         let flow_key = TcpFlowKey {
@@ -196,7 +209,7 @@ impl TunnelManager {
             remote_ip,
             remote_port,
         };
-        let state = SocketState {
+        let socket_state = SocketState {
             stream: control,
             flow_key: Some(flow_key),
             pending_events: SOCKET_EVENT_WRITE,
@@ -206,9 +219,12 @@ impl TunnelManager {
             ready_waiters: Vec::new(),
         };
 
-        sockets.insert(handle, state);
-        tcp_flow_map.insert(flow_key, handle);
-        tcp_handles.push(handle);
+        state.sockets.insert(handle, socket_state);
+        state.tcp_flow_map.insert(flow_key, handle);
+        state.tcp_handles.push(handle);
+        if reserved_slot {
+            state.runtime_stats.finish_reserved_tcp_connect();
+        }
 
         Ok(stream)
     }

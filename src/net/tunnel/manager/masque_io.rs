@@ -4,6 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::MissedTickBehavior;
 use tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MasqueSendRound {
+    sent_packets: usize,
+    sent_bytes: usize,
+    blocked: bool,
+}
+
 struct MasqueIoHandle {
     socket: Arc<tokio::net::UdpSocket>,
     peer_addr: SocketAddr,
@@ -38,6 +45,7 @@ impl MasqueIoHandle {
         let quic_stats = Arc::new(Mutex::new(None));
         let quic_stats_worker = quic_stats.clone();
         let pool_max_size = tunables.pool_max_size;
+        let buffer_reuse_max_capacity = tunables.buffer_reuse_max_capacity;
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
         let send_budget_limit = tunables.masque_stack_drain_budget;
         let send_batch_size = tunables.masque_send_batch_size.max(1);
@@ -51,6 +59,7 @@ impl MasqueIoHandle {
                 TunnelManager::take_pooled_buffer(&buffer_pool, udp_recv_buffer_size);
             recv_buf.resize(udp_recv_buffer_size, 0);
             let mut stats_tick = tokio::time::interval(stats_interval);
+            let mut send_backlog = VecDeque::new();
             stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             if let Some(stats) = tunnel.sample_quic_stats().await
@@ -60,6 +69,25 @@ impl MasqueIoHandle {
             }
 
             loop {
+                if !send_backlog.is_empty() {
+                    match Self::flush_send_backlog(
+                        &mut tunnel,
+                        &mut send_backlog,
+                        &event_tx,
+                        &buffer_pool,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    )
+                    .await
+                    {
+                        Ok(round) => {
+                            Self::emit_send_round_events(&event_tx, round);
+                            continue;
+                        }
+                        Err(()) => break,
+                    }
+                }
+
                 tokio::select! {
                     biased;
                     _ = shutdown_sub.recv() => break,
@@ -107,10 +135,8 @@ impl MasqueIoHandle {
                             Some(InboundFrame::Datagram(dgram)) => {
                                 match tunnel.decode_datagram(dgram, recv_buf.as_mut()) {
                                     Ok(len) if len > 0 => {
-                                        let mut packet = TunnelManager::take_pooled_buffer(
-                                            &buffer_pool,
-                                            len,
-                                        );
+                                        let mut packet =
+                                            TunnelManager::take_pooled_buffer(&buffer_pool, len);
                                         packet.extend_from_slice(&recv_buf[..len]);
                                         if event_tx
                                             .send(TransportIoEvent::Incoming(IncomingDatagram { data: packet }))
@@ -152,83 +178,40 @@ impl MasqueIoHandle {
                     }
 
                     maybe_packet_batch = send_rx.recv() => {
-                        let Some(mut batch) = maybe_packet_batch else {
+                        let Some(batch) = maybe_packet_batch else {
                             log::trace!("MASQUE IO send channel disconnected");
                             break;
                         };
-
-                        while batch.len() < send_budget_limit {
-                            match send_rx.try_recv() {
-                                Ok(mut packets) => {
-                                    batch.append(&mut packets);
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                            }
-                        }
-
-                        let mut sent_packets = 0usize;
-                        let mut sent_bytes = 0usize;
-                        let mut blocked = false;
-
-                        for packet in batch {
-                            match tunnel.send_datagram(&packet).await {
-                                Ok(crate::net::tunnel::masque::DatagramSendState::Sent)
-                                | Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
-                                    sent_packets += 1;
-                                    sent_bytes += packet.len();
-                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
-                                }
-                                Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
-                                    sent_packets += 1;
-                                    sent_bytes += packet.len();
-                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
-                                    let mut icmp_packet =
-                                        TunnelManager::take_pooled_buffer(&buffer_pool, icmp.len());
-                                    icmp_packet.extend_from_slice(&icmp);
-                                    if event_tx
-                                        .send(TransportIoEvent::Incoming(IncomingDatagram { data: icmp_packet }))
-                                        .await
-                                        .is_err()
-                                    {
-                                        blocked = true;
-                                        break;
-                                    }
-                                }
-                                Ok(crate::net::tunnel::masque::DatagramSendState::Blocked) => {
-                                    blocked = true;
-                                    let _ = event_tx.try_send(TransportIoEvent::MasqueBlocked);
-                                    break;
-                                }
-                                Err(error) => {
-                                    log::debug!("MASQUE datagram send failed: {:?}", error);
-                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
-                                }
-                            }
-                        }
-
-                        if sent_packets > 0 || blocked {
-                            let _ = event_tx.try_send(TransportIoEvent::QuicFlush(QuicSendStatus {
-                                bytes_sent: sent_bytes,
-                                packets_sent: sent_packets,
-                                blocked,
-                                enobufs: false,
-                                paced: false,
-                            }));
-                        }
+                        Self::absorb_send_batch(&mut send_backlog, batch, &queued_packets_worker);
+                        Self::drain_send_channel_round(
+                            &mut send_backlog,
+                            &mut send_rx,
+                            &queued_packets_worker,
+                            send_budget_limit,
+                        );
                     }
                 }
             }
 
             tunnel.close();
 
+            while let Some(packet) = send_backlog.pop_front() {
+                TunnelManager::return_pooled_buffer(
+                    &buffer_pool,
+                    packet,
+                    pool_max_size,
+                    buffer_reuse_max_capacity,
+                );
+            }
             while let Ok(packets) = send_rx.try_recv() {
                 queued_packets_worker.fetch_sub(packets.len(), Ordering::AcqRel);
                 for packet in packets {
-                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+                    TunnelManager::return_pooled_buffer(
+                        &buffer_pool,
+                        packet,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
                 }
             }
             let final_stats = tunnel.sample_quic_stats().await;
@@ -291,5 +274,188 @@ impl MasqueIoHandle {
 
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    fn absorb_send_batch(
+        send_backlog: &mut VecDeque<BytesMut>,
+        packets: Vec<BytesMut>,
+        queued_packets: &AtomicUsize,
+    ) {
+        queued_packets.fetch_sub(packets.len(), Ordering::AcqRel);
+        send_backlog.extend(packets);
+    }
+
+    fn drain_send_channel_round(
+        send_backlog: &mut VecDeque<BytesMut>,
+        send_rx: &mut mpsc::Receiver<Vec<BytesMut>>,
+        queued_packets: &AtomicUsize,
+        send_budget_limit: usize,
+    ) {
+        while send_backlog.len() < send_budget_limit {
+            match send_rx.try_recv() {
+                Ok(packets) => {
+                    Self::absorb_send_batch(send_backlog, packets, queued_packets);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    async fn flush_send_backlog(
+        tunnel: &mut MasqueTunnel,
+        send_backlog: &mut VecDeque<BytesMut>,
+        event_tx: &mpsc::Sender<TransportIoEvent>,
+        buffer_pool: &BufferPool,
+        pool_max_size: usize,
+        buffer_reuse_max_capacity: usize,
+    ) -> Result<MasqueSendRound, ()> {
+        let mut round = MasqueSendRound::default();
+        let mut waited_on_full = false;
+
+        while let Some(packet) = send_backlog.pop_front() {
+            match tunnel.send_datagram(&packet, !waited_on_full).await {
+                Ok(crate::net::tunnel::masque::DatagramSendState::Sent { waited }) => {
+                    waited_on_full |= waited;
+                    round.sent_packets += 1;
+                    round.sent_bytes += packet.len();
+                    TunnelManager::return_pooled_buffer(
+                        buffer_pool,
+                        packet,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                }
+                Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
+                    round.sent_packets += 1;
+                    round.sent_bytes += packet.len();
+                    TunnelManager::return_pooled_buffer(
+                        buffer_pool,
+                        packet,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                }
+                Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
+                    round.sent_packets += 1;
+                    round.sent_bytes += packet.len();
+                    TunnelManager::return_pooled_buffer(
+                        buffer_pool,
+                        packet,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                    let mut icmp_packet = TunnelManager::take_pooled_buffer(buffer_pool, icmp.len());
+                    icmp_packet.extend_from_slice(&icmp);
+                    if event_tx
+                        .send(TransportIoEvent::Incoming(IncomingDatagram { data: icmp_packet }))
+                        .await
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                Ok(crate::net::tunnel::masque::DatagramSendState::Blocked) => {
+                    round.blocked = true;
+                    send_backlog.push_front(packet);
+                    break;
+                }
+                Err(error) => {
+                    log::debug!("MASQUE datagram send failed: {:?}", error);
+                    TunnelManager::return_pooled_buffer(
+                        buffer_pool,
+                        packet,
+                        pool_max_size,
+                        buffer_reuse_max_capacity,
+                    );
+                }
+            }
+        }
+
+        Ok(round)
+    }
+
+    fn emit_send_round_events(event_tx: &mpsc::Sender<TransportIoEvent>, round: MasqueSendRound) {
+        if round.blocked {
+            let _ = event_tx.try_send(TransportIoEvent::MasqueBlocked);
+        }
+        if round.sent_packets > 0 || round.blocked {
+            let _ = event_tx.try_send(TransportIoEvent::QuicFlush(QuicSendStatus {
+                bytes_sent: round.sent_bytes,
+                packets_sent: round.sent_packets,
+                blocked: round.blocked,
+                enobufs: false,
+                paced: false,
+            }));
+        }
+    }
+}
+
+#[cfg(test)]
+mod masque_io_tests {
+    use super::*;
+
+    #[test]
+    fn drain_send_channel_round_merges_multiple_batches() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let queued_packets = AtomicUsize::new(5);
+        let mut backlog = VecDeque::new();
+
+        tx.try_send(vec![BytesMut::from(&b"c"[..]), BytesMut::from(&b"d"[..])])
+            .unwrap();
+        tx.try_send(vec![BytesMut::from(&b"e"[..])]).unwrap();
+
+        MasqueIoHandle::absorb_send_batch(
+            &mut backlog,
+            vec![BytesMut::from(&b"a"[..]), BytesMut::from(&b"b"[..])],
+            &queued_packets,
+        );
+        MasqueIoHandle::drain_send_channel_round(&mut backlog, &mut rx, &queued_packets, 8);
+
+        assert_eq!(queued_packets.load(Ordering::Acquire), 0);
+        assert_eq!(
+            backlog
+                .into_iter()
+                .map(|buf| buf.freeze())
+                .collect::<Vec<_>>(),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+                Bytes::from_static(b"d"),
+                Bytes::from_static(b"e"),
+            ]
+        );
+    }
+
+    #[test]
+    fn emit_send_round_events_reports_once_per_round() {
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        MasqueIoHandle::emit_send_round_events(
+            &event_tx,
+            MasqueSendRound {
+                sent_packets: 3,
+                sent_bytes: 1200,
+                blocked: true,
+            },
+        );
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::MasqueBlocked)
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::QuicFlush(QuicSendStatus {
+                packets_sent: 3,
+                bytes_sent: 1200,
+                blocked: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

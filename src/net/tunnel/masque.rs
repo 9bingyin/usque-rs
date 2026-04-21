@@ -44,7 +44,7 @@ pub enum MasqueError {
 }
 
 pub enum DatagramSendState {
-    Sent,
+    Sent { waited: bool },
     Dropped,
     PacketTooBig(Vec<u8>),
     Blocked,
@@ -245,6 +245,7 @@ impl MasqueTunnel {
     pub async fn send_datagram(
         &mut self,
         packet: &BytesMut,
+        wait_on_full: bool,
     ) -> Result<DatagramSendState, MasqueError> {
         let dgram_len = 1 + packet.len();
         if self.dgram_send_buf.len() < dgram_len {
@@ -284,14 +285,18 @@ impl MasqueTunnel {
         })?;
 
         match sender.try_send(frame) {
-            Ok(()) => {}
+            Ok(()) => return Ok(DatagramSendState::Sent { waited: false }),
             Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
+                if !wait_on_full {
+                    return Ok(DatagramSendState::Blocked);
+                }
                 self.flow_send.send(frame).await.map_err(|e| {
                     MasqueError::ConnectionError(format!(
                         "datagram send failed after waiting: {}",
                         e
                     ))
                 })?;
+                return Ok(DatagramSendState::Sent { waited: true });
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 return Err(MasqueError::ConnectionError(
@@ -299,8 +304,6 @@ impl MasqueTunnel {
                 ));
             }
         }
-
-        Ok(DatagramSendState::Sent)
     }
 
     pub fn decode_datagram(
