@@ -557,8 +557,9 @@ impl TunnelManager {
             match stack.tcp_recv(handle, &mut read_buffer[..read_len]) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let was_empty = state.stream.recv_buffer.is_empty();
                     let written = state.stream.recv_buffer.enqueue_slice(&read_buffer[..n]);
-                    if written > 0 {
+                    if was_empty && written > 0 {
                         state.stream.recv_waker.wake();
                     }
                     if written < n {

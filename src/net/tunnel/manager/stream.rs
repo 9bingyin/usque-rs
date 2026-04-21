@@ -161,9 +161,12 @@ impl tokio::io::AsyncRead for SocketStream {
                 buf.unfilled_mut(),
             )
         };
+        let was_full = control.recv_buffer.is_full();
         let n = control.recv_buffer.dequeue_slice(recv_buf);
         buf.advance(n);
-        control.notify_read_ready();
+        if was_full && !control.recv_buffer.is_full() {
+            control.notify_read_ready();
+        }
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -196,16 +199,25 @@ impl tokio::io::AsyncWrite for SocketStream {
             }
         }
 
+        let was_empty = control.send_buffer.is_empty();
         let n = control.send_buffer.enqueue_slice(buf);
-        control.notify_write_ready();
+        if was_empty && n > 0 {
+            control.notify_write_ready();
+        }
         std::task::Poll::Ready(Ok(n))
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.control.notify_write_ready();
+        if !self.control.send_buffer.is_empty() {
+            self.control.notify_write_ready();
+            self.control.send_waker.register(cx.waker());
+            if !self.control.send_buffer.is_empty() {
+                return std::task::Poll::Pending;
+            }
+        }
         std::task::Poll::Ready(Ok(()))
     }
 
@@ -214,11 +226,13 @@ impl tokio::io::AsyncWrite for SocketStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::ready!(self.as_mut().poll_flush(cx))?;
-        self.control
+        if !self
+            .control
             .write_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.control.send_waker.wake();
-        self.control.notify_write_ready();
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.control.notify_write_ready();
+        }
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -229,9 +243,15 @@ mod socket_stream_tests {
     use futures::task::noop_waker_ref;
     use tokio::io::{AsyncRead, AsyncWrite};
 
-    fn build_stream() -> (SocketStream, std::sync::Arc<SocketStreamHandle>) {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        SocketStream::new(SocketHandle::default(), 16, 16, tx)
+    fn build_stream(
+    ) -> (
+        SocketStream,
+        std::sync::Arc<SocketStreamHandle>,
+        tokio::sync::mpsc::UnboundedReceiver<SocketEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream, control) = SocketStream::new(SocketHandle::default(), 16, 16, tx);
+        (stream, control, rx)
     }
 
     fn noop_cx() -> std::task::Context<'static> {
@@ -240,7 +260,7 @@ mod socket_stream_tests {
 
     #[test]
     fn poll_read_returns_eof_after_peer_close() {
-        let (mut stream, control) = build_stream();
+        let (mut stream, control, _rx) = build_stream();
         control
             .read_closed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -256,7 +276,7 @@ mod socket_stream_tests {
 
     #[test]
     fn poll_shutdown_marks_write_shutdown() {
-        let (mut stream, control) = build_stream();
+        let (mut stream, control, _rx) = build_stream();
         let mut cx = noop_cx();
 
         let result = std::pin::Pin::new(&mut stream).poll_shutdown(&mut cx);
@@ -271,7 +291,7 @@ mod socket_stream_tests {
 
     #[test]
     fn poll_write_fails_after_write_close() {
-        let (mut stream, control) = build_stream();
+        let (mut stream, control, _rx) = build_stream();
         control
             .write_closed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -282,5 +302,89 @@ mod socket_stream_tests {
         assert!(
             matches!(result, std::task::Poll::Ready(Err(err)) if err.kind() == std::io::ErrorKind::BrokenPipe)
         );
+    }
+
+    #[test]
+    fn poll_write_only_notifies_on_empty_to_non_empty_transition() {
+        let (mut stream, control, mut rx) = build_stream();
+        let mut cx = noop_cx();
+
+        let result = std::pin::Pin::new(&mut stream).poll_write(&mut cx, b"hello");
+        assert!(matches!(result, std::task::Poll::Ready(Ok(5))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SocketEvent {
+                kind: SocketEventKind::WriteReady,
+                ..
+            })
+        ));
+
+        control.clear_all_events();
+        let result = std::pin::Pin::new(&mut stream).poll_write(&mut cx, b"world");
+        assert!(matches!(result, std::task::Poll::Ready(Ok(5))));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn poll_read_only_notifies_when_releasing_full_buffer() {
+        let (mut stream, control, mut rx) = build_stream();
+        let mut cx = noop_cx();
+
+        assert_eq!(control.recv_buffer.enqueue_slice(b"0123456789abcdef"), 16);
+        let mut bytes = [0u8; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+
+        let result = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+        assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"0123");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SocketEvent {
+                kind: SocketEventKind::ReadReady,
+                ..
+            })
+        ));
+
+        control.clear_all_events();
+        let mut bytes = [0u8; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+        let result = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+        assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"4567");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn poll_flush_waits_until_send_buffer_is_empty() {
+        let (mut stream, control, mut rx) = build_stream();
+        let mut cx = noop_cx();
+
+        let write_result = std::pin::Pin::new(&mut stream).poll_write(&mut cx, b"hello");
+        assert!(matches!(write_result, std::task::Poll::Ready(Ok(5))));
+        let _ = rx.try_recv();
+        control.clear_all_events();
+
+        let flush_result = std::pin::Pin::new(&mut stream).poll_flush(&mut cx);
+        assert!(matches!(flush_result, std::task::Poll::Pending));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SocketEvent {
+                kind: SocketEventKind::WriteReady,
+                ..
+            })
+        ));
+
+        control.send_buffer.consume(5);
+        control.send_waker.wake();
+        control.clear_all_events();
+
+        let flush_result = std::pin::Pin::new(&mut stream).poll_flush(&mut cx);
+        assert!(matches!(flush_result, std::task::Poll::Ready(Ok(()))));
     }
 }
