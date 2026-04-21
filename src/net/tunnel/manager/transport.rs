@@ -384,19 +384,32 @@ impl TunnelManager {
                 blocked_until,
                 ..
             } => {
+                let batch_size = io.send_batch_size().min(budget.max(1));
                 let mut attempted = 0usize;
                 while attempted < budget {
-                    let Some(packet) = state.stack.take_packet() else {
+                    let Some(first_packet) = state.stack.take_packet() else {
                         break;
                     };
-                    state.perf.inc_tx(packet.len());
+                    let mut packets = Vec::with_capacity(batch_size);
+                    state.perf.inc_tx(first_packet.len());
+                    packets.push(first_packet);
                     attempted += 1;
-                    match io.try_send_packet(packet) {
+
+                    while attempted < budget && packets.len() < batch_size {
+                        let Some(packet) = state.stack.take_packet() else {
+                            break;
+                        };
+                        state.perf.inc_tx(packet.len());
+                        packets.push(packet);
+                        attempted += 1;
+                    }
+
+                    match io.try_send_batch(packets) {
                         Ok(()) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(packets)) => {
                             state.perf.inc_masque_blocked();
                             *blocked_streak = blocked_streak.saturating_add(1).min(6);
                             let backoff_ms = 1u64 << (*blocked_streak as u32 - 1);
@@ -404,12 +417,16 @@ impl TunnelManager {
                                 TokioInstant::now()
                                     + Duration::from_millis(backoff_ms.min(32)),
                             );
-                            state.stack.requeue_packet_front(packet);
+                            for packet in packets.into_iter().rev() {
+                                state.stack.requeue_packet_front(packet);
+                            }
                             break;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(packet)) => {
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(packets)) => {
                             log::debug!("MASQUE IO channel closed");
-                            state.stack.requeue_packet_front(packet);
+                            for packet in packets.into_iter().rev() {
+                                state.stack.requeue_packet_front(packet);
+                            }
                             break;
                         }
                     }

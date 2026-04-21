@@ -40,6 +40,7 @@ pub struct ManagerTunables {
     pub socket_event_batch_budget: usize,
     pub targeted_tcp_sweep_budget: usize,
     pub masque_io_channel_capacity: usize,
+    pub masque_send_batch_size: usize,
     pub masque_stack_drain_budget: usize,
     pub wg_stack_drain_budget: usize,
     pub pool_max_size: usize,
@@ -67,6 +68,7 @@ impl Default for ManagerTunables {
             socket_event_batch_budget: 128,
             targeted_tcp_sweep_budget: 64,
             masque_io_channel_capacity: 1024,
+            masque_send_batch_size: 32,
             masque_stack_drain_budget: 128,
             wg_stack_drain_budget: 256,
             pool_max_size: 256,
@@ -153,6 +155,11 @@ impl ManagerTunables {
                 "USQUE_MASQUE_IO_CHANNEL_CAPACITY",
                 defaults.masque_io_channel_capacity,
             ),
+            masque_send_batch_size: env_usize(
+                "USQUE_MASQUE_SEND_BATCH_SIZE",
+                defaults.masque_send_batch_size,
+            )
+            .max(1),
             masque_stack_drain_budget: env_usize(
                 "USQUE_MASQUE_STACK_DRAIN_BUDGET",
                 defaults.masque_stack_drain_budget,

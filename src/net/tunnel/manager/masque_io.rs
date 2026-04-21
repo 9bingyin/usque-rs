@@ -7,10 +7,11 @@ use tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame};
 struct MasqueIoHandle {
     socket: Arc<tokio::net::UdpSocket>,
     peer_addr: SocketAddr,
-    send_tx: mpsc::Sender<BytesMut>,
+    send_tx: mpsc::Sender<Vec<BytesMut>>,
     queued_packets: Arc<AtomicUsize>,
     alive: Arc<AtomicBool>,
     quic_stats: Arc<Mutex<Option<QuicPerfStats>>>,
+    send_batch_size: usize,
 }
 
 impl MasqueIoHandle {
@@ -22,7 +23,8 @@ impl MasqueIoHandle {
     ) -> (Self, IncomingTask) {
         let socket = tunnel.socket.clone();
         let peer_addr = tunnel.peer_addr;
-        let (send_tx, mut send_rx) = mpsc::channel::<BytesMut>(tunables.masque_io_channel_capacity);
+        let (send_tx, mut send_rx) =
+            mpsc::channel::<Vec<BytesMut>>(tunables.masque_io_channel_capacity);
         let (event_tx, event_rx) =
             mpsc::channel::<TransportIoEvent>(tunables.incoming_dgram_capacity);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -38,6 +40,7 @@ impl MasqueIoHandle {
         let pool_max_size = tunables.pool_max_size;
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
         let send_budget_limit = tunables.masque_stack_drain_budget;
+        let send_batch_size = tunables.masque_send_batch_size.max(1);
         let stats_interval = tunables.max_poll_interval.max(Duration::from_millis(250));
 
         let recv_handle = tokio::spawn(async move {
@@ -148,17 +151,17 @@ impl MasqueIoHandle {
                         }
                     }
 
-                    maybe_packet = send_rx.recv() => {
-                        let Some(first_packet) = maybe_packet else {
+                    maybe_packet_batch = send_rx.recv() => {
+                        let Some(mut batch) = maybe_packet_batch else {
                             log::trace!("MASQUE IO send channel disconnected");
                             break;
                         };
 
-                        let mut batch = Vec::with_capacity(send_budget_limit.min(16));
-                        batch.push(first_packet);
                         while batch.len() < send_budget_limit {
                             match send_rx.try_recv() {
-                                Ok(packet) => batch.push(packet),
+                                Ok(mut packets) => {
+                                    batch.append(&mut packets);
+                                }
                                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                             }
@@ -222,9 +225,11 @@ impl MasqueIoHandle {
 
             tunnel.close();
 
-            while let Ok(packet) = send_rx.try_recv() {
-                queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+            while let Ok(packets) = send_rx.try_recv() {
+                queued_packets_worker.fetch_sub(packets.len(), Ordering::AcqRel);
+                for packet in packets {
+                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+                }
             }
             let final_stats = tunnel.sample_quic_stats().await;
             if let Ok(mut guard) = quic_stats_worker.lock() {
@@ -241,6 +246,7 @@ impl MasqueIoHandle {
                 queued_packets,
                 alive,
                 quic_stats,
+                send_batch_size,
             },
             IncomingTask {
                 incoming_rx: event_rx,
@@ -252,22 +258,27 @@ impl MasqueIoHandle {
         )
     }
 
-    fn try_send_packet(
+    fn try_send_batch(
         &self,
-        packet: BytesMut,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<BytesMut>> {
-        match self.send_tx.try_send(packet) {
+        packets: Vec<BytesMut>,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<BytesMut>>> {
+        let packet_count = packets.len();
+        match self.send_tx.try_send(packets) {
             Ok(()) => {
-                self.queued_packets.fetch_add(1, Ordering::AcqRel);
+                self.queued_packets.fetch_add(packet_count, Ordering::AcqRel);
                 Ok(())
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
-                Err(tokio::sync::mpsc::error::TrySendError::Full(packet))
+            Err(tokio::sync::mpsc::error::TrySendError::Full(packets)) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(packets))
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(packet)) => {
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(packet))
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(packets)) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(packets))
             }
         }
+    }
+
+    fn send_batch_size(&self) -> usize {
+        self.send_batch_size
     }
 
     fn pending_send_packets(&self) -> usize {
