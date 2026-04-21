@@ -4,6 +4,20 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CongestionControl {
     Reno,
@@ -224,7 +238,11 @@ pub async fn connect(
     };
     socket.connect(endpoint).await?;
     let std_socket = socket.into_std()?;
-    configure_udp_socket_buffers(&std_socket, 4 * 1024 * 1024, 2 * 1024 * 1024);
+    configure_udp_socket_buffers(
+        &std_socket,
+        env_usize("USQUE_QUIC_UDP_RECVBUF", 4 * 1024 * 1024),
+        env_usize("USQUE_QUIC_UDP_SNDBUF", 2 * 1024 * 1024),
+    );
     let socket = UdpSocket::from_std(std_socket)?;
     let local_addr = socket.local_addr()?;
     let socket = Arc::new(socket);
@@ -242,7 +260,9 @@ pub async fn connect(
     };
 
     let start = std::time::Instant::now();
-    let mut buf = [0u8; 65535];
+    let mut buf = vec![0u8; env_usize("USQUE_QUIC_HANDSHAKE_BUFFER_SIZE", 64 * 1024)];
+    let handshake_poll_timeout =
+        Duration::from_millis(env_u64("USQUE_QUIC_HANDSHAKE_POLL_TIMEOUT_MS", 100));
 
     quic_conn.send_async().await?;
 
@@ -251,9 +271,7 @@ pub async fn connect(
             return Err(QuicError::HandshakeTimeout);
         }
 
-        match tokio::time::timeout(Duration::from_millis(100), quic_conn.socket.recv(&mut buf))
-            .await
-        {
+        match tokio::time::timeout(handshake_poll_timeout, quic_conn.socket.recv(&mut buf)).await {
             Ok(Ok(len)) => {
                 let recv_info = quiche::RecvInfo {
                     from: endpoint,

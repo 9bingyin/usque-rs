@@ -95,7 +95,7 @@ pub async fn run_socks_server(
     let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(65536);
+        .unwrap_or(256 * 1024);
 
     let quic_idle_timeout_ms: u64 = std::env::var("USQUE_QUIC_IDLE_TIMEOUT_MS")
         .ok()
@@ -108,6 +108,8 @@ pub async fn run_socks_server(
         .unwrap_or(1);
     let perf_enabled = env_bool("USQUE_PERF", false);
     let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
+    let manager_tunables = tunnel::ManagerTunables::from_env();
+    let stack_tunables = tunnel::StackTunables::from_env();
 
     let cfg = Config::load(&config_path)?;
     log::debug!("config loaded from {}", config_path);
@@ -180,7 +182,25 @@ pub async fn run_socks_server(
         wg_client_id: None,
         perf_enabled,
         perf_interval_secs,
+        manager_tunables: manager_tunables.clone(),
+        stack_tunables: stack_tunables.clone(),
     };
+
+    log::info!(
+        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
+        tcp_buffer_size / 1024,
+        manager_tunables.max_pending_data / 1024,
+        manager_tunables.max_pending_to_client / 1024,
+        manager_tunables.cmd_channel_capacity,
+        manager_tunables.udp_data_channel_capacity,
+        manager_tunables.incoming_dgram_capacity,
+        stack_tunables
+            .tcp_ack_delay
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        manager_tunables.wg_udp_recv_buffer_size / 1024,
+        manager_tunables.wg_udp_send_buffer_size / 1024,
+    );
 
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -245,7 +265,7 @@ pub async fn run_socks_server_wg(
     let tcp_buffer_size: usize = std::env::var("USQUE_TCP_BUFFER_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(65536);
+        .unwrap_or(256 * 1024);
 
     let tunnel_workers: usize = std::env::var("USQUE_TUNNEL_WORKERS")
         .ok()
@@ -253,6 +273,8 @@ pub async fn run_socks_server_wg(
         .unwrap_or(1);
     let perf_enabled = env_bool("USQUE_PERF", false);
     let perf_interval_secs = env_u64("USQUE_PERF_INTERVAL_SECS", 5);
+    let manager_tunables = tunnel::ManagerTunables::from_env();
+    let stack_tunables = tunnel::StackTunables::from_env();
 
     let wg_cfg = WgConfig::load(&config_path)?;
     log::debug!("config loaded from {}", config_path);
@@ -307,7 +329,25 @@ pub async fn run_socks_server_wg(
         wg_client_id: Some(client_id),
         perf_enabled,
         perf_interval_secs,
+        manager_tunables: manager_tunables.clone(),
+        stack_tunables: stack_tunables.clone(),
     };
+
+    log::info!(
+        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
+        tcp_buffer_size / 1024,
+        manager_tunables.max_pending_data / 1024,
+        manager_tunables.max_pending_to_client / 1024,
+        manager_tunables.cmd_channel_capacity,
+        manager_tunables.udp_data_channel_capacity,
+        manager_tunables.incoming_dgram_capacity,
+        stack_tunables
+            .tcp_ack_delay
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        manager_tunables.wg_udp_recv_buffer_size / 1024,
+        manager_tunables.wg_udp_send_buffer_size / 1024,
+    );
 
     let available = std::thread::available_parallelism()
         .map(|n| n.get())

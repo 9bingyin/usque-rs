@@ -1,8 +1,8 @@
-use super::{
-    CONNECT_TIMEOUT, CONNECTION_ATTEMPT_DELAY, IDLE_TIMEOUT, TCP_READ_BUFFER_SIZE, format_ip_addr,
-    interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
-};
 use super::{Socks5Error, get_local_port};
+use super::{
+    SocksTunables, format_ip_addr, interleave_addresses, map_connect_error_to_reply,
+    map_manager_error_to_reply,
+};
 use crate::net::tunnel::manager::{SocketStream, TcpSocketState, TunnelManager};
 use bytes::BytesMut;
 use fast_socks5::ReplyError;
@@ -12,7 +12,6 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -22,6 +21,7 @@ pub(crate) async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
     target: &TargetAddr,
     _client_addr: SocketAddr,
 ) -> Result<(), Socks5Error> {
+    let tunables = SocksTunables::from_env();
     // Resolve addresses and get port
     let (addresses, remote_port) = match target {
         TargetAddr::Ip(addr) => (vec![super::std_ip_to_smoltcp(addr.ip())], addr.port()),
@@ -52,11 +52,12 @@ pub(crate) async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
 
     // Single address: use simple connection logic
     if addresses.len() == 1 {
-        return handle_tcp_connect_single(proto, manager, addresses[0], remote_port).await;
+        return handle_tcp_connect_single(proto, manager, addresses[0], remote_port, &tunables)
+            .await;
     }
 
     // Multiple addresses: use Happy Eyeballs connection racing
-    handle_tcp_connect_racing(proto, manager, addresses, remote_port).await
+    handle_tcp_connect_racing(proto, manager, addresses, remote_port, &tunables).await
 }
 
 // Single address connection (no racing needed)
@@ -65,6 +66,7 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
     manager: Arc<TunnelManager>,
     remote_ip: IpAddress,
     remote_port: u16,
+    tunables: &SocksTunables,
 ) -> Result<(), Socks5Error> {
     let local_port = get_local_port();
     let channels = match manager.connect(remote_ip, remote_port, local_port).await {
@@ -79,19 +81,21 @@ async fn handle_tcp_connect_single<T: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let handle = channels.handle;
-    let ready = match tokio::time::timeout(CONNECT_TIMEOUT, manager.wait_socket_ready(handle)).await
-    {
-        Ok(state) => state,
-        Err(_) => {
-            let err = Socks5Error::Timeout;
-            let reply = map_connect_error_to_reply(&err);
-            if let Err(rep_err) = proto.reply_error(&reply).await {
-                log::trace!("failed to send error reply: {}", rep_err);
+    let ready =
+        match tokio::time::timeout(tunables.connect_timeout, manager.wait_socket_ready(handle))
+            .await
+        {
+            Ok(state) => state,
+            Err(_) => {
+                let err = Socks5Error::Timeout;
+                let reply = map_connect_error_to_reply(&err);
+                if let Err(rep_err) = proto.reply_error(&reply).await {
+                    log::trace!("failed to send error reply: {}", rep_err);
+                }
+                manager.close(handle).await;
+                return Err(err);
             }
-            manager.close(handle).await;
-            return Err(err);
-        }
-    };
+        };
 
     if ready != TcpSocketState::Established {
         let err = match ready {
@@ -123,6 +127,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
     manager: Arc<TunnelManager>,
     addresses: Vec<IpAddress>,
     remote_port: u16,
+    tunables: &SocksTunables,
 ) -> Result<(), Socks5Error> {
     use tokio::time::timeout;
 
@@ -147,13 +152,14 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // Main racing loop with total timeout
-    let result = timeout(CONNECT_TIMEOUT, async {
+    let result = timeout(tunables.connect_timeout, async {
         race_connections_event_driven(
             &manager,
             &mut pending,
             &mut addr_iter,
             remote_port,
             &mut last_error,
+            tunables,
         )
         .await
     })
@@ -196,6 +202,7 @@ async fn race_connections_event_driven(
     addr_iter: &mut std::iter::Peekable<std::vec::IntoIter<IpAddress>>,
     remote_port: u16,
     last_error: &mut Option<Socks5Error>,
+    tunables: &SocksTunables,
 ) -> Result<(SocketHandle, SocketStream), Socks5Error> {
     use tokio::sync::mpsc;
     use tokio::time::sleep;
@@ -217,7 +224,7 @@ async fn race_connections_event_driven(
     }
 
     // Timer for starting next connection
-    let next_attempt = sleep(CONNECTION_ATTEMPT_DELAY);
+    let next_attempt = sleep(tunables.connection_attempt_delay);
     tokio::pin!(next_attempt);
 
     loop {
@@ -291,7 +298,7 @@ async fn race_connections_event_driven(
                     }
                 }
                 // Reset timer for next attempt
-                next_attempt.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
+                next_attempt.as_mut().reset(tokio::time::Instant::now() + tunables.connection_attempt_delay);
             }
         }
     }
@@ -332,7 +339,8 @@ pub(crate) async fn handle_tcp_bind<T: AsyncRead + AsyncWrite + Unpin>(
     let mut client_stream = proto.reply_success(reply_addr).await?;
 
     // Wait for incoming connection with timeout
-    let accept_result = tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
+    let tunables = SocksTunables::from_env();
+    let accept_result = tokio::time::timeout(tunables.bind_accept_timeout, listener.accept()).await;
 
     let (incoming_stream, peer_addr) = match accept_result {
         Ok(Ok((stream, addr))) => (stream, addr),
@@ -382,11 +390,12 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     I: AsyncRead + AsyncWrite + Unpin,
 {
+    let tunables = SocksTunables::from_env();
     let (mut client_reader, mut client_writer) = tokio::io::split(&mut client);
     let (mut incoming_reader, mut incoming_writer) = tokio::io::split(&mut incoming);
 
     let client_to_incoming = async {
-        let mut buf = [0u8; 65535];
+        let mut buf = vec![0u8; tunables.tcp_read_buffer_size];
         loop {
             match client_reader.read(&mut buf).await {
                 Ok(0) => break,
@@ -401,7 +410,7 @@ where
     };
 
     let incoming_to_client = async {
-        let mut buf = [0u8; 65535];
+        let mut buf = vec![0u8; tunables.tcp_read_buffer_size];
         loop {
             match incoming_reader.read(&mut buf).await {
                 Ok(0) => break,
@@ -429,8 +438,9 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Socks5Error> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
-    let mut client_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
-    let mut tunnel_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
+    let tunables = SocksTunables::from_env();
+    let mut client_buf = BytesMut::with_capacity(tunables.tcp_read_buffer_size);
+    let mut tunnel_buf = BytesMut::with_capacity(tunables.tcp_read_buffer_size);
     let mut client_eof = false;
     let mut tunnel_eof = false;
 
@@ -439,7 +449,7 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
             break;
         }
 
-        let result = tokio::time::timeout(IDLE_TIMEOUT, async {
+        let result = tokio::time::timeout(tunables.idle_timeout, async {
             tokio::select! {
                 result = tunnel_reader.read_buf(&mut tunnel_buf), if !tunnel_eof => {
                     match result {

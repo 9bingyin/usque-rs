@@ -17,6 +17,7 @@ impl TunnelManager {
                     &mut state.sockets,
                     &mut state.tcp_handles,
                     state.socket_event_tx.clone(),
+                    &state.tunables,
                     remote_ip,
                     remote_port,
                     local_port,
@@ -167,6 +168,7 @@ impl TunnelManager {
         sockets: &mut HashMap<SocketHandle, SocketState>,
         tcp_handles: &mut Vec<SocketHandle>,
         socket_event_tx: mpsc::UnboundedSender<SocketEvent>,
+        tunables: &ManagerTunables,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
@@ -181,8 +183,8 @@ impl TunnelManager {
 
         let (stream, control) = SocketStream::new(
             handle,
-            MAX_PENDING_DATA,
-            MAX_PENDING_TO_CLIENT,
+            tunables.max_pending_data,
+            tunables.max_pending_to_client,
             socket_event_tx,
         );
 

@@ -4,6 +4,20 @@ use quiche::h3::NameValue;
 use std::time::Duration;
 use thiserror::Error;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 // Context ID = 0 for IP packets (RFC 9484)
 const CONTEXT_ID_ZERO: u8 = 0x00;
 
@@ -227,7 +241,7 @@ impl MasqueTunnel {
         log::debug!("H3 SETTINGS sent");
 
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 65535];
+        let mut buf = vec![0u8; env_usize("USQUE_MASQUE_HANDSHAKE_BUFFER_SIZE", 64 * 1024)];
 
         // Step 2: Wait for peer's SETTINGS frame before sending CONNECT request
         while !self.peer_settings_received() {
@@ -298,12 +312,8 @@ impl MasqueTunnel {
     }
 
     async fn recv_and_process_async(&mut self, buf: &mut [u8]) -> Result<(), MasqueError> {
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            self.quic_conn.socket.recv_from(buf),
-        )
-        .await
-        {
+        let recv_timeout = Duration::from_millis(env_u64("USQUE_MASQUE_RECV_TIMEOUT_MS", 100));
+        match tokio::time::timeout(recv_timeout, self.quic_conn.socket.recv_from(buf)).await {
             Ok(Ok((len, from))) => {
                 let recv_info = quiche::RecvInfo {
                     from,

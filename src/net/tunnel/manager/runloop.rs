@@ -1,7 +1,7 @@
 impl TunnelManager {
     pub fn new(params: ConnectionParams) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
-        let (udp_tx, udp_rx) = mpsc::channel(UDP_DATA_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::channel(params.manager_tunables.cmd_channel_capacity);
+        let (udp_tx, udp_rx) = mpsc::channel(params.manager_tunables.udp_data_channel_capacity);
 
         tokio::spawn(Self::maintain_tunnel(params, cmd_rx, udp_rx));
 
@@ -46,7 +46,7 @@ impl TunnelManager {
                                 log::info!("tunnel established");
                                 backoff.reset();
                                 let (active_tunnel, stack) =
-                                    ActiveTunnel::from_conn(conn, params.keepalive);
+                                    ActiveTunnel::from_conn(conn, params.keepalive, &params.manager_tunables);
                                 Self::run_active_tunnel(
                                     active_tunnel,
                                     stack,
@@ -151,7 +151,7 @@ impl TunnelManager {
             Some(params.ipv4.as_str())
         };
         let ipv6 = params.ipv6.as_deref().filter(|s| !s.trim().is_empty());
-        let stack = NetworkStack::new(ipv4, ipv6, mtu);
+        let stack = NetworkStack::new(ipv4, ipv6, mtu, params.stack_tunables.clone());
 
         Ok((masque_tunnel, stack))
     }
@@ -166,7 +166,11 @@ impl TunnelManager {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(params.endpoint).await?;
         let std_socket = socket.into_std()?;
-        Self::configure_udp_socket_buffers(&std_socket, 4 * 1024 * 1024, 2 * 1024 * 1024);
+        Self::configure_udp_socket_buffers(
+            &std_socket,
+            params.manager_tunables.wg_udp_recv_buffer_size,
+            params.manager_tunables.wg_udp_send_buffer_size,
+        );
         let socket = tokio::net::UdpSocket::from_std(std_socket)?;
         let socket = Arc::new(socket);
 
@@ -204,7 +208,7 @@ impl TunnelManager {
             Some(params.ipv4.as_str())
         };
         let ipv6 = params.ipv6.as_deref().filter(|s| !s.trim().is_empty());
-        let stack = NetworkStack::new(ipv4, ipv6, mtu);
+        let stack = NetworkStack::new(ipv4, ipv6, mtu, params.stack_tunables.clone());
 
         Ok((wg_tunnel, stack))
     }
@@ -340,9 +344,18 @@ impl TunnelManager {
         udp_rx: &mut mpsc::Receiver<UdpSend>,
         params: &ConnectionParams,
     ) {
-        let mut incoming_task =
-            Self::spawn_incoming_task(tunnel.socket(), stack.buffer_pool(), tunnel.peer_addr());
-        let mut state = RuntimeState::new(stack, params.perf_enabled, params.perf_interval_secs);
+        let mut incoming_task = Self::spawn_incoming_task(
+            tunnel.socket(),
+            stack.buffer_pool(),
+            tunnel.peer_addr(),
+            &params.manager_tunables,
+        );
+        let mut state = RuntimeState::new(
+            stack,
+            params.manager_tunables.clone(),
+            params.perf_enabled,
+            params.perf_interval_secs,
+        );
         let poll_timer = tokio::time::sleep(Duration::from_millis(0));
         tokio::pin!(poll_timer);
 
@@ -395,7 +408,7 @@ impl TunnelManager {
                 }
 
                 _ = &mut maintenance_timer, if has_maintenance => {
-                    Self::run_maintenance_tick(&mut tunnel).await;
+                    Self::run_maintenance_tick(&mut tunnel, &state.tunables).await;
                 }
 
                 _ = &mut poll_timer, if has_poll_timer => {

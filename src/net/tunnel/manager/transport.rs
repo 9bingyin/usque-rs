@@ -1,5 +1,9 @@
 impl ActiveTunnel {
-    fn from_conn(conn: TunnelConn, keepalive_secs: u64) -> (Self, NetworkStack) {
+    fn from_conn(
+        conn: TunnelConn,
+        keepalive_secs: u64,
+        tunables: &ManagerTunables,
+    ) -> (Self, NetworkStack) {
         match conn {
             TunnelConn::Masque(tunnel, stack) => (
                 Self::Masque {
@@ -15,8 +19,7 @@ impl ActiveTunnel {
             TunnelConn::Wg(tunnel, stack) => (
                 Self::Wg {
                     tunnel,
-                    next_timer_at: TokioInstant::now()
-                        + Duration::from_millis(WG_TIMER_INTERVAL_MS),
+                    next_timer_at: TokioInstant::now() + tunables.wg_timer_interval,
                 },
                 stack,
             ),
@@ -75,7 +78,7 @@ impl ActiveTunnel {
                     .stack
                     .poll_delay()
                     .unwrap_or(Duration::ZERO)
-                    .min(MAX_POLL_INTERVAL),
+                    .min(state.tunables.max_poll_interval),
             )
         } else {
             None
@@ -90,14 +93,15 @@ impl ActiveTunnel {
                     .quic_conn
                     .conn
                     .timeout()
-                    .map(|timeout| timeout.min(MAX_POLL_INTERVAL));
+                    .map(|timeout| timeout.min(state.tunables.max_poll_interval));
                 if let Some(stack_timeout) = smoltcp_timeout {
                     timeout = Some(timeout.map_or(stack_timeout, |current| current.min(stack_timeout)));
                 }
                 if let Some(until) = blocked_until
                     && *until > TokioInstant::now()
                 {
-                    let blocked_timeout = (*until - TokioInstant::now()).min(MAX_POLL_INTERVAL);
+                    let blocked_timeout =
+                        (*until - TokioInstant::now()).min(state.tunables.max_poll_interval);
                     timeout = Some(timeout.map_or(blocked_timeout, |current| current.min(blocked_timeout)));
                 }
                 timeout
@@ -123,10 +127,10 @@ impl ActiveTunnel {
         }
     }
 
-    fn stack_drain_budget(&self) -> usize {
+    fn stack_drain_budget(&self, tunables: &ManagerTunables) -> usize {
         match self {
-            ActiveTunnel::Masque { .. } => MASQUE_STACK_DRAIN_BUDGET,
-            ActiveTunnel::Wg { .. } => WG_STACK_DRAIN_BUDGET,
+            ActiveTunnel::Masque { .. } => tunables.masque_stack_drain_budget,
+            ActiveTunnel::Wg { .. } => tunables.wg_stack_drain_budget,
         }
     }
 
@@ -154,12 +158,15 @@ impl TunnelManager {
         socket: Arc<tokio::net::UdpSocket>,
         buffer_pool: BufferPool,
         peer_addr: SocketAddr,
+        tunables: &ManagerTunables,
     ) -> IncomingTask {
-        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_DGRAM_CAPACITY);
+        let (incoming_tx, incoming_rx) = mpsc::channel(tunables.incoming_dgram_capacity);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let mut shutdown_sub = shutdown_tx.subscribe();
         let (completion_tx, completion_rx) = mpsc::channel::<()>(1);
         let recv_completion_tx = completion_tx.clone();
+        let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
+        let pool_max_size = tunables.pool_max_size;
 
         let recv_handle = tokio::spawn(async move {
             let _guard = recv_completion_tx;
@@ -167,8 +174,8 @@ impl TunnelManager {
                 tokio::select! {
                     _ = shutdown_sub.recv() => break,
                     result = async {
-                        let mut buf = Self::take_pooled_buffer(&buffer_pool, UDP_RECV_BUFFER_SIZE);
-                        buf.resize(UDP_RECV_BUFFER_SIZE, 0);
+                        let mut buf = Self::take_pooled_buffer(&buffer_pool, udp_recv_buffer_size);
+                        buf.resize(udp_recv_buffer_size, 0);
                         match socket.recv(&mut buf[..]).await {
                             Ok(len) => Ok((buf, len)),
                             Err(e) => Err((buf, e)),
@@ -177,7 +184,7 @@ impl TunnelManager {
                         match result {
                             Ok((mut buf, len)) => {
                                 if len == 0 {
-                                    Self::return_pooled_buffer(&buffer_pool, buf);
+                                    Self::return_pooled_buffer(&buffer_pool, buf, pool_max_size);
                                     continue;
                                 }
                                 buf.truncate(len);
@@ -187,7 +194,7 @@ impl TunnelManager {
                                 }
                             }
                             Err((buf, e)) => {
-                                Self::return_pooled_buffer(&buffer_pool, buf);
+                                Self::return_pooled_buffer(&buffer_pool, buf, pool_max_size);
                                 log::warn!("UDP recv error: {}", e);
                             }
                         }
@@ -216,7 +223,7 @@ impl TunnelManager {
         }
     }
 
-    async fn run_maintenance_tick(tunnel: &mut ActiveTunnel) {
+    async fn run_maintenance_tick(tunnel: &mut ActiveTunnel, tunables: &ManagerTunables) {
         match tunnel {
             ActiveTunnel::Wg {
                 tunnel,
@@ -225,7 +232,7 @@ impl TunnelManager {
                 if let Err(e) = tunnel.tick_timers().await {
                     log::warn!("WireGuard timer error: {}", e);
                 }
-                *next_timer_at = TokioInstant::now() + Duration::from_millis(WG_TIMER_INTERVAL_MS);
+                *next_timer_at = TokioInstant::now() + tunables.wg_timer_interval;
             }
             ActiveTunnel::Masque {
                 tunnel,
@@ -264,6 +271,7 @@ impl TunnelManager {
                     &mut state.stack,
                     &state.buffer_pool,
                     &mut state.perf,
+                    &mut state.udp_buffer,
                     &mut data[..],
                     incoming.from,
                     *local_addr,
@@ -276,7 +284,7 @@ impl TunnelManager {
             }
         }
 
-        Self::return_pooled_buffer(&state.buffer_pool, data);
+        Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
         needs_transport_flush
     }
 
@@ -322,7 +330,7 @@ impl TunnelManager {
     }
 
     async fn drain_stack_packets(tunnel: &mut ActiveTunnel, state: &mut RuntimeState) {
-        let budget = tunnel.stack_drain_budget();
+        let budget = tunnel.stack_drain_budget(&state.tunables);
         if tunnel.masque_drain_blocked() {
             return;
         }

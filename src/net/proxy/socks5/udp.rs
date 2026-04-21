@@ -1,4 +1,4 @@
-use super::{FragBuffer, Socks5Error, cleanup_fragments, get_local_port};
+use super::{FragBuffer, Socks5Error, SocksTunables, cleanup_fragments, get_local_port};
 use crate::net::proxy::socks5::resolve;
 use crate::net::tunnel::manager::{ManagerCommand, TunnelManager};
 use bytes::Bytes;
@@ -74,7 +74,8 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
     local_port: u16,
     manager: &TunnelManager,
 ) -> Result<(), Socks5Error> {
-    let mut buf = [0u8; 65535];
+    let tunables = SocksTunables::from_env();
+    let mut buf = vec![0u8; tunables.udp_socket_buffer_size];
     let mut tcp_buf = [0u8; 1];
     let mut client_addr: Option<SocketAddr> = None;
     let mut frag_buffers: HashMap<TargetAddr, FragBuffer> = HashMap::new();
@@ -119,11 +120,11 @@ async fn forward_udp_data<T: AsyncRead + AsyncWrite + Unpin>(
                             }
 
                             let now = Instant::now();
-                            let buffer = frag_buffers
-                                .entry(target.clone())
-                                .or_insert_with(|| FragBuffer::new(now));
+                            let buffer = frag_buffers.entry(target.clone()).or_insert_with(|| {
+                                FragBuffer::new(now, tunables.udp_frag_max_count)
+                            });
 
-                            if buffer.is_expired(now) {
+                            if buffer.is_expired(now, tunables.udp_frag_timeout) {
                                 buffer.reset(now);
                             }
 

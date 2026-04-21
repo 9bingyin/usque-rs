@@ -4,6 +4,7 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         buffer_pool: &BufferPool,
         perf: &mut PerfCounters,
+        dgram_buf: &mut BytesMut,
         data: &mut [u8],
         from: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
@@ -20,9 +21,8 @@ impl TunnelManager {
 
         tunnel.poll_h3();
 
-        let mut dgram_buf = [0u8; 65535];
         loop {
-            match tunnel.recv_datagram(&mut dgram_buf) {
+            match tunnel.recv_datagram(dgram_buf.as_mut()) {
                 Ok(len) if len > 0 => {
                     let mut packet = Self::take_pooled_buffer(buffer_pool, len);
                     packet.extend_from_slice(&dgram_buf[..len]);
@@ -75,13 +75,13 @@ impl TunnelManager {
         }
     }
 
-    fn return_pooled_buffer(pool: &BufferPool, mut buf: BytesMut) {
+    fn return_pooled_buffer(pool: &BufferPool, mut buf: BytesMut, pool_max_size: usize) {
         buf.clear();
         let mut guard = match pool.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.len() < POOL_MAX_SIZE {
+        if guard.len() < pool_max_size {
             guard.push(buf);
         }
     }

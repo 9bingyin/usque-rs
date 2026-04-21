@@ -7,21 +7,21 @@ impl TunnelManager {
         incoming_task: &mut IncomingTask,
         params: &ConnectionParams,
     ) -> bool {
-        Self::drain_socket_event_batch(state, SOCKET_EVENT_BATCH_BUDGET);
+        Self::drain_socket_event_batch(state, state.tunables.socket_event_batch_budget);
         Self::drain_command_batch(
             state,
             &params.dns_servers,
             params.tcp_buffer_size,
             cmd_rx,
-            CMD_BATCH_BUDGET,
+            state.tunables.cmd_batch_budget,
         );
-        Self::drain_udp_send_batch(state, udp_rx, UDP_BATCH_BUDGET);
+        Self::drain_udp_send_batch(state, udp_rx, state.tunables.udp_batch_budget);
 
         let handled_incoming = Self::drain_incoming_batch(
             tunnel,
             state,
             &mut incoming_task.incoming_rx,
-            UDP_BATCH_READ_BUDGET,
+            state.tunables.udp_batch_read_budget,
         );
 
         if handled_incoming {
@@ -205,6 +205,7 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         udp_sessions: &mut HashMap<u16, UdpSessionState>,
         udp_ports: &[u16],
+        udp_buffer: &mut BytesMut,
     ) {
         for &local_port in udp_ports {
             let handle = match udp_sessions.get(&local_port) {
@@ -216,8 +217,7 @@ impl TunnelManager {
                 continue;
             }
 
-            let mut buf = [0u8; 65535];
-            if let Ok((len, endpoint)) = stack.udp_recv(handle, &mut buf)
+            if let Ok((len, endpoint)) = stack.udp_recv(handle, udp_buffer.as_mut())
                 && len > 0
             {
                 let remote_ip = endpoint.endpoint.addr;
@@ -227,7 +227,7 @@ impl TunnelManager {
                     session.last_activity = Instant::now();
                     if session
                         .to_client
-                        .try_send((remote_ip, remote_port, Bytes::copy_from_slice(&buf[..len])))
+                        .try_send((remote_ip, remote_port, Bytes::copy_from_slice(&udp_buffer[..len])))
                         .is_err()
                     {
                         log::debug!("UDP session channel full or closed for port {}", local_port);
@@ -254,7 +254,12 @@ impl TunnelManager {
             &state.dns_sockets,
         );
 
-        Self::process_udp_responses(&mut state.stack, &mut state.udp_sessions, &state.udp_ports);
+        Self::process_udp_responses(
+            &mut state.stack,
+            &mut state.udp_sessions,
+            &state.udp_ports,
+            &mut state.udp_buffer,
+        );
 
         Self::expire_dns_groups(state);
         Self::expire_udp_sessions(state);
@@ -306,7 +311,9 @@ impl TunnelManager {
         let stale_ports: Vec<u16> = state
             .udp_sessions
             .iter()
-            .filter(|(_, session)| now.duration_since(session.last_activity) > UDP_SESSION_TIMEOUT)
+            .filter(|(_, session)| {
+                now.duration_since(session.last_activity) > state.tunables.udp_session_timeout
+            })
             .map(|(port, _)| *port)
             .collect();
 
@@ -363,8 +370,15 @@ impl TunnelManager {
                 {
                     socket_state.write_shutdown = true;
                 }
-                Self::flush_pending_to_stack(stack, write_buffer, handle, socket_state);
-                Self::fill_recv_buffer(handle, stack, read_buffer, socket_state);
+                let tcp_chunk_size = state.tunables.tcp_chunk_size;
+                Self::flush_pending_to_stack(
+                    stack,
+                    write_buffer,
+                    handle,
+                    socket_state,
+                    tcp_chunk_size,
+                );
+                Self::fill_recv_buffer(handle, stack, read_buffer, socket_state, tcp_chunk_size);
 
                 let past_handshake = stack.tcp_is_past_handshake(handle);
 
@@ -436,6 +450,7 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         read_buffer: &mut BytesMut,
         state: &mut SocketState,
+        tcp_chunk_size: usize,
     ) {
         if state.close_requested || !stack.tcp_may_recv(handle) {
             return;
@@ -446,7 +461,7 @@ impl TunnelManager {
                 .stream
                 .recv_buffer
                 .remaining_capacity()
-                .min(MAX_TCP_READ_CHUNK);
+                .min(tcp_chunk_size);
             if read_buffer.len() < read_len {
                 read_buffer.resize(read_len, 0);
             }
@@ -477,12 +492,16 @@ impl TunnelManager {
         write_buffer: &mut BytesMut,
         handle: SocketHandle,
         state: &mut SocketState,
+        tcp_chunk_size: usize,
     ) {
         while stack.tcp_may_send(handle) {
-            if write_buffer.len() < MAX_TCP_READ_CHUNK {
-                write_buffer.resize(MAX_TCP_READ_CHUNK, 0);
+            if write_buffer.len() < tcp_chunk_size {
+                write_buffer.resize(tcp_chunk_size, 0);
             }
-            let chunk_len = state.stream.send_buffer.peek_copy(&mut write_buffer[..MAX_TCP_READ_CHUNK]);
+            let chunk_len = state
+                .stream
+                .send_buffer
+                .peek_copy(&mut write_buffer[..tcp_chunk_size]);
             if chunk_len == 0 {
                 break;
             }

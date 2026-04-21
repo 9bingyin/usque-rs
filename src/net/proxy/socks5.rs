@@ -18,15 +18,102 @@ static LOCAL_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 
 const PORT_RANGE_START: u16 = 49152;
 const PORT_RANGE_SIZE: u16 = 16384; // 65536 - 49152 (RFC 6335)
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
-const UDP_FRAG_TIMEOUT: Duration = Duration::from_secs(5);
-const UDP_FRAG_MAX_COUNT: usize = 128;
 
-/// Convert std IpAddr to smoltcp IpAddress, unwrapping IPv4-mapped IPv6
-/// (e.g. ::ffff:104.26.12.31) to native IPv4.
+#[derive(Clone, Debug)]
+struct SocksTunables {
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    bind_accept_timeout: Duration,
+    max_concurrent_connections: usize,
+    tcp_read_buffer_size: usize,
+    udp_socket_buffer_size: usize,
+    udp_frag_timeout: Duration,
+    udp_frag_max_count: usize,
+    connection_attempt_delay: Duration,
+}
+
+impl Default for SocksTunables {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(300),
+            bind_accept_timeout: Duration::from_secs(60),
+            max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+            tcp_read_buffer_size: 64 * 1024,
+            udp_socket_buffer_size: 64 * 1024,
+            udp_frag_timeout: Duration::from_secs(5),
+            udp_frag_max_count: 128,
+            connection_attempt_delay: Duration::from_millis(250),
+        }
+    }
+}
+
+impl SocksTunables {
+    fn from_env() -> Self {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|val| val.parse::<usize>().ok())
+                .filter(|val| *val > 0)
+                .unwrap_or(default)
+        }
+
+        fn env_duration_secs(name: &str, default: Duration) -> Duration {
+            std::env::var(name)
+                .ok()
+                .and_then(|val| val.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(default)
+        }
+
+        fn env_duration_ms(name: &str, default: Duration) -> Duration {
+            std::env::var(name)
+                .ok()
+                .and_then(|val| val.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(default)
+        }
+
+        let defaults = Self::default();
+        Self {
+            connect_timeout: env_duration_secs(
+                "USQUE_SOCKS_CONNECT_TIMEOUT_SECS",
+                defaults.connect_timeout,
+            ),
+            idle_timeout: env_duration_secs("USQUE_SOCKS_IDLE_TIMEOUT_SECS", defaults.idle_timeout),
+            bind_accept_timeout: env_duration_secs(
+                "USQUE_SOCKS_BIND_ACCEPT_TIMEOUT_SECS",
+                defaults.bind_accept_timeout,
+            ),
+            max_concurrent_connections: env_usize(
+                "USQUE_MAX_CONNECTIONS",
+                defaults.max_concurrent_connections,
+            ),
+            tcp_read_buffer_size: env_usize(
+                "USQUE_SOCKS_TCP_BUFFER_SIZE",
+                defaults.tcp_read_buffer_size,
+            ),
+            udp_socket_buffer_size: env_usize(
+                "USQUE_SOCKS_UDP_BUFFER_SIZE",
+                defaults.udp_socket_buffer_size,
+            ),
+            udp_frag_timeout: env_duration_secs(
+                "USQUE_SOCKS_UDP_FRAG_TIMEOUT_SECS",
+                defaults.udp_frag_timeout,
+            ),
+            udp_frag_max_count: env_usize(
+                "USQUE_SOCKS_UDP_FRAG_MAX_COUNT",
+                defaults.udp_frag_max_count,
+            ),
+            connection_attempt_delay: env_duration_ms(
+                "USQUE_SOCKS_CONN_ATTEMPT_DELAY_MS",
+                defaults.connection_attempt_delay,
+            ),
+        }
+    }
+}
+
 fn std_ip_to_smoltcp(ip: IpAddr) -> IpAddress {
     match ip {
         IpAddr::V4(v4) => {
@@ -46,9 +133,6 @@ fn std_ip_to_smoltcp(ip: IpAddr) -> IpAddress {
         }
     }
 }
-
-// RFC 8305 Happy Eyeballs parameters
-const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 // RFC 8305 Section 4: Interleave addresses (IPv6, IPv4, IPv6, IPv4, ...)
 // In-place sorting to avoid extra allocations
@@ -99,17 +183,17 @@ struct FragBuffer {
 }
 
 impl FragBuffer {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, max_frag_count: usize) -> Self {
         Self {
-            fragments: vec![None; UDP_FRAG_MAX_COUNT],
+            fragments: vec![None; max_frag_count.max(2)],
             highest_seq: 0,
             end_seq: None,
             last_update: now,
         }
     }
 
-    fn is_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.last_update) > UDP_FRAG_TIMEOUT
+    fn is_expired(&self, now: Instant, timeout: Duration) -> bool {
+        now.duration_since(self.last_update) > timeout
     }
 
     fn reset(&mut self, now: Instant) {
@@ -176,11 +260,7 @@ fn get_local_port() -> u16 {
 }
 
 fn max_concurrent_connections() -> usize {
-    std::env::var("USQUE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|val| val.parse::<usize>().ok())
-        .filter(|val| *val > 0)
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+    SocksTunables::from_env().max_concurrent_connections
 }
 
 #[derive(Error, Debug)]
@@ -214,7 +294,8 @@ fn cleanup_fragments(
     frag_buffers: &mut HashMap<fast_socks5::util::target_addr::TargetAddr, FragBuffer>,
 ) {
     let now = Instant::now();
-    frag_buffers.retain(|_, buffer| !buffer.is_expired(now));
+    let tunables = SocksTunables::from_env();
+    frag_buffers.retain(|_, buffer| !buffer.is_expired(now, tunables.udp_frag_timeout));
 }
 
 fn map_manager_error_to_reply(err: &ManagerError) -> fast_socks5::ReplyError {

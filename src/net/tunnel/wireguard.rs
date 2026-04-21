@@ -10,6 +10,20 @@ use tokio::net::UdpSocket;
 
 use super::stack::NetworkStack;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Error, Debug)]
 pub enum WgTunnelError {
     #[error("IO error: {0}")]
@@ -61,14 +75,14 @@ impl WgTunnel {
             rate_limiter,
         );
 
-        let packet_pool = PacketBufPool::new(256);
+        let packet_pool = PacketBufPool::new(env_usize("USQUE_WG_PACKET_POOL_SIZE", 256));
 
         Self {
             tunn,
             socket,
             client_id,
             packet_pool,
-            send_queue: Vec::with_capacity(64),
+            send_queue: Vec::with_capacity(env_usize("USQUE_WG_SEND_QUEUE_CAPACITY", 64)),
         }
     }
 
@@ -90,8 +104,8 @@ impl WgTunnel {
         log::debug!("WireGuard handshake initiated");
 
         let start = std::time::Instant::now();
-        let mut buf = vec![0u8; 65535];
-        let timer_interval = Duration::from_millis(250);
+        let mut buf = vec![0u8; env_usize("USQUE_WG_HANDSHAKE_BUFFER_SIZE", 64 * 1024)];
+        let timer_interval = Duration::from_millis(env_u64("USQUE_WG_HANDSHAKE_TIMER_MS", 250));
         let timer = tokio::time::sleep(timer_interval);
         tokio::pin!(timer);
 

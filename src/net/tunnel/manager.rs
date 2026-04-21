@@ -4,7 +4,7 @@ use crate::net::tunnel::dns::{
 };
 use crate::net::tunnel::masque::MasqueTunnel;
 use crate::net::tunnel::quic;
-use crate::net::tunnel::stack::{BufferPool, DeviceStats, NetworkStack, StackError};
+use crate::net::tunnel::stack::{BufferPool, DeviceStats, NetworkStack, StackError, StackTunables};
 use crate::net::tunnel::wireguard::WgTunnel;
 use bytes::{Bytes, BytesMut};
 use quick_cache::unsync::Cache;
@@ -21,6 +21,147 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use crate::net::tunnel::quic::CongestionControl;
+
+#[derive(Clone, Debug)]
+pub struct ManagerTunables {
+    pub cmd_channel_capacity: usize,
+    pub udp_data_channel_capacity: usize,
+    pub incoming_dgram_capacity: usize,
+    pub udp_recv_buffer_size: usize,
+    pub tcp_chunk_size: usize,
+    pub udp_session_timeout: Duration,
+    pub max_pending_data: usize,
+    pub max_pending_to_client: usize,
+    pub udp_batch_read_budget: usize,
+    pub cmd_batch_budget: usize,
+    pub udp_batch_budget: usize,
+    pub socket_event_batch_budget: usize,
+    pub masque_stack_drain_budget: usize,
+    pub wg_stack_drain_budget: usize,
+    pub pool_max_size: usize,
+    pub max_poll_interval: Duration,
+    pub wg_timer_interval: Duration,
+    pub wg_udp_recv_buffer_size: usize,
+    pub wg_udp_send_buffer_size: usize,
+}
+
+impl Default for ManagerTunables {
+    fn default() -> Self {
+        Self {
+            cmd_channel_capacity: 1024,
+            udp_data_channel_capacity: 1024,
+            incoming_dgram_capacity: 4096,
+            udp_recv_buffer_size: 65535,
+            tcp_chunk_size: 64 * 1024,
+            udp_session_timeout: Duration::from_secs(300),
+            max_pending_data: 256 * 1024,
+            max_pending_to_client: 256 * 1024,
+            udp_batch_read_budget: 128,
+            cmd_batch_budget: 128,
+            udp_batch_budget: 128,
+            socket_event_batch_budget: 128,
+            masque_stack_drain_budget: 128,
+            wg_stack_drain_budget: 256,
+            pool_max_size: 256,
+            max_poll_interval: Duration::from_millis(50),
+            wg_timer_interval: Duration::from_millis(250),
+            wg_udp_recv_buffer_size: 4 * 1024 * 1024,
+            wg_udp_send_buffer_size: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl ManagerTunables {
+    pub fn from_env() -> Self {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_duration_ms(name: &str, default: Duration) -> Duration {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(default)
+        }
+
+        fn env_duration_secs(name: &str, default: Duration) -> Duration {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(default)
+        }
+
+        let defaults = Self::default();
+        Self {
+            cmd_channel_capacity: env_usize(
+                "USQUE_CMD_CHANNEL_CAPACITY",
+                defaults.cmd_channel_capacity,
+            ),
+            udp_data_channel_capacity: env_usize(
+                "USQUE_UDP_CHANNEL_CAPACITY",
+                defaults.udp_data_channel_capacity,
+            ),
+            incoming_dgram_capacity: env_usize(
+                "USQUE_INCOMING_DGRAM_CAPACITY",
+                defaults.incoming_dgram_capacity,
+            ),
+            udp_recv_buffer_size: env_usize(
+                "USQUE_INCOMING_UDP_BUFFER_SIZE",
+                defaults.udp_recv_buffer_size,
+            ),
+            tcp_chunk_size: env_usize("USQUE_TCP_CHUNK_SIZE", defaults.tcp_chunk_size),
+            udp_session_timeout: env_duration_secs(
+                "USQUE_UDP_SESSION_TIMEOUT_SECS",
+                defaults.udp_session_timeout,
+            ),
+            max_pending_data: env_usize("USQUE_MAX_PENDING_DATA", defaults.max_pending_data),
+            max_pending_to_client: env_usize(
+                "USQUE_MAX_PENDING_TO_CLIENT",
+                defaults.max_pending_to_client,
+            ),
+            udp_batch_read_budget: env_usize(
+                "USQUE_UDP_BATCH_READ_BUDGET",
+                defaults.udp_batch_read_budget,
+            ),
+            cmd_batch_budget: env_usize("USQUE_CMD_BATCH_BUDGET", defaults.cmd_batch_budget),
+            udp_batch_budget: env_usize("USQUE_UDP_BATCH_BUDGET", defaults.udp_batch_budget),
+            socket_event_batch_budget: env_usize(
+                "USQUE_SOCKET_EVENT_BATCH_BUDGET",
+                defaults.socket_event_batch_budget,
+            ),
+            masque_stack_drain_budget: env_usize(
+                "USQUE_MASQUE_STACK_DRAIN_BUDGET",
+                defaults.masque_stack_drain_budget,
+            ),
+            wg_stack_drain_budget: env_usize(
+                "USQUE_WG_STACK_DRAIN_BUDGET",
+                defaults.wg_stack_drain_budget,
+            ),
+            pool_max_size: env_usize("USQUE_BUFFER_POOL_MAX_SIZE", defaults.pool_max_size),
+            max_poll_interval: env_duration_ms(
+                "USQUE_MAX_POLL_INTERVAL_MS",
+                defaults.max_poll_interval,
+            ),
+            wg_timer_interval: env_duration_ms(
+                "USQUE_WG_TIMER_INTERVAL_MS",
+                defaults.wg_timer_interval,
+            ),
+            wg_udp_recv_buffer_size: env_usize(
+                "USQUE_WG_UDP_RECVBUF",
+                defaults.wg_udp_recv_buffer_size,
+            ),
+            wg_udp_send_buffer_size: env_usize(
+                "USQUE_WG_UDP_SNDBUF",
+                defaults.wg_udp_send_buffer_size,
+            ),
+        }
+    }
+}
 
 /// Format IpAddress for logging (IPv6 uses bracket notation)
 fn format_ip(ip: IpAddress) -> String {
@@ -55,6 +196,8 @@ pub struct ConnectionParams {
     pub wg_client_id: Option<[u8; 3]>,
     pub perf_enabled: bool,
     pub perf_interval_secs: u64,
+    pub manager_tunables: ManagerTunables,
+    pub stack_tunables: StackTunables,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -435,6 +578,7 @@ impl PerfCounters {
 
 struct RuntimeState {
     stack: NetworkStack,
+    tunables: ManagerTunables,
     sockets: HashMap<SocketHandle, SocketState>,
     // Keep in sync with sockets for fast iteration without per-loop allocations.
     tcp_handles: Vec<SocketHandle>,
@@ -449,6 +593,7 @@ struct RuntimeState {
     udp_sessions: HashMap<u16, UdpSessionState>,
     // Keep in sync with udp_sessions for fast iteration without per-loop allocations.
     udp_ports: Vec<u16>,
+    udp_buffer: BytesMut,
     read_buffer: BytesMut,
     write_buffer: BytesMut,
     buffer_pool: BufferPool,
@@ -456,11 +601,19 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(stack: NetworkStack, perf_enabled: bool, perf_interval_secs: u64) -> Self {
+    fn new(
+        stack: NetworkStack,
+        tunables: ManagerTunables,
+        perf_enabled: bool,
+        perf_interval_secs: u64,
+    ) -> Self {
         let buffer_pool = stack.buffer_pool();
         let (socket_event_tx, socket_event_rx) = mpsc::unbounded_channel();
+        let tcp_chunk_size = tunables.tcp_chunk_size;
+        let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
         Self {
             stack,
+            tunables,
             sockets: HashMap::new(),
             tcp_handles: Vec::new(),
             ready_tcp_handles: VecDeque::new(),
@@ -473,8 +626,9 @@ impl RuntimeState {
             dns_cache: Cache::new(DNS_CACHE_CAPACITY),
             udp_sessions: HashMap::new(),
             udp_ports: Vec::new(),
-            read_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
-            write_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
+            udp_buffer: BytesMut::zeroed(udp_recv_buffer_size),
+            read_buffer: BytesMut::zeroed(tcp_chunk_size),
+            write_buffer: BytesMut::zeroed(tcp_chunk_size),
             buffer_pool,
             perf: PerfCounters::new(perf_enabled, perf_interval_secs),
         }
@@ -507,28 +661,6 @@ impl RuntimeState {
         }
     }
 }
-
-const CMD_CHANNEL_CAPACITY: usize = 256;
-const UDP_DATA_CHANNEL_CAPACITY: usize = 2048;
-// Increased for high-concurrency scenarios (64+ parallel connections)
-const INCOMING_DGRAM_CAPACITY: usize = 4096;
-const UDP_RECV_BUFFER_SIZE: usize = 65535;
-const MAX_TCP_READ_CHUNK: usize = 64 * 1024;
-
-const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-// Backpressure: from_client uses small channel (32) so send().await naturally blocks SOCKS5 reads
-const MAX_PENDING_DATA: usize = 128 * 1024; // 128KB per socket (for partial writes)
-// Backpressure: to_client uses try_send + pending queue, must never block manager
-const MAX_PENDING_TO_CLIENT: usize = 256 * 1024; // 256KB per socket
-const UDP_BATCH_READ_BUDGET: usize = 128;
-const CMD_BATCH_BUDGET: usize = 64;
-const UDP_BATCH_BUDGET: usize = 64;
-const SOCKET_EVENT_BATCH_BUDGET: usize = 128;
-const MASQUE_STACK_DRAIN_BUDGET: usize = 128;
-const WG_STACK_DRAIN_BUDGET: usize = 256;
-const POOL_MAX_SIZE: usize = 256;
-const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const WG_TIMER_INTERVAL_MS: u64 = 250;
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 static DNS_SERVER_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

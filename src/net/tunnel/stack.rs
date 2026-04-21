@@ -13,11 +13,93 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 use thiserror::Error;
 
-const MAX_QUEUE_SIZE: usize = 4096;
-const BUFFER_POOL_SIZE: usize = 256;
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) type BufferPool = Arc<Mutex<Vec<BytesMut>>>;
+
+#[derive(Clone, Debug)]
+pub struct StackTunables {
+    pub device_queue_capacity: usize,
+    pub buffer_pool_size: usize,
+    pub tcp_ack_delay: Option<Duration>,
+    pub tcp_keepalive: Option<Duration>,
+    pub tcp_timeout: Option<Duration>,
+    pub udp_socket_metadata_capacity: usize,
+    pub udp_socket_buffer_size: usize,
+}
+
+impl Default for StackTunables {
+    fn default() -> Self {
+        Self {
+            device_queue_capacity: 4096,
+            buffer_pool_size: 256,
+            tcp_ack_delay: Some(Duration::from_millis(10)),
+            tcp_keepalive: Some(Duration::from_secs(28)),
+            tcp_timeout: Some(Duration::from_secs(7200)),
+            udp_socket_metadata_capacity: 16,
+            udp_socket_buffer_size: 64 * 1024,
+        }
+    }
+}
+
+impl StackTunables {
+    pub fn from_env() -> Self {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_optional_duration_ms(name: &str, default: Option<Duration>) -> Option<Duration> {
+            match std::env::var(name) {
+                Ok(v) => match v.parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(ms) => Some(Duration::from_millis(ms)),
+                    Err(_) => default,
+                },
+                Err(_) => default,
+            }
+        }
+
+        fn env_optional_duration_secs(name: &str, default: Option<Duration>) -> Option<Duration> {
+            match std::env::var(name) {
+                Ok(v) => match v.parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(secs) => Some(Duration::from_secs(secs)),
+                    Err(_) => default,
+                },
+                Err(_) => default,
+            }
+        }
+
+        let defaults = Self::default();
+        Self {
+            device_queue_capacity: env_usize(
+                "USQUE_STACK_QUEUE_CAPACITY",
+                defaults.device_queue_capacity,
+            ),
+            buffer_pool_size: env_usize("USQUE_STACK_BUFFER_POOL_SIZE", defaults.buffer_pool_size),
+            tcp_ack_delay: env_optional_duration_ms(
+                "USQUE_TCP_ACK_DELAY_MS",
+                defaults.tcp_ack_delay,
+            ),
+            tcp_keepalive: env_optional_duration_secs(
+                "USQUE_TCP_KEEPALIVE_SECS",
+                defaults.tcp_keepalive,
+            ),
+            tcp_timeout: env_optional_duration_secs("USQUE_TCP_TIMEOUT_SECS", defaults.tcp_timeout),
+            udp_socket_metadata_capacity: env_usize(
+                "USQUE_UDP_SOCKET_METADATA_CAPACITY",
+                defaults.udp_socket_metadata_capacity,
+            ),
+            udp_socket_buffer_size: env_usize(
+                "USQUE_UDP_SOCKET_BUFFER_SIZE",
+                defaults.udp_socket_buffer_size,
+            ),
+        }
+    }
+}
 
 struct DropLogger {
     label: &'static str,
@@ -63,17 +145,21 @@ pub struct VirtualDevice {
     tx_queue: VecDeque<BytesMut>,
     buffer_pool: BufferPool,
     mtu: usize,
+    queue_capacity: usize,
+    pool_capacity: usize,
     rx_drop_logger: DropLogger,
     tx_drop_logger: DropLogger,
 }
 
 impl VirtualDevice {
-    pub fn new(mtu: usize, buffer_pool: BufferPool) -> Self {
+    pub fn new(mtu: usize, buffer_pool: BufferPool, tunables: &StackTunables) -> Self {
         Self {
             rx_queue: VecDeque::with_capacity(1024),
             tx_queue: VecDeque::with_capacity(1024),
             buffer_pool,
             mtu,
+            queue_capacity: tunables.device_queue_capacity,
+            pool_capacity: tunables.buffer_pool_size,
             rx_drop_logger: DropLogger::new("RX"),
             tx_drop_logger: DropLogger::new("TX"),
         }
@@ -101,13 +187,13 @@ impl VirtualDevice {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if pool.len() < BUFFER_POOL_SIZE {
+        if pool.len() < self.pool_capacity {
             pool.push(buf);
         }
     }
 
     pub fn inject_packet(&mut self, data: &[u8]) {
-        while self.rx_queue.len() >= MAX_QUEUE_SIZE {
+        while self.rx_queue.len() >= self.queue_capacity {
             if let Some(old) = self.rx_queue.pop_front() {
                 self.return_buffer(old);
             }
@@ -119,7 +205,7 @@ impl VirtualDevice {
     }
 
     pub fn inject_packet_owned(&mut self, data: BytesMut) {
-        while self.rx_queue.len() >= MAX_QUEUE_SIZE {
+        while self.rx_queue.len() >= self.queue_capacity {
             if let Some(old) = self.rx_queue.pop_front() {
                 self.return_buffer(old);
             }
@@ -156,7 +242,7 @@ impl VirtualDevice {
     }
 
     fn has_tx_capacity(&self) -> bool {
-        self.tx_queue.len() < MAX_QUEUE_SIZE
+        self.tx_queue.len() < self.queue_capacity
     }
 }
 
@@ -183,11 +269,14 @@ impl Device for VirtualDevice {
             VirtualRxToken {
                 data: packet,
                 buffer_pool: self.buffer_pool.clone(),
+                pool_capacity: self.pool_capacity,
             },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
                 buffer,
                 buffer_pool: self.buffer_pool.clone(),
+                queue_capacity: self.queue_capacity,
+                pool_capacity: self.pool_capacity,
                 drop_logger: &mut self.tx_drop_logger,
             },
         ))
@@ -202,6 +291,8 @@ impl Device for VirtualDevice {
             queue: &mut self.tx_queue,
             buffer,
             buffer_pool: self.buffer_pool.clone(),
+            queue_capacity: self.queue_capacity,
+            pool_capacity: self.pool_capacity,
             drop_logger: &mut self.tx_drop_logger,
         })
     }
@@ -224,6 +315,7 @@ impl Device for VirtualDevice {
 pub struct VirtualRxToken {
     data: BytesMut,
     buffer_pool: BufferPool,
+    pool_capacity: usize,
 }
 
 impl Drop for VirtualRxToken {
@@ -235,7 +327,7 @@ impl Drop for VirtualRxToken {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if pool.len() < BUFFER_POOL_SIZE {
+        if pool.len() < self.pool_capacity {
             pool.push(buf);
         }
     }
@@ -254,6 +346,8 @@ pub struct VirtualTxToken<'a> {
     queue: &'a mut VecDeque<BytesMut>,
     buffer: BytesMut,
     buffer_pool: BufferPool,
+    queue_capacity: usize,
+    pool_capacity: usize,
     drop_logger: &'a mut DropLogger,
 }
 
@@ -266,7 +360,7 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         self.buffer.resize(len, 0);
         let result = f(&mut self.buffer);
 
-        if self.queue.len() >= MAX_QUEUE_SIZE {
+        if self.queue.len() >= self.queue_capacity {
             self.drop_logger.log_drop();
             let mut dropped = std::mem::take(&mut self.buffer);
             dropped.clear();
@@ -274,7 +368,7 @@ impl<'a> TxToken for VirtualTxToken<'a> {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if pool.len() < BUFFER_POOL_SIZE {
+            if pool.len() < self.pool_capacity {
                 pool.push(dropped);
             }
             return result;
@@ -296,10 +390,11 @@ mod tests {
 
     #[test]
     fn receive_preserves_rx_packet_when_tx_queue_is_full() {
-        let mut device = VirtualDevice::new(1500, test_buffer_pool());
+        let tunables = StackTunables::default();
+        let mut device = VirtualDevice::new(1500, test_buffer_pool(), &tunables);
         device.inject_packet(&[1, 2, 3, 4]);
 
-        for _ in 0..MAX_QUEUE_SIZE {
+        for _ in 0..tunables.device_queue_capacity {
             device.tx_queue.push_back(BytesMut::from(&b"x"[..]));
         }
 
@@ -325,8 +420,9 @@ mod tests {
 
     #[test]
     fn transmit_returns_none_when_tx_queue_is_full() {
-        let mut device = VirtualDevice::new(1500, test_buffer_pool());
-        for _ in 0..MAX_QUEUE_SIZE {
+        let tunables = StackTunables::default();
+        let mut device = VirtualDevice::new(1500, test_buffer_pool(), &tunables);
+        for _ in 0..tunables.device_queue_capacity {
             device.tx_queue.push_back(BytesMut::from(&b"x"[..]));
         }
 
@@ -338,7 +434,8 @@ mod tests {
 
     #[test]
     fn requeue_packet_front_restores_packet_order() {
-        let mut device = VirtualDevice::new(1500, test_buffer_pool());
+        let tunables = StackTunables::default();
+        let mut device = VirtualDevice::new(1500, test_buffer_pool(), &tunables);
         device.tx_queue.push_back(BytesMut::from(&b"b"[..]));
         device.requeue_packet_front(BytesMut::from(&b"a"[..]));
 
@@ -375,6 +472,7 @@ pub struct NetworkStack {
     local_ipv4: Option<Ipv4Address>,
     local_ipv6: Option<Ipv6Address>,
     buffer_pool: BufferPool,
+    tunables: StackTunables,
 }
 
 impl NetworkStack {
@@ -426,19 +524,25 @@ impl NetworkStack {
         snapshot
     }
 
-    pub fn new(ipv4: Option<&str>, ipv6: Option<&str>, mtu: usize) -> Self {
-        let buffer_pool: BufferPool = Arc::new(Mutex::new(Vec::with_capacity(BUFFER_POOL_SIZE)));
+    pub fn new(
+        ipv4: Option<&str>,
+        ipv6: Option<&str>,
+        mtu: usize,
+        tunables: StackTunables,
+    ) -> Self {
+        let buffer_pool: BufferPool =
+            Arc::new(Mutex::new(Vec::with_capacity(tunables.buffer_pool_size)));
         {
             let mut pool = match buffer_pool.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            for _ in 0..BUFFER_POOL_SIZE {
+            for _ in 0..tunables.buffer_pool_size {
                 pool.push(BytesMut::with_capacity(mtu));
             }
         }
 
-        let mut device = VirtualDevice::new(mtu, buffer_pool.clone());
+        let mut device = VirtualDevice::new(mtu, buffer_pool.clone(), &tunables);
 
         let mut local_ipv4 = match ipv4.filter(|s| !s.trim().is_empty()) {
             Some(s) => match s.parse() {
@@ -503,6 +607,7 @@ impl NetworkStack {
             local_ipv4,
             local_ipv6,
             buffer_pool,
+            tunables,
         }
     }
 
@@ -552,9 +657,10 @@ impl NetworkStack {
         let tx_buffer = SocketBuffer::new(vec![0; buffer_size]);
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
-        socket.set_ack_delay(None);
+        socket.set_ack_delay(self.tunables.tcp_ack_delay.map(Into::into));
+        socket.set_keep_alive(self.tunables.tcp_keepalive.map(Into::into));
         socket.set_congestion_control(CongestionControl::Cubic);
-        socket.set_timeout(Some(smoltcp::time::Duration::from_secs(7200)));
+        socket.set_timeout(self.tunables.tcp_timeout.map(Into::into));
         let handle = self.sockets.add(socket);
         self.valid_handles.insert(handle);
         handle
@@ -703,8 +809,16 @@ impl NetworkStack {
         local_addr: IpAddress,
         local_port: u16,
     ) -> Result<SocketHandle, StackError> {
-        let rx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 8192]);
-        let tx_buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 8192]);
+        let metadata_capacity = self.tunables.udp_socket_metadata_capacity;
+        let buffer_size = self.tunables.udp_socket_buffer_size;
+        let rx_buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; metadata_capacity],
+            vec![0; buffer_size],
+        );
+        let tx_buffer = PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; metadata_capacity],
+            vec![0; buffer_size],
+        );
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
         let local_endpoint = IpEndpoint::new(local_addr, local_port);
