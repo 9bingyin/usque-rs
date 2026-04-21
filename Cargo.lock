@@ -2967,6 +2967,7 @@ dependencies = [
  "der",
  "env_logger",
  "fast-socks5",
+ "futures",
  "gotatun",
  "hex",
  "hickory-proto",

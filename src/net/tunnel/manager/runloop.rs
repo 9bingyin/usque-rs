@@ -214,7 +214,7 @@ impl TunnelManager {
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
-    ) -> Result<SocketChannels, ManagerError> {
+    ) -> Result<SocketStream, ManagerError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.cmd_tx
@@ -386,6 +386,11 @@ impl TunnelManager {
 
                 Some(incoming) = incoming_task.incoming_rx.recv() => {
                     handled_incoming |= Self::handle_incoming_datagram(&mut tunnel, &mut state, incoming);
+                    dirty = true;
+                }
+
+                Some(event) = state.socket_event_rx.recv() => {
+                    Self::handle_socket_event(&mut state, event);
                     dirty = true;
                 }
 

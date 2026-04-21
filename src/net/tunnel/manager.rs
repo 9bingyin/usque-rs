@@ -11,7 +11,7 @@ use quick_cache::unsync::Cache;
 use rand::Rng;
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -88,7 +88,7 @@ pub enum ManagerCommand {
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
-        response: oneshot::Sender<Result<SocketChannels, ManagerError>>,
+        response: oneshot::Sender<Result<SocketStream, ManagerError>>,
     },
     // Close a TCP connection
     Close {
@@ -134,26 +134,37 @@ pub enum TcpSocketState {
     Closed,
 }
 
-// Channels for a single TCP socket
-pub struct SocketChannels {
-    pub handle: SocketHandle,
-    pub to_stack: mpsc::Sender<Bytes>,
-    pub from_stack: mpsc::Receiver<Bytes>,
+include!("manager/buffer.rs");
+#[derive(Clone, Copy)]
+enum SocketEventKind {
+    ReadReady,
+    WriteReady,
+    Closed,
 }
+struct SocketEvent {
+    handle: SocketHandle,
+    kind: SocketEventKind,
+}
+include!("manager/stream.rs");
 
 // Internal state for each socket
 struct SocketState {
-    to_client: mpsc::Sender<Bytes>,
-    from_client: mpsc::Receiver<Bytes>,
-    pending_from_client: VecDeque<Bytes>,
-    pending_from_client_bytes: usize,
-    pending_to_client: VecDeque<Bytes>,
-    pending_to_client_bytes: usize,
+    stream: Arc<SocketStreamHandle>,
     close_requested: bool,
     write_shutdown: bool,
     fin_sent: bool,
     // Waiters for socket ready notification (event-driven instead of polling)
     ready_waiters: Vec<oneshot::Sender<TcpSocketState>>,
+}
+
+impl SocketState {
+    fn buffered_from_client_bytes(&self) -> usize {
+        self.stream.send_buffer.len()
+    }
+
+    fn buffered_to_client_bytes(&self) -> usize {
+        self.stream.recv_buffer.len()
+    }
 }
 
 include!("manager/dns_cache.rs");
@@ -255,6 +266,7 @@ struct PerfSnapshot {
     cmd_queue_len: usize,
     udp_queue_len: usize,
     incoming_queue_len: usize,
+    ready_tcp_queue_len: usize,
     transport_pending_send_packets: usize,
 }
 
@@ -271,6 +283,10 @@ struct PerfCounters {
     scheduler_yields: u64,
     masque_blocked_events: u64,
     wg_flushes: u64,
+    socket_event_batches: u64,
+    socket_events: u64,
+    full_tcp_sweeps: u64,
+    targeted_tcp_sweeps: u64,
 }
 
 impl PerfCounters {
@@ -289,6 +305,10 @@ impl PerfCounters {
             scheduler_yields: 0,
             masque_blocked_events: 0,
             wg_flushes: 0,
+            socket_event_batches: 0,
+            socket_events: 0,
+            full_tcp_sweeps: 0,
+            targeted_tcp_sweeps: 0,
         }
     }
 
@@ -340,6 +360,23 @@ impl PerfCounters {
         }
     }
 
+    fn inc_socket_event_batch(&mut self, count: usize) {
+        if self.enabled && count > 0 {
+            self.socket_event_batches += 1;
+            self.socket_events += count as u64;
+        }
+    }
+
+    fn inc_tcp_sweep(&mut self, full_sweep: bool) {
+        if self.enabled {
+            if full_sweep {
+                self.full_tcp_sweeps += 1;
+            } else {
+                self.targeted_tcp_sweeps += 1;
+            }
+        }
+    }
+
     fn report(&mut self, snapshot: PerfSnapshot) {
         if !self.enabled {
             return;
@@ -350,7 +387,7 @@ impl PerfCounters {
         }
         let secs = elapsed.as_secs_f64();
         log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s wg_flushes={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} transport_pending={}",
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
             self.rx_packets as f64 / secs,
             self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.tx_packets as f64 / secs,
@@ -360,6 +397,10 @@ impl PerfCounters {
             self.scheduler_yields as f64 / secs,
             self.masque_blocked_events as f64 / secs,
             self.wg_flushes as f64 / secs,
+            self.socket_event_batches as f64 / secs,
+            self.socket_events as f64 / secs,
+            self.full_tcp_sweeps as f64 / secs,
+            self.targeted_tcp_sweeps as f64 / secs,
             snapshot.sockets,
             snapshot.udp_sessions,
             snapshot.dns_groups,
@@ -372,6 +413,7 @@ impl PerfCounters {
             snapshot.cmd_queue_len,
             snapshot.udp_queue_len,
             snapshot.incoming_queue_len,
+            snapshot.ready_tcp_queue_len,
             snapshot.transport_pending_send_packets,
         );
         self.last_report = Instant::now();
@@ -384,6 +426,10 @@ impl PerfCounters {
         self.scheduler_yields = 0;
         self.masque_blocked_events = 0;
         self.wg_flushes = 0;
+        self.socket_event_batches = 0;
+        self.socket_events = 0;
+        self.full_tcp_sweeps = 0;
+        self.targeted_tcp_sweeps = 0;
     }
 }
 
@@ -392,6 +438,10 @@ struct RuntimeState {
     sockets: HashMap<SocketHandle, SocketState>,
     // Keep in sync with sockets for fast iteration without per-loop allocations.
     tcp_handles: Vec<SocketHandle>,
+    ready_tcp_handles: VecDeque<SocketHandle>,
+    ready_tcp_set: HashSet<SocketHandle>,
+    socket_event_tx: mpsc::UnboundedSender<SocketEvent>,
+    socket_event_rx: mpsc::UnboundedReceiver<SocketEvent>,
     dns_queries: HashMap<u16, DnsQueryState>,
     dns_groups: HashMap<u32, DnsQueryGroup>,
     dns_sockets: DnsSockets,
@@ -400,6 +450,7 @@ struct RuntimeState {
     // Keep in sync with udp_sessions for fast iteration without per-loop allocations.
     udp_ports: Vec<u16>,
     read_buffer: BytesMut,
+    write_buffer: BytesMut,
     buffer_pool: BufferPool,
     perf: PerfCounters,
 }
@@ -407,10 +458,15 @@ struct RuntimeState {
 impl RuntimeState {
     fn new(stack: NetworkStack, perf_enabled: bool, perf_interval_secs: u64) -> Self {
         let buffer_pool = stack.buffer_pool();
+        let (socket_event_tx, socket_event_rx) = mpsc::unbounded_channel();
         Self {
             stack,
             sockets: HashMap::new(),
             tcp_handles: Vec::new(),
+            ready_tcp_handles: VecDeque::new(),
+            ready_tcp_set: HashSet::new(),
+            socket_event_tx,
+            socket_event_rx,
             dns_queries: HashMap::new(),
             dns_groups: HashMap::new(),
             dns_sockets: DnsSockets::new(),
@@ -418,6 +474,7 @@ impl RuntimeState {
             udp_sessions: HashMap::new(),
             udp_ports: Vec::new(),
             read_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
+            write_buffer: BytesMut::zeroed(MAX_TCP_READ_CHUNK),
             buffer_pool,
             perf: PerfCounters::new(perf_enabled, perf_interval_secs),
         }
@@ -433,8 +490,8 @@ impl RuntimeState {
         }
 
         if self.sockets.values().any(|socket| {
-            socket.pending_from_client_bytes > 0
-                || socket.pending_to_client_bytes > 0
+            socket.buffered_from_client_bytes() > 0
+                || socket.buffered_to_client_bytes() > 0
                 || socket.close_requested
         }) {
             return true;
@@ -442,6 +499,12 @@ impl RuntimeState {
 
         let (rx_queue_len, tx_queue_len) = self.stack.queue_lengths();
         rx_queue_len > 0 || tx_queue_len > 0
+    }
+
+    fn enqueue_ready_tcp_handle(&mut self, handle: SocketHandle) {
+        if self.ready_tcp_set.insert(handle) {
+            self.ready_tcp_handles.push_back(handle);
+        }
     }
 }
 
@@ -460,16 +523,12 @@ const MAX_PENDING_TO_CLIENT: usize = 256 * 1024; // 256KB per socket
 const UDP_BATCH_READ_BUDGET: usize = 128;
 const CMD_BATCH_BUDGET: usize = 64;
 const UDP_BATCH_BUDGET: usize = 64;
+const SOCKET_EVENT_BATCH_BUDGET: usize = 128;
 const MASQUE_STACK_DRAIN_BUDGET: usize = 128;
 const WG_STACK_DRAIN_BUDGET: usize = 256;
 const POOL_MAX_SIZE: usize = 256;
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WG_TIMER_INTERVAL_MS: u64 = 250;
-
-enum DeliverError {
-    Backpressure,
-    Closed,
-}
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 static DNS_SERVER_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

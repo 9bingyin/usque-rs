@@ -6,7 +6,7 @@ pub mod stack;
 pub mod wireguard;
 
 pub use manager::{
-    ConnectionParams, ManagerCommand, ManagerError, SocketChannels, TcpSocketState, TunnelManager,
+    ConnectionParams, ManagerCommand, ManagerError, SocketStream, TcpSocketState, TunnelManager,
     TunnelManagerPool, TunnelMode,
 };
 pub use quic::CongestionControl;

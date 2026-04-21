@@ -16,6 +16,7 @@ impl TunnelManager {
                     &mut state.stack,
                     &mut state.sockets,
                     &mut state.tcp_handles,
+                    state.socket_event_tx.clone(),
                     remote_ip,
                     remote_port,
                     local_port,
@@ -165,11 +166,12 @@ impl TunnelManager {
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
         tcp_handles: &mut Vec<SocketHandle>,
+        socket_event_tx: mpsc::UnboundedSender<SocketEvent>,
         remote_ip: IpAddress,
         remote_port: u16,
         local_port: u16,
         tcp_buffer_size: usize,
-    ) -> Result<SocketChannels, ManagerError> {
+    ) -> Result<SocketStream, ManagerError> {
         let handle = stack.create_tcp_socket_with_buffer(tcp_buffer_size);
 
         if let Err(e) = stack.connect_tcp(handle, remote_ip, remote_port, local_port) {
@@ -177,16 +179,15 @@ impl TunnelManager {
             return Err(ManagerError::Stack(e));
         }
 
-        let (to_client_tx, to_client_rx) = mpsc::channel(128);
-        let (from_client_tx, from_client_rx) = mpsc::channel(32);
+        let (stream, control) = SocketStream::new(
+            handle,
+            MAX_PENDING_DATA,
+            MAX_PENDING_TO_CLIENT,
+            socket_event_tx,
+        );
 
         let state = SocketState {
-            to_client: to_client_tx,
-            from_client: from_client_rx,
-            pending_from_client: VecDeque::new(),
-            pending_from_client_bytes: 0,
-            pending_to_client: VecDeque::new(),
-            pending_to_client_bytes: 0,
+            stream: control,
             close_requested: false,
             write_shutdown: false,
             fin_sent: false,
@@ -196,11 +197,7 @@ impl TunnelManager {
         sockets.insert(handle, state);
         tcp_handles.push(handle);
 
-        Ok(SocketChannels {
-            handle,
-            to_stack: from_client_tx,
-            from_stack: to_client_rx,
-        })
+        Ok(stream)
     }
 
     fn close_connection(
@@ -212,6 +209,9 @@ impl TunnelManager {
         if let Some(state) = sockets.get_mut(&handle) {
             state.close_requested = true;
             state.write_shutdown = true;
+            state.stream.write_shutdown.store(true, std::sync::atomic::Ordering::Release);
+            state.stream.send_waker.wake();
+            state.stream.notify_closed();
             for waiter in state.ready_waiters.drain(..) {
                 if waiter.send(TcpSocketState::Closed).is_err() {
                     log::trace!("Failed to notify waiter of connection close: receiver dropped");

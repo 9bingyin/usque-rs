@@ -3,7 +3,7 @@ use super::{
     interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
 };
 use super::{Socks5Error, get_local_port};
-use crate::net::tunnel::manager::{SocketChannels, TcpSocketState, TunnelManager};
+use crate::net::tunnel::manager::{SocketStream, TcpSocketState, TunnelManager};
 use bytes::BytesMut;
 use fast_socks5::ReplyError;
 use fast_socks5::server::Socks5ServerProtocol;
@@ -129,7 +129,7 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
     log::debug!("racing {} addresses", addresses.len());
 
     let mut addr_iter = addresses.into_iter().peekable();
-    let mut pending: Vec<(SocketHandle, SocketChannels)> = Vec::new();
+    let mut pending: Vec<(SocketHandle, SocketStream)> = Vec::new();
     let mut last_error: Option<Socks5Error> = None;
 
     // Start first connection immediately
@@ -192,11 +192,11 @@ async fn handle_tcp_connect_racing<T: AsyncRead + AsyncWrite + Unpin>(
 /// Event-driven connection racing using wait_socket_ready
 async fn race_connections_event_driven(
     manager: &Arc<TunnelManager>,
-    pending: &mut Vec<(SocketHandle, SocketChannels)>,
+    pending: &mut Vec<(SocketHandle, SocketStream)>,
     addr_iter: &mut std::iter::Peekable<std::vec::IntoIter<IpAddress>>,
     remote_port: u16,
     last_error: &mut Option<Socks5Error>,
-) -> Result<(SocketHandle, SocketChannels), Socks5Error> {
+) -> Result<(SocketHandle, SocketStream), Socks5Error> {
     use tokio::sync::mpsc;
     use tokio::time::sleep;
 
@@ -301,7 +301,7 @@ async fn start_connection(
     manager: &TunnelManager,
     remote_ip: IpAddress,
     remote_port: u16,
-) -> Result<SocketChannels, Socks5Error> {
+) -> Result<SocketStream, Socks5Error> {
     let local_port = get_local_port();
     manager
         .connect(remote_ip, remote_port, local_port)
@@ -425,10 +425,12 @@ where
 
 async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut T,
-    mut channels: SocketChannels,
+    tunnel: SocketStream,
 ) -> Result<(), Socks5Error> {
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
     let mut client_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
+    let mut tunnel_buf = BytesMut::with_capacity(TCP_READ_BUFFER_SIZE);
     let mut client_eof = false;
     let mut tunnel_eof = false;
 
@@ -439,18 +441,10 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
 
         let result = tokio::time::timeout(IDLE_TIMEOUT, async {
             tokio::select! {
-                result = channels.from_stack.recv(), if !tunnel_eof => {
+                result = tunnel_reader.read_buf(&mut tunnel_buf), if !tunnel_eof => {
                     match result {
-                        Some(data) => {
-                            if let Err(e) = writer.write_all(&data).await {
-                                log::trace!("write to client failed: {}", e);
-                                return false;
-                            }
-                            true
-                        }
-                        None => {
-                            log::trace!("tunnel channel closed");
-                            // Flush before signaling EOF to client
+                        Ok(0) => {
+                            log::trace!("tunnel stream closed");
                             if let Err(e) = writer.flush().await {
                                 log::trace!("flush to client failed: {}", e);
                             }
@@ -460,6 +454,18 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                             tunnel_eof = true;
                             true
                         }
+                        Ok(n) => {
+                            let data = tunnel_buf.split_to(n).freeze();
+                            if let Err(e) = writer.write_all(&data).await {
+                                log::trace!("write to client failed: {}", e);
+                                return false;
+                            }
+                            true
+                        }
+                        Err(e) => {
+                            log::trace!("read from tunnel failed: {}", e);
+                            false
+                        }
                     }
                 }
 
@@ -467,16 +473,17 @@ async fn forward_tcp_data<T: AsyncRead + AsyncWrite + Unpin>(
                     match result {
                         Ok(0) => {
                             log::trace!("client closed connection");
-                            // Drop the sender to signal EOF to tunnel side
-                            drop(channels.to_stack.clone());
+                            if let Err(e) = tunnel_writer.shutdown().await {
+                                log::trace!("shutdown tunnel writer failed: {}", e);
+                            }
                             client_eof = true;
                             true
                         }
                         Ok(n) => {
                             let data = client_buf.split_to(n).freeze();
-                            if channels.to_stack.send(data).await.is_err() {
-                                log::trace!("tunnel channel closed");
-                                tunnel_eof = true;
+                            if let Err(e) = tunnel_writer.write_all(&data).await {
+                                log::trace!("write to tunnel failed: {}", e);
+                                return false;
                             }
                             true
                         }

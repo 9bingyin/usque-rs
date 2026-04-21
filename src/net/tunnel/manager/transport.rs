@@ -300,7 +300,7 @@ impl TunnelManager {
             tunnel.quic_conn.conn.on_timeout();
         }
 
-        if !Self::poll_stack_common(state) {
+        if !Self::poll_stack_common(state, true) {
             return false;
         }
 
@@ -308,8 +308,12 @@ impl TunnelManager {
         true
     }
 
-    async fn flush_active_tunnel(tunnel: &mut ActiveTunnel, state: &mut RuntimeState) -> bool {
-        if !Self::flush_stack_reads(state) {
+    async fn flush_active_tunnel(
+        tunnel: &mut ActiveTunnel,
+        state: &mut RuntimeState,
+        full_tcp_sweep: bool,
+    ) -> bool {
+        if !Self::flush_stack_reads(state, full_tcp_sweep) {
             return false;
         }
 

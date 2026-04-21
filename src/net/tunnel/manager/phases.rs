@@ -7,6 +7,7 @@ impl TunnelManager {
         incoming_task: &mut IncomingTask,
         params: &ConnectionParams,
     ) -> bool {
+        Self::drain_socket_event_batch(state, SOCKET_EVENT_BATCH_BUDGET);
         Self::drain_command_batch(
             state,
             &params.dns_servers,
@@ -27,7 +28,23 @@ impl TunnelManager {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
 
-        Self::flush_active_tunnel(tunnel, state).await
+        Self::flush_active_tunnel(tunnel, state, handled_incoming).await
+    }
+
+    fn drain_socket_event_batch(state: &mut RuntimeState, budget: usize) {
+        let mut remaining = budget;
+        let mut drained = 0usize;
+        while remaining > 0 {
+            match state.socket_event_rx.try_recv() {
+                Ok(event) => {
+                    Self::handle_socket_event(state, event);
+                    remaining -= 1;
+                    drained += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        state.perf.inc_socket_event_batch(drained);
     }
 
     fn drain_command_batch(
@@ -84,6 +101,17 @@ impl TunnelManager {
             }
         }
         handled_incoming
+    }
+
+    fn handle_socket_event(state: &mut RuntimeState, event: SocketEvent) {
+        if let Some(socket_state) = state.sockets.get_mut(&event.handle) {
+            socket_state.stream.clear_event(event.kind);
+            if matches!(event.kind, SocketEventKind::Closed) {
+                socket_state.close_requested = true;
+                socket_state.write_shutdown = true;
+            }
+        }
+        state.enqueue_ready_tcp_handle(event.handle);
     }
 
     fn notify_ready_waiters(
@@ -209,7 +237,7 @@ impl TunnelManager {
         }
     }
 
-    fn poll_stack_common(state: &mut RuntimeState) -> bool {
+    fn poll_stack_common(state: &mut RuntimeState, full_tcp_sweep: bool) -> bool {
         if let Err(e) = state.stack.poll() {
             log::error!("network stack poll failed: {}", e);
             return false;
@@ -230,7 +258,7 @@ impl TunnelManager {
 
         Self::expire_dns_groups(state);
         Self::expire_udp_sessions(state);
-        Self::poll_tcp_sockets(state);
+        Self::poll_tcp_sockets(state, full_tcp_sweep);
 
         true
     }
@@ -294,87 +322,73 @@ impl TunnelManager {
         }
     }
 
-    fn poll_tcp_sockets(state: &mut RuntimeState) {
+    fn poll_tcp_sockets(state: &mut RuntimeState, full_sweep: bool) {
+        state.perf.inc_tcp_sweep(full_sweep);
         let mut closed_handles = Vec::new();
+        let stack = &mut state.stack;
+        let read_buffer = &mut state.read_buffer;
+        let write_buffer = &mut state.write_buffer;
+        let handles: Vec<SocketHandle> = if full_sweep {
+            state.ready_tcp_handles.clear();
+            state.ready_tcp_set.clear();
+            state.tcp_handles.clone()
+        } else {
+            let mut handles = Vec::with_capacity(state.ready_tcp_handles.len());
+            while let Some(handle) = state.ready_tcp_handles.pop_front() {
+                state.ready_tcp_set.remove(&handle);
+                handles.push(handle);
+            }
+            handles
+        };
 
-        for handle in state.tcp_handles.iter().copied() {
-            if !state.stack.tcp_is_active(handle) {
+        for handle in handles {
+            if !stack.tcp_is_active(handle) {
                 closed_handles.push(handle);
                 continue;
             }
 
             if let Some(socket_state) = state.sockets.get_mut(&handle) {
-                if Self::flush_pending_to_client(socket_state) {
+                if socket_state
+                    .stream
+                    .socket_dropped
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
                     socket_state.close_requested = true;
                     socket_state.write_shutdown = true;
                 }
-
-                if !socket_state.close_requested
-                    && state.stack.tcp_may_recv(handle)
-                    && socket_state.pending_to_client_bytes < MAX_PENDING_TO_CLIENT
+                if socket_state
+                    .stream
+                    .write_shutdown
+                    .load(std::sync::atomic::Ordering::Acquire)
                 {
-                    let available =
-                        MAX_PENDING_TO_CLIENT.saturating_sub(socket_state.pending_to_client_bytes);
-                    let read_len = available.min(MAX_TCP_READ_CHUNK);
-                    if read_len > 0 {
-                        if state.read_buffer.len() < read_len {
-                            state.read_buffer.resize(read_len, 0);
-                        }
-                        if let Ok(n) = state
-                            .stack
-                            .tcp_recv(handle, &mut state.read_buffer[..read_len])
-                            && n > 0
-                        {
-                            let data = Bytes::copy_from_slice(&state.read_buffer[..n]);
-                            match Self::deliver_to_client(handle, socket_state, data) {
-                                Ok(()) | Err(DeliverError::Backpressure) => {}
-                                Err(DeliverError::Closed) => {
-                                    log::trace!("TCP channel closed for socket {:?}", handle);
-                                    socket_state.close_requested = true;
-                                    socket_state.write_shutdown = true;
-                                }
-                            }
-                        }
-                    }
+                    socket_state.write_shutdown = true;
                 }
+                Self::flush_pending_to_stack(stack, write_buffer, handle, socket_state);
+                Self::fill_recv_buffer(handle, stack, read_buffer, socket_state);
 
-                Self::flush_pending_to_stack(&mut state.stack, handle, socket_state);
+                let past_handshake = stack.tcp_is_past_handshake(handle);
 
-                if !socket_state.write_shutdown
-                    && socket_state.pending_from_client_bytes < MAX_PENDING_DATA
-                {
-                    loop {
-                        match socket_state.from_client.try_recv() {
-                            Ok(data) => {
-                                socket_state.pending_from_client_bytes += data.len();
-                                socket_state.pending_from_client.push_back(data);
-                                if socket_state.pending_from_client_bytes >= MAX_PENDING_DATA {
-                                    log::debug!(
-                                        "Pending data exceeded limit for socket {:?} ({} bytes), applying backpressure",
-                                        handle,
-                                        socket_state.pending_from_client_bytes
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                socket_state.close_requested = true;
-                                socket_state.write_shutdown = true;
-                                break;
-                            }
-                        }
-                    }
+                if past_handshake && !stack.tcp_may_recv(handle) {
+                    socket_state
+                        .stream
+                        .read_closed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    socket_state.stream.recv_waker.wake();
                 }
-
-                Self::flush_pending_to_stack(&mut state.stack, handle, socket_state);
+                if past_handshake && !stack.tcp_may_send(handle) {
+                    socket_state
+                        .stream
+                        .write_closed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    socket_state.stream.send_waker.wake();
+                }
 
                 if socket_state.close_requested
                     && !socket_state.fin_sent
-                    && socket_state.pending_from_client_bytes == 0
-                    && state.stack.tcp_may_send(handle)
+                    && socket_state.buffered_from_client_bytes() == 0
+                    && stack.tcp_may_send(handle)
                 {
-                    state.stack.tcp_close(handle);
+                    stack.tcp_close(handle);
                     socket_state.fin_sent = true;
                 }
             }
@@ -382,105 +396,108 @@ impl TunnelManager {
 
         for handle in &closed_handles {
             if let Some(socket_state) = state.sockets.remove(handle) {
+                socket_state
+                    .stream
+                    .socket_closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                socket_state
+                    .stream
+                    .read_closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                socket_state
+                    .stream
+                    .write_closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                socket_state.stream.recv_waker.wake();
+                socket_state.stream.send_waker.wake();
                 for waiter in socket_state.ready_waiters {
                     if waiter.send(TcpSocketState::Closed).is_err() {
                         log::trace!("Failed to notify waiter of connection close: receiver dropped");
                     }
                 }
             }
-            state.stack.remove_socket(*handle);
+            state.ready_tcp_set.remove(handle);
+            stack.remove_socket(*handle);
         }
         if !closed_handles.is_empty() {
             state.tcp_handles.retain(|h| !closed_handles.contains(h));
+            state
+                .ready_tcp_handles
+                .retain(|h| !closed_handles.contains(h));
         }
     }
 
-    fn flush_stack_reads(state: &mut RuntimeState) -> bool {
-        Self::poll_stack_common(state)
+    fn flush_stack_reads(state: &mut RuntimeState, full_tcp_sweep: bool) -> bool {
+        Self::poll_stack_common(state, full_tcp_sweep)
     }
 
-    fn flush_pending_to_client(state: &mut SocketState) -> bool {
-        while let Some(data) = state.pending_to_client.pop_front() {
-            let len = data.len();
-            match state.to_client.try_send(data) {
-                Ok(()) => {
-                    state.pending_to_client_bytes =
-                        state.pending_to_client_bytes.saturating_sub(len);
+    fn fill_recv_buffer(
+        handle: SocketHandle,
+        stack: &mut NetworkStack,
+        read_buffer: &mut BytesMut,
+        state: &mut SocketState,
+    ) {
+        if state.close_requested || !stack.tcp_may_recv(handle) {
+            return;
+        }
+
+        while state.stream.recv_buffer.remaining_capacity() > 0 && stack.tcp_may_recv(handle) {
+            let read_len = state
+                .stream
+                .recv_buffer
+                .remaining_capacity()
+                .min(MAX_TCP_READ_CHUNK);
+            if read_buffer.len() < read_len {
+                read_buffer.resize(read_len, 0);
+            }
+
+            match stack.tcp_recv(handle, &mut read_buffer[..read_len]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let written = state.stream.recv_buffer.enqueue_slice(&read_buffer[..n]);
+                    if written > 0 {
+                        state.stream.recv_waker.wake();
+                    }
+                    if written < n {
+                        log::debug!(
+                            "Receive buffer saturated for socket {:?} ({} bytes buffered)",
+                            handle,
+                            state.buffered_to_client_bytes()
+                        );
+                        break;
+                    }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    state.pending_to_client.push_front(data);
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    state.pending_to_client.clear();
-                    state.pending_to_client_bytes = 0;
-                    return true;
-                }
+                Err(_) => break,
             }
         }
-        false
     }
 
     fn flush_pending_to_stack(
         stack: &mut NetworkStack,
+        write_buffer: &mut BytesMut,
         handle: SocketHandle,
         state: &mut SocketState,
     ) {
-        if !stack.tcp_may_send(handle) {
-            return;
-        }
-
-        while let Some(data) = state.pending_from_client.pop_front() {
-            let len = data.len();
-            state.pending_from_client_bytes = state.pending_from_client_bytes.saturating_sub(len);
-
-            match stack.tcp_send(handle, &data) {
-                Ok(0) => {
-                    state.pending_from_client_bytes += len;
-                    state.pending_from_client.push_front(data);
-                    break;
-                }
-                Ok(sent) if sent < len => {
-                    let remaining = data.slice(sent..);
-                    state.pending_from_client_bytes += remaining.len();
-                    state.pending_from_client.push_front(remaining);
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    state.pending_from_client_bytes += len;
-                    state.pending_from_client.push_front(data);
-                    break;
-                }
+        while stack.tcp_may_send(handle) {
+            if write_buffer.len() < MAX_TCP_READ_CHUNK {
+                write_buffer.resize(MAX_TCP_READ_CHUNK, 0);
             }
-
-            if !stack.tcp_may_send(handle) {
+            let chunk_len = state.stream.send_buffer.peek_copy(&mut write_buffer[..MAX_TCP_READ_CHUNK]);
+            if chunk_len == 0 {
                 break;
             }
-        }
-    }
 
-    fn deliver_to_client(
-        handle: SocketHandle,
-        state: &mut SocketState,
-        data: Bytes,
-    ) -> Result<(), DeliverError> {
-        match state.to_client.try_send(data) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                if state.pending_to_client_bytes + data.len() > MAX_PENDING_TO_CLIENT {
-                    log::debug!(
-                        "Pending to-client data exceeded limit for socket {:?} ({} bytes), applying backpressure",
-                        handle,
-                        state.pending_to_client_bytes + data.len()
-                    );
-                    return Err(DeliverError::Backpressure);
+            match stack.tcp_send(handle, &write_buffer[..chunk_len]) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    state.stream.send_buffer.consume(sent);
+                    state.stream.send_waker.wake();
+                    if sent < chunk_len {
+                        break;
+                    }
                 }
-                state.pending_to_client_bytes += data.len();
-                state.pending_to_client.push_back(data);
-                Ok(())
+                Err(_) => break,
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::Closed),
         }
     }
 
@@ -501,8 +518,8 @@ impl TunnelManager {
         let mut pending_from_client_bytes = 0usize;
         let mut pending_to_client_bytes = 0usize;
         for socket_state in state.sockets.values() {
-            pending_from_client_bytes += socket_state.pending_from_client_bytes;
-            pending_to_client_bytes += socket_state.pending_to_client_bytes;
+            pending_from_client_bytes += socket_state.buffered_from_client_bytes();
+            pending_to_client_bytes += socket_state.buffered_to_client_bytes();
         }
 
         PerfSnapshot {
@@ -518,6 +535,7 @@ impl TunnelManager {
             cmd_queue_len,
             udp_queue_len,
             incoming_queue_len,
+            ready_tcp_queue_len: state.ready_tcp_handles.len(),
             transport_pending_send_packets: tunnel.transport_pending_send_packets(),
         }
     }

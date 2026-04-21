@@ -4,7 +4,7 @@ use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToke
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::socket::{
     Socket,
-    tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer},
+    tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer, State as TcpState},
 };
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
@@ -610,6 +610,17 @@ impl NetworkStack {
     pub fn tcp_may_recv(&mut self, handle: SocketHandle) -> bool {
         self.get_tcp_socket_mut(handle)
             .map(|s| s.may_recv())
+            .unwrap_or(false)
+    }
+
+    pub fn tcp_is_past_handshake(&mut self, handle: SocketHandle) -> bool {
+        self.get_tcp_socket_mut(handle)
+            .map(|s| {
+                !matches!(
+                    s.state(),
+                    TcpState::Listen | TcpState::SynSent | TcpState::SynReceived
+                )
+            })
             .unwrap_or(false)
     }
 
