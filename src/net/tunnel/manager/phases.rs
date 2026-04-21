@@ -71,6 +71,7 @@ impl TunnelManager {
         let needs_stack_poll =
             handled_commands || handled_udp_sends || incoming_result.stack_ingress;
         let needs_targeted_tcp_service = handled_socket_events || !state.ready_tcp_handles.is_empty();
+        let mut needs_stack_egress = false;
 
         if needs_stack_poll {
             if !Self::flush_stack_reads(state, incoming_result.stack_ingress) {
@@ -78,9 +79,21 @@ impl TunnelManager {
             }
         } else if needs_targeted_tcp_service {
             Self::poll_tcp_sockets(state, false);
+            if handled_socket_events {
+                match state.stack.poll_egress() {
+                    Ok(_state_changed) => {
+                        needs_stack_egress = state.stack.has_tx_packets();
+                    }
+                    Err(e) => {
+                        log::debug!("stack egress poll failed after socket event: {}", e);
+                        return false;
+                    }
+                }
+            }
         }
 
-        let needs_transport_drain = needs_stack_poll || state.stack.has_tx_packets();
+        let needs_transport_drain =
+            needs_stack_poll || needs_stack_egress || state.stack.has_tx_packets();
         let needs_transport_flush = incoming_result.needs_transport_flush
             || tunnel.transport_pending_send_packets() > 0
             || needs_transport_drain;
