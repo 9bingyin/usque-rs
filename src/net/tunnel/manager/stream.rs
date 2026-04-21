@@ -161,10 +161,14 @@ impl tokio::io::AsyncRead for SocketStream {
                 buf.unfilled_mut(),
             )
         };
-        let was_full = control.recv_buffer.is_full();
+        let before_len = control.recv_buffer.len();
+        let low_watermark = control.recv_buffer.usable_capacity() / 2;
         let n = control.recv_buffer.dequeue_slice(recv_buf);
         buf.advance(n);
-        if was_full && !control.recv_buffer.is_full() {
+        let after_len = before_len.saturating_sub(n);
+        if before_len == control.recv_buffer.usable_capacity()
+            || (before_len > low_watermark && after_len <= low_watermark)
+        {
             control.notify_read_ready();
         }
         std::task::Poll::Ready(Ok(()))
@@ -356,7 +360,42 @@ mod socket_stream_tests {
         assert_eq!(buf.filled(), b"4567");
         assert!(matches!(
             rx.try_recv(),
+            Ok(SocketEvent {
+                kind: SocketEventKind::ReadReady,
+                ..
+            })
+        ));
+
+        control.clear_all_events();
+        let mut bytes = [0u8; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+        let result = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+        assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"89ab");
+        assert!(matches!(
+            rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn poll_read_notifies_when_crossing_low_watermark() {
+        let (mut stream, control, mut rx) = build_stream();
+        let mut cx = noop_cx();
+
+        assert_eq!(control.recv_buffer.enqueue_slice(b"0123456789ab"), 12);
+        let mut bytes = [0u8; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+
+        let result = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+        assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"0123");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SocketEvent {
+                kind: SocketEventKind::ReadReady,
+                ..
+            })
         ));
     }
 
