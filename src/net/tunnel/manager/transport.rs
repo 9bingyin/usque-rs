@@ -274,36 +274,39 @@ impl TunnelManager {
         tunnel: &mut ActiveTunnel,
         state: &mut RuntimeState,
         incoming: IncomingDatagram,
-    ) -> bool {
+    ) -> IncomingHandling {
         let mut data = incoming.data;
 
-        let needs_transport_flush = match tunnel {
+        let handling = match tunnel {
             ActiveTunnel::Masque {
                 tunnel,
                 local_addr,
                 ..
-            } => {
-                Self::handle_udp_recv(
-                    tunnel,
-                    &mut state.stack,
-                    &state.buffer_pool,
-                    &mut state.perf,
-                    &mut state.udp_buffer,
-                    &mut data[..],
-                    incoming.from,
-                    *local_addr,
-                );
-                true
-            }
+            } => IncomingHandling {
+                stack_ingress: Self::handle_udp_recv(tunnel, state, &mut data[..], incoming.from, *local_addr),
+                needs_transport_flush: true,
+            },
             ActiveTunnel::Wg { tunnel, .. } => {
                 state.perf.inc_rx(data.len());
-                tunnel.decrypt_incoming(&mut data, &mut state.stack);
-                true
+                let packet = tunnel.decrypt_incoming(&mut data);
+                if let Some(packet) = packet {
+                    Self::note_incoming_tcp_handle(state, &packet[..]);
+                    state.stack.inject_packet_owned(packet);
+                    IncomingHandling {
+                        stack_ingress: true,
+                        needs_transport_flush: true,
+                    }
+                } else {
+                    IncomingHandling {
+                        stack_ingress: false,
+                        needs_transport_flush: true,
+                    }
+                }
             }
         };
 
         Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
-        needs_transport_flush
+        handling
     }
 
     async fn flush_transport_side_effects(

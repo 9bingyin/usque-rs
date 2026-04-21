@@ -15,6 +15,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=${RUSTFLAGS}
+
 RUN cargo build --release --locked
 
 FROM bitnami/minideb:trixie

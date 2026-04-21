@@ -393,7 +393,6 @@ impl TunnelManager {
             tokio::pin!(maintenance_timer);
 
             let mut dirty = false;
-            let mut handled_incoming = false;
             let mut needs_transport_flush = false;
 
             tokio::select! {
@@ -409,8 +408,8 @@ impl TunnelManager {
                 }
 
                 Some(incoming) = incoming_task.incoming_rx.recv() => {
-                    handled_incoming |= Self::handle_incoming_datagram(&mut tunnel, &mut state, incoming);
-                    needs_transport_flush |= handled_incoming;
+                    let handled = Self::handle_incoming_datagram(&mut tunnel, &mut state, incoming);
+                    needs_transport_flush |= handled.needs_transport_flush;
                     dirty = true;
                 }
 

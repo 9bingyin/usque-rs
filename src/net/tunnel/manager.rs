@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use crate::net::tunnel::quic::{CongestionControl, QuicSendStatus};
+use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket};
 
 #[derive(Clone, Debug)]
 pub struct ManagerTunables {
@@ -299,11 +300,19 @@ include!("manager/stream.rs");
 // Internal state for each socket
 struct SocketState {
     stream: Arc<SocketStreamHandle>,
+    flow_key: Option<TcpFlowKey>,
     close_requested: bool,
     write_shutdown: bool,
     fin_sent: bool,
     // Waiters for socket ready notification (event-driven instead of polling)
     ready_waiters: Vec<oneshot::Sender<TcpSocketState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TcpFlowKey {
+    local_port: u16,
+    remote_ip: IpAddress,
+    remote_port: u16,
 }
 
 impl SocketState {
@@ -372,6 +381,12 @@ struct UdpSend {
 struct IncomingDatagram {
     data: BytesMut,
     from: SocketAddr,
+}
+
+#[derive(Default, Clone, Copy)]
+struct IncomingHandling {
+    stack_ingress: bool,
+    needs_transport_flush: bool,
 }
 
 enum TunnelConn {
@@ -620,6 +635,7 @@ struct RuntimeState {
     stack: NetworkStack,
     tunables: ManagerTunables,
     sockets: HashMap<SocketHandle, SocketState>,
+    tcp_flow_map: HashMap<TcpFlowKey, SocketHandle>,
     // Keep in sync with sockets for fast iteration without per-loop allocations.
     tcp_handles: Vec<SocketHandle>,
     ready_tcp_handles: VecDeque<SocketHandle>,
@@ -655,6 +671,7 @@ impl RuntimeState {
             stack,
             tunables,
             sockets: HashMap::new(),
+            tcp_flow_map: HashMap::new(),
             tcp_handles: Vec::new(),
             ready_tcp_handles: VecDeque::new(),
             ready_tcp_set: HashSet::new(),

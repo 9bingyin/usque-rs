@@ -15,6 +15,7 @@ impl TunnelManager {
                 let result = Self::create_connection(
                     &mut state.stack,
                     &mut state.sockets,
+                    &mut state.tcp_flow_map,
                     &mut state.tcp_handles,
                     state.socket_event_tx.clone(),
                     &state.tunables,
@@ -31,6 +32,7 @@ impl TunnelManager {
                 Self::close_connection(
                     &mut state.stack,
                     &mut state.sockets,
+                    &mut state.tcp_flow_map,
                     &mut state.tcp_handles,
                     handle,
                 );
@@ -166,6 +168,7 @@ impl TunnelManager {
     fn create_connection(
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        tcp_flow_map: &mut HashMap<TcpFlowKey, SocketHandle>,
         tcp_handles: &mut Vec<SocketHandle>,
         socket_event_tx: mpsc::UnboundedSender<SocketEvent>,
         tunables: &ManagerTunables,
@@ -188,8 +191,14 @@ impl TunnelManager {
             socket_event_tx,
         );
 
+        let flow_key = TcpFlowKey {
+            local_port,
+            remote_ip,
+            remote_port,
+        };
         let state = SocketState {
             stream: control,
+            flow_key: Some(flow_key),
             close_requested: false,
             write_shutdown: false,
             fin_sent: false,
@@ -197,6 +206,7 @@ impl TunnelManager {
         };
 
         sockets.insert(handle, state);
+        tcp_flow_map.insert(flow_key, handle);
         tcp_handles.push(handle);
 
         Ok(stream)
@@ -205,6 +215,7 @@ impl TunnelManager {
     fn close_connection(
         stack: &mut NetworkStack,
         sockets: &mut HashMap<SocketHandle, SocketState>,
+        tcp_flow_map: &mut HashMap<TcpFlowKey, SocketHandle>,
         tcp_handles: &mut Vec<SocketHandle>,
         handle: SocketHandle,
     ) {
@@ -224,6 +235,7 @@ impl TunnelManager {
 
         stack.tcp_close(handle);
         stack.remove_socket(handle);
+        tcp_flow_map.retain(|_, mapped_handle| *mapped_handle != handle);
         tcp_handles.retain(|h| *h != handle);
     }
 

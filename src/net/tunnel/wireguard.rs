@@ -9,8 +9,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
-use super::stack::NetworkStack;
-
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -175,7 +173,7 @@ impl WgTunnel {
     /// Synchronously decrypt an incoming WG packet and inject IP payload into smoltcp.
     /// WG control responses (handshake, cookie) are queued in send_queue for batch sending.
     /// Call drain_queued_to_send_queue() + flush_send_queue() after processing a batch.
-    pub fn decrypt_incoming(&mut self, data: &mut BytesMut, stack: &mut NetworkStack) {
+    pub fn decrypt_incoming(&mut self, data: &mut BytesMut) -> Option<BytesMut> {
         strip_reserved(data.as_mut());
 
         let packet_buf = data.split();
@@ -184,24 +182,25 @@ impl WgTunnel {
             Ok(wg) => wg,
             Err(e) => {
                 log::debug!("Failed to parse WG packet: {}", e);
-                return;
+                return None;
             }
         };
 
         let result = self.tunn.handle_incoming_packet(wg_kind);
         match result {
-            TunnResult::Done => {}
+            TunnResult::Done => None,
             TunnResult::Err(e) => {
                 log::debug!("WG tunnel error: {:?}", e);
+                None
             }
             TunnResult::WriteToNetwork(response) => {
                 self.prepare_and_queue(response);
+                None
             }
             TunnResult::WriteToTunnel(packet) => {
-                let raw: &[u8] = &packet;
-                if !raw.is_empty() {
-                    stack.inject_packet(raw);
-                }
+                let mut packet = packet.into_bytes();
+                let raw = packet.buf_mut().split();
+                if raw.is_empty() { None } else { Some(raw) }
             }
         }
     }

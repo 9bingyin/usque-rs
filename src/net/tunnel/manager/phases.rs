@@ -1,4 +1,46 @@
 impl TunnelManager {
+    fn classify_incoming_tcp_handle(state: &RuntimeState, packet: &[u8]) -> Option<SocketHandle> {
+        if packet.is_empty() {
+            return None;
+        }
+
+        match packet[0] >> 4 {
+            4 => {
+                let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
+                if ipv4.next_header() != IpProtocol::Tcp {
+                    return None;
+                }
+                let tcp = TcpPacket::new_checked(ipv4.payload()).ok()?;
+                let key = TcpFlowKey {
+                    local_port: tcp.dst_port(),
+                    remote_ip: IpAddress::Ipv4(ipv4.src_addr()),
+                    remote_port: tcp.src_port(),
+                };
+                state.tcp_flow_map.get(&key).copied()
+            }
+            6 => {
+                let ipv6 = Ipv6Packet::new_checked(packet).ok()?;
+                if ipv6.next_header() != IpProtocol::Tcp {
+                    return None;
+                }
+                let tcp = TcpPacket::new_checked(ipv6.payload()).ok()?;
+                let key = TcpFlowKey {
+                    local_port: tcp.dst_port(),
+                    remote_ip: IpAddress::Ipv6(ipv6.src_addr()),
+                    remote_port: tcp.src_port(),
+                };
+                state.tcp_flow_map.get(&key).copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn note_incoming_tcp_handle(state: &mut RuntimeState, packet: &[u8]) {
+        if let Some(handle) = Self::classify_incoming_tcp_handle(state, packet) {
+            state.enqueue_ready_tcp_handle(handle);
+        }
+    }
+
     async fn process_dirty_cycle(
         tunnel: &mut ActiveTunnel,
         state: &mut RuntimeState,
@@ -19,25 +61,26 @@ impl TunnelManager {
         let handled_udp_sends =
             Self::drain_udp_send_batch(state, udp_rx, state.tunables.udp_batch_budget);
 
-        let handled_incoming = Self::drain_incoming_batch(
+        let incoming_result = Self::drain_incoming_batch(
             tunnel,
             state,
             &mut incoming_task.incoming_rx,
             state.tunables.udp_batch_read_budget,
         );
 
-        let needs_stack_poll = handled_commands || handled_udp_sends || handled_incoming;
+        let needs_stack_poll =
+            handled_commands || handled_udp_sends || incoming_result.stack_ingress;
         let needs_targeted_tcp_service = handled_socket_events || !state.ready_tcp_handles.is_empty();
 
         if needs_stack_poll {
-            if !Self::flush_stack_reads(state, handled_incoming) {
+            if !Self::flush_stack_reads(state, incoming_result.stack_ingress) {
                 return false;
             }
         } else if needs_targeted_tcp_service {
             Self::poll_tcp_sockets(state, false);
         }
 
-        if needs_stack_poll || needs_targeted_tcp_service {
+        if needs_stack_poll || needs_targeted_tcp_service || incoming_result.needs_transport_flush {
             Self::drain_stack_packets(tunnel, state).await;
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
@@ -109,19 +152,21 @@ impl TunnelManager {
         state: &mut RuntimeState,
         incoming_rx: &mut mpsc::Receiver<IncomingDatagram>,
         budget: usize,
-    ) -> bool {
+    ) -> IncomingHandling {
         let mut remaining = budget;
-        let mut handled_incoming = false;
+        let mut result = IncomingHandling::default();
         while remaining > 0 {
             match incoming_rx.try_recv() {
                 Ok(incoming) => {
-                    handled_incoming |= Self::handle_incoming_datagram(tunnel, state, incoming);
+                    let handled = Self::handle_incoming_datagram(tunnel, state, incoming);
+                    result.stack_ingress |= handled.stack_ingress;
+                    result.needs_transport_flush |= handled.needs_transport_flush;
                     remaining -= 1;
                 }
                 Err(_) => break,
             }
         }
-        handled_incoming
+        result
     }
 
     fn handle_socket_event(state: &mut RuntimeState, event: SocketEvent) {
@@ -268,8 +313,9 @@ impl TunnelManager {
         };
         state.perf.inc_poll();
 
-        let should_full_tcp_sweep = full_tcp_sweep && outcome.socket_state_changed;
-        let should_targeted_tcp_sweep = !should_full_tcp_sweep && !state.ready_tcp_handles.is_empty();
+        let should_full_tcp_sweep =
+            full_tcp_sweep && outcome.socket_state_changed && state.ready_tcp_handles.is_empty();
+        let should_targeted_tcp_sweep = !state.ready_tcp_handles.is_empty();
 
         if outcome.socket_state_changed {
             Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
@@ -442,6 +488,9 @@ impl TunnelManager {
 
         for handle in &closed_handles {
             if let Some(socket_state) = state.sockets.remove(handle) {
+                if let Some(flow_key) = socket_state.flow_key {
+                    state.tcp_flow_map.remove(&flow_key);
+                }
                 socket_state
                     .stream
                     .socket_closed

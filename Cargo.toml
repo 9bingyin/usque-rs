@@ -37,3 +37,9 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 x509-cert = { version = "0.2.5", features = ["builder"] }
 gotatun = { git = "https://github.com/mullvad/gotatun", default-features = false, features = ["ring"] }
 configparser = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
