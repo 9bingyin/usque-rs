@@ -70,7 +70,9 @@ impl TunnelManager {
 
         let needs_stack_poll =
             handled_commands || handled_udp_sends || incoming_result.stack_ingress;
-        let needs_targeted_tcp_service = handled_socket_events || !state.ready_tcp_handles.is_empty();
+        let needs_targeted_tcp_service = handled_socket_events
+            || !state.ready_tcp_handles.is_empty()
+            || state.has_refill_work();
         let mut needs_stack_egress = false;
 
         if needs_stack_poll {
@@ -190,11 +192,14 @@ impl TunnelManager {
     }
 
     fn handle_socket_event(state: &mut RuntimeState, event: SocketEvent) {
-        if let Some(socket_state) = state.sockets.get_mut(&event.handle)
-            && matches!(event.kind, SocketEventKind::Closed)
-        {
+        if let Some(socket_state) = state.sockets.get_mut(&event.handle) {
+            if matches!(event.kind, SocketEventKind::Closed) {
                 socket_state.close_requested = true;
                 socket_state.write_shutdown = true;
+                socket_state.refill_rounds = 0;
+            } else if matches!(event.kind, SocketEventKind::ReadReady) {
+                socket_state.refill_rounds = TCP_REFILL_ROUNDS;
+            }
         }
         state.enqueue_ready_tcp_handle(event.handle);
     }
@@ -334,7 +339,7 @@ impl TunnelManager {
 
         let should_full_tcp_sweep =
             full_tcp_sweep && outcome.socket_state_changed && state.ready_tcp_handles.is_empty();
-        let should_targeted_tcp_sweep = !state.ready_tcp_handles.is_empty();
+        let should_targeted_tcp_sweep = !state.ready_tcp_handles.is_empty() || state.has_refill_work();
 
         if outcome.socket_state_changed {
             Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
@@ -429,6 +434,7 @@ impl TunnelManager {
     fn poll_tcp_sockets(state: &mut RuntimeState, full_sweep: bool) {
         state.perf.inc_tcp_sweep(full_sweep);
         let mut closed_handles = Vec::new();
+        let mut refill_requeue = Vec::new();
         let stack = &mut state.stack;
         let read_buffer = &mut state.read_buffer;
         let write_buffer = &mut state.write_buffer;
@@ -441,6 +447,16 @@ impl TunnelManager {
             while let Some(handle) = state.ready_tcp_handles.pop_front() {
                 state.ready_tcp_set.remove(&handle);
                 handles.push(handle);
+            }
+            for handle in &state.tcp_handles {
+                if state
+                    .sockets
+                    .get(handle)
+                    .is_some_and(|socket_state| socket_state.refill_rounds > 0)
+                    && !handles.contains(handle)
+                {
+                    handles.push(*handle);
+                }
             }
             handles
         };
@@ -467,6 +483,11 @@ impl TunnelManager {
                     .load(std::sync::atomic::Ordering::Acquire)
                 {
                     socket_state.write_shutdown = true;
+                }
+                if socket_state.stream.recv_buffer.remaining_capacity() == 0
+                    || socket_state.close_requested
+                {
+                    socket_state.refill_rounds = 0;
                 }
                 let tcp_chunk_size = state.tunables.tcp_chunk_size;
                 Self::flush_pending_to_stack(
@@ -502,6 +523,18 @@ impl TunnelManager {
                 {
                     stack.tcp_close(handle);
                     socket_state.fin_sent = true;
+                }
+
+                if socket_state.refill_rounds > 0
+                    && socket_state.stream.recv_buffer.remaining_capacity() > 0
+                    && stack.tcp_may_recv(handle)
+                {
+                    socket_state.refill_rounds -= 1;
+                    if socket_state.refill_rounds > 0 {
+                        refill_requeue.push(handle);
+                    }
+                } else {
+                    socket_state.refill_rounds = 0;
                 }
             }
         }
@@ -539,6 +572,11 @@ impl TunnelManager {
             state
                 .ready_tcp_handles
                 .retain(|h| !closed_handles.contains(h));
+        }
+        for handle in refill_requeue {
+            if !closed_handles.contains(&handle) {
+                state.enqueue_ready_tcp_handle(handle);
+            }
         }
     }
 

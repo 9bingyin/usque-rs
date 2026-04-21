@@ -202,6 +202,7 @@ impl TunnelManager {
             close_requested: false,
             write_shutdown: false,
             fin_sent: false,
+            refill_rounds: 0,
             ready_waiters: Vec::new(),
         };
 
