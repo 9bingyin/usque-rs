@@ -24,10 +24,6 @@ impl TunnelManager {
             state.tunables.udp_batch_read_budget,
         );
 
-        if handled_incoming {
-            Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
-        }
-
         Self::flush_active_tunnel(tunnel, state, handled_incoming).await
     }
 

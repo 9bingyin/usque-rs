@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
@@ -170,6 +171,14 @@ pub fn create_quiche_config(
 
     // Set congestion control algorithm (default: BBR2)
     config.set_cc_algorithm(quic_cfg.congestion_control.to_quiche());
+    config.enable_pacing(true);
+    if let Some(max_pacing_rate_mbps) = std::env::var("USQUE_QUIC_MAX_PACING_RATE_MBPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        config.set_max_pacing_rate(max_pacing_rate_mbps * 1_000_000);
+    }
 
     Ok(config)
 }
@@ -180,36 +189,103 @@ pub struct QuicConnection {
     pub peer_addr: SocketAddr,
     pub local_addr: SocketAddr,
     send_buf: Vec<u8>,
+    pending_buf: Vec<u8>,
+    pending_len: usize,
+    pending_at: Option<Instant>,
+    pending_socket_blocked: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuicSendStatus {
+    pub bytes_sent: usize,
+    pub packets_sent: usize,
+    pub blocked: bool,
+    pub enobufs: bool,
+    pub paced: bool,
+}
+
+impl QuicSendStatus {
+    fn record_sent(&mut self, bytes: usize) {
+        self.bytes_sent += bytes;
+        self.packets_sent += 1;
+    }
 }
 
 impl QuicConnection {
-    pub async fn send_async(&mut self) -> Result<usize, QuicError> {
-        let mut total_sent = 0;
+    pub async fn send_async(&mut self) -> Result<QuicSendStatus, QuicError> {
+        let mut status = QuicSendStatus::default();
 
         loop {
-            let (write, _send_info) = match self.conn.send(&mut self.send_buf) {
+            if self.pending_len > 0 {
+                let now = Instant::now();
+                if let Some(pending_at) = self.pending_at
+                    && pending_at > now
+                {
+                    status.paced = true;
+                    break;
+                }
+
+                match self.try_send_pending_packet() {
+                    Ok(sent) => {
+                        status.record_sent(sent);
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.pending_socket_blocked = true;
+                        status.blocked = true;
+                        break;
+                    }
+                    Err(e) if is_enobufs(&e) => {
+                        self.pending_socket_blocked = true;
+                        status.blocked = true;
+                        status.enobufs = true;
+                        break;
+                    }
+                    Err(e) => return Err(QuicError::IoError(e)),
+                }
+            }
+
+            let (write, send_info) = match self.conn.send(&mut self.send_buf) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
                 Err(e) => return Err(QuicError::Quiche(e)),
             };
 
-            match self.socket.send(&self.send_buf[..write]).await {
-                Ok(_) => {
-                    total_sent += write;
+            let now = Instant::now();
+            if send_info.at > now {
+                self.cache_pending_packet(write, send_info.at);
+                status.paced = true;
+                break;
+            }
+
+            match self.socket.try_send(&self.send_buf[..write]) {
+                Ok(sent) => {
+                    if sent != write {
+                        return Err(QuicError::ConnectionError(format!(
+                            "partial UDP datagram send: sent {} of {} bytes",
+                            sent, write
+                        )));
+                    }
+                    status.record_sent(sent);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    log::trace!("UDP send WouldBlock, dropped packet");
-                    continue;
+                    self.cache_pending_packet(write, send_info.at);
+                    self.pending_socket_blocked = true;
+                    status.blocked = true;
+                    break;
                 }
                 Err(e) if is_enobufs(&e) => {
-                    log::trace!("UDP send ENOBUFS, dropped packet");
-                    continue;
+                    self.cache_pending_packet(write, send_info.at);
+                    self.pending_socket_blocked = true;
+                    status.blocked = true;
+                    status.enobufs = true;
+                    break;
                 }
                 Err(e) => return Err(QuicError::IoError(e)),
             }
         }
 
-        Ok(total_sent)
+        Ok(status)
     }
 
     pub fn is_established(&self) -> bool {
@@ -218,6 +294,61 @@ impl QuicConnection {
 
     pub fn is_closed(&self) -> bool {
         self.conn.is_closed()
+    }
+
+    pub fn has_pending_send(&self) -> bool {
+        self.pending_len > 0
+    }
+
+    pub fn pending_send_packets(&self) -> usize {
+        usize::from(self.pending_len > 0)
+    }
+
+    pub fn next_send_at(&self) -> Option<Instant> {
+        if self.pending_len > 0 {
+            self.pending_at
+                .filter(|deadline| *deadline > Instant::now())
+        } else {
+            None
+        }
+    }
+
+    pub fn needs_socket_writable(&self) -> bool {
+        self.pending_len > 0
+            && self.pending_socket_blocked
+            && self
+                .pending_at
+                .is_none_or(|deadline| deadline <= Instant::now())
+    }
+
+    fn cache_pending_packet(&mut self, len: usize, send_at: Instant) {
+        if self.pending_buf.len() < len {
+            self.pending_buf.resize(len, 0);
+        } else {
+            self.pending_buf.truncate(len);
+        }
+        self.pending_buf[..len].copy_from_slice(&self.send_buf[..len]);
+        self.pending_len = len;
+        self.pending_at = Some(send_at);
+        self.pending_socket_blocked = false;
+    }
+
+    fn try_send_pending_packet(&mut self) -> Result<usize, std::io::Error> {
+        debug_assert!(self.pending_len > 0);
+        let sent = self
+            .socket
+            .try_send(&self.pending_buf[..self.pending_len])?;
+        if sent != self.pending_len {
+            return Err(std::io::Error::other(format!(
+                "partial UDP datagram send: sent {} of {} bytes",
+                sent, self.pending_len
+            )));
+        }
+
+        self.pending_len = 0;
+        self.pending_at = None;
+        self.pending_socket_blocked = false;
+        Ok(sent)
     }
 }
 
@@ -257,6 +388,10 @@ pub async fn connect(
         peer_addr: endpoint,
         local_addr,
         send_buf: vec![0u8; max_datagram_size],
+        pending_buf: vec![0u8; max_datagram_size],
+        pending_len: 0,
+        pending_at: None,
+        pending_socket_blocked: false,
     };
 
     let start = std::time::Instant::now();

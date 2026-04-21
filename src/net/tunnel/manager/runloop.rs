@@ -368,6 +368,8 @@ impl TunnelManager {
             state.perf.inc_loop();
             let poll_timeout = tunnel.compute_poll_timeout(&mut state);
             let has_poll_timer = poll_timeout.is_some();
+            let socket = tunnel.socket();
+            let needs_socket_writable = tunnel.needs_socket_writable();
             poll_timer.as_mut().reset(
                 poll_timeout
                     .map(|timeout| TokioInstant::now() + timeout)
@@ -385,6 +387,7 @@ impl TunnelManager {
 
             let mut dirty = false;
             let mut handled_incoming = false;
+            let mut needs_transport_flush = false;
 
             tokio::select! {
                 biased;
@@ -400,6 +403,7 @@ impl TunnelManager {
 
                 Some(incoming) = incoming_task.incoming_rx.recv() => {
                     handled_incoming |= Self::handle_incoming_datagram(&mut tunnel, &mut state, incoming);
+                    needs_transport_flush |= handled_incoming;
                     dirty = true;
                 }
 
@@ -408,8 +412,20 @@ impl TunnelManager {
                     dirty = true;
                 }
 
+                writable = socket.writable(), if needs_socket_writable => {
+                    match writable {
+                        Ok(()) => {
+                            needs_transport_flush = true;
+                        }
+                        Err(e) => {
+                            log::debug!("UDP writable wait failed: {}", e);
+                        }
+                    }
+                }
+
                 _ = &mut maintenance_timer, if has_maintenance => {
                     Self::run_maintenance_tick(&mut tunnel, &state.tunables).await;
+                    needs_transport_flush = true;
                 }
 
                 _ = &mut poll_timer, if has_poll_timer => {
@@ -419,11 +435,11 @@ impl TunnelManager {
                 }
             }
 
-            if dirty {
-                if handled_incoming {
-                    Self::flush_transport_side_effects(&mut tunnel, &mut state.perf).await;
-                }
+            if needs_transport_flush {
+                Self::flush_transport_side_effects(&mut tunnel, &mut state.perf).await;
+            }
 
+            if dirty {
                 if !Self::process_dirty_cycle(
                     &mut tunnel,
                     &mut state,

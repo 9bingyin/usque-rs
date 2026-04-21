@@ -94,6 +94,11 @@ impl ActiveTunnel {
                     .conn
                     .timeout()
                     .map(|timeout| timeout.min(state.tunables.max_poll_interval));
+                if let Some(send_at) = tunnel.quic_conn.next_send_at() {
+                    let send_timeout =
+                        send_at.saturating_duration_since(Instant::now()).min(state.tunables.max_poll_interval);
+                    timeout = Some(timeout.map_or(send_timeout, |current| current.min(send_timeout)));
+                }
                 if let Some(stack_timeout) = smoltcp_timeout {
                     timeout = Some(timeout.map_or(stack_timeout, |current| current.min(stack_timeout)));
                 }
@@ -136,7 +141,7 @@ impl ActiveTunnel {
 
     fn transport_pending_send_packets(&self) -> usize {
         match self {
-            ActiveTunnel::Masque { .. } => 0,
+            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.pending_send_packets(),
             ActiveTunnel::Wg { tunnel, .. } => tunnel.pending_send_packets(),
         }
     }
@@ -149,6 +154,13 @@ impl ActiveTunnel {
                 ..
             } if *until > TokioInstant::now()
         )
+    }
+
+    fn needs_socket_writable(&self) -> bool {
+        match self {
+            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.needs_socket_writable(),
+            ActiveTunnel::Wg { .. } => false,
+        }
     }
 
 }
@@ -258,9 +270,8 @@ impl TunnelManager {
         incoming: IncomingDatagram,
     ) -> bool {
         let mut data = incoming.data;
-        let mut needs_transport_flush = false;
 
-        match tunnel {
+        let needs_transport_flush = match tunnel {
             ActiveTunnel::Masque {
                 tunnel,
                 local_addr,
@@ -276,13 +287,14 @@ impl TunnelManager {
                     incoming.from,
                     *local_addr,
                 );
+                true
             }
             ActiveTunnel::Wg { tunnel, .. } => {
                 state.perf.inc_rx(data.len());
                 tunnel.decrypt_incoming(&mut data, &mut state.stack);
-                needs_transport_flush = true;
+                true
             }
-        }
+        };
 
         Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
         needs_transport_flush
@@ -292,12 +304,18 @@ impl TunnelManager {
         tunnel: &mut ActiveTunnel,
         perf: &mut PerfCounters,
     ) {
-        if let ActiveTunnel::Wg { tunnel, .. } = tunnel {
-            let _ = tunnel.drain_queued_to_send_queue();
-            if tunnel.pending_send_packets() > 0 {
-                let flushed = tunnel.flush_send_queue().await;
-                if flushed > 0 {
-                    perf.inc_wg_flush();
+        match tunnel {
+            ActiveTunnel::Masque { tunnel, .. } => match tunnel.quic_conn.send_async().await {
+                Ok(status) => perf.record_quic_flush(status),
+                Err(e) => log::debug!("QUIC send failed: {:?}", e),
+            },
+            ActiveTunnel::Wg { tunnel, .. } => {
+                let _ = tunnel.drain_queued_to_send_queue();
+                if tunnel.pending_send_packets() > 0 {
+                    let flushed = tunnel.flush_send_queue().await;
+                    if flushed > 0 {
+                        perf.inc_wg_flush();
+                    }
                 }
             }
         }
@@ -313,6 +331,7 @@ impl TunnelManager {
         }
 
         Self::drain_stack_packets(tunnel, state).await;
+        Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         true
     }
 
@@ -326,6 +345,7 @@ impl TunnelManager {
         }
 
         Self::drain_stack_packets(tunnel, state).await;
+        Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         true
     }
 
@@ -342,7 +362,6 @@ impl TunnelManager {
                 blocked_until,
                 ..
             } => {
-                let mut flushed_quic = false;
                 let mut attempted = 0usize;
                 while attempted < budget {
                     let Some(packet) = state.stack.take_packet() else {
@@ -354,7 +373,6 @@ impl TunnelManager {
                         Ok(crate::net::tunnel::masque::DatagramSendState::Sent) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
-                            flushed_quic = true;
                             state.stack.recycle_tx_buffer(packet);
                         }
                         Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
@@ -379,7 +397,6 @@ impl TunnelManager {
                                 TokioInstant::now()
                                     + Duration::from_millis(backoff_ms.min(32)),
                             );
-                            flushed_quic = true;
                             state.stack.requeue_packet_front(packet);
                             break;
                         }
@@ -388,12 +405,6 @@ impl TunnelManager {
                             log::debug!("datagram send failed: {:?}", e);
                         }
                     }
-                }
-
-                if flushed_quic
-                    && let Err(e) = masque_tunnel.quic_conn.send_async().await
-                {
-                    log::debug!("QUIC send failed: {:?}", e);
                 }
             }
             ActiveTunnel::Wg { tunnel, .. } => {
