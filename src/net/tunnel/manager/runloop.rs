@@ -366,13 +366,20 @@ impl TunnelManager {
             }
 
             state.perf.inc_loop();
-            let poll_timeout = tunnel.compute_poll_timeout(&mut state);
-            let has_poll_timer = poll_timeout.is_some();
+            let stack_poll_deadline = tunnel.stack_poll_deadline(&mut state);
+            let transport_timeout_deadline =
+                tunnel.transport_timeout_deadline(state.tunables.max_poll_interval);
+            let transport_send_deadline =
+                tunnel.transport_send_deadline(state.tunables.max_poll_interval);
+            let poll_deadline = [stack_poll_deadline, transport_timeout_deadline, transport_send_deadline]
+                .into_iter()
+                .flatten()
+                .min();
+            let has_poll_timer = poll_deadline.is_some();
             let socket = tunnel.socket();
             let needs_socket_writable = tunnel.needs_socket_writable();
             poll_timer.as_mut().reset(
-                poll_timeout
-                    .map(|timeout| TokioInstant::now() + timeout)
+                poll_deadline
                     .unwrap_or_else(|| {
                         TokioInstant::now() + Duration::from_secs(365 * 24 * 60 * 60)
                     }),
@@ -429,13 +436,27 @@ impl TunnelManager {
                 }
 
                 _ = &mut poll_timer, if has_poll_timer => {
-                    if !Self::poll_active_tunnel(&mut tunnel, &mut state).await {
+                    let now = TokioInstant::now();
+                    let stack_due = stack_poll_deadline.is_some_and(|deadline| deadline <= now);
+                    let transport_timeout_due =
+                        transport_timeout_deadline.is_some_and(|deadline| deadline <= now);
+                    let transport_send_due =
+                        transport_send_deadline.is_some_and(|deadline| deadline <= now);
+                    if !Self::poll_active_tunnel(
+                        &mut tunnel,
+                        &mut state,
+                        stack_due,
+                        transport_timeout_due,
+                        transport_send_due,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
             }
 
-            if needs_transport_flush {
+            if !dirty && needs_transport_flush {
                 Self::flush_transport_side_effects(&mut tunnel, &mut state.perf).await;
             }
 
@@ -465,7 +486,7 @@ impl TunnelManager {
                 state.perf.report(snapshot);
             }
 
-            let should_yield = poll_timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1))
+            let should_yield = poll_deadline.is_some_and(|deadline| deadline <= TokioInstant::now() + Duration::from_millis(1))
                 || (dirty
                     && (cmd_rx.len() > 0
                         || udp_rx.len() > 0

@@ -1,4 +1,50 @@
 impl ActiveTunnel {
+    fn stack_poll_deadline(&self, state: &mut RuntimeState) -> Option<TokioInstant> {
+        if !state.has_poll_work() {
+            return None;
+        }
+
+        let timeout = state
+            .stack
+            .poll_delay()
+            .unwrap_or(Duration::ZERO)
+            .min(state.tunables.max_poll_interval);
+        Some(TokioInstant::now() + timeout)
+    }
+
+    fn transport_timeout_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
+        match self {
+            ActiveTunnel::Masque { tunnel, .. } => tunnel
+                .quic_conn
+                .conn
+                .timeout()
+                .map(|timeout| TokioInstant::now() + timeout.min(max_poll_interval)),
+            ActiveTunnel::Wg { .. } => None,
+        }
+    }
+
+    fn transport_send_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
+        match self {
+            ActiveTunnel::Masque {
+                tunnel,
+                blocked_until,
+                ..
+            } => {
+                let mut deadline = tunnel
+                    .quic_conn
+                    .next_send_at()
+                    .map(TokioInstant::from_std);
+                if let Some(until) = blocked_until
+                    && *until > TokioInstant::now()
+                {
+                    deadline = Some(deadline.map_or(*until, |current| current.min(*until)));
+                }
+                deadline.map(|when| when.min(TokioInstant::now() + max_poll_interval))
+            }
+            ActiveTunnel::Wg { .. } => None,
+        }
+    }
+
     fn from_conn(
         conn: TunnelConn,
         keepalive_secs: u64,
@@ -68,50 +114,6 @@ impl ActiveTunnel {
                     true
                 }
             }
-        }
-    }
-
-    fn compute_poll_timeout(&mut self, state: &mut RuntimeState) -> Option<Duration> {
-        let smoltcp_timeout = if state.has_poll_work() {
-            Some(
-                state
-                    .stack
-                    .poll_delay()
-                    .unwrap_or(Duration::ZERO)
-                    .min(state.tunables.max_poll_interval),
-            )
-        } else {
-            None
-        };
-        match self {
-            ActiveTunnel::Masque {
-                tunnel,
-                blocked_until,
-                ..
-            } => {
-                let mut timeout = tunnel
-                    .quic_conn
-                    .conn
-                    .timeout()
-                    .map(|timeout| timeout.min(state.tunables.max_poll_interval));
-                if let Some(send_at) = tunnel.quic_conn.next_send_at() {
-                    let send_timeout =
-                        send_at.saturating_duration_since(Instant::now()).min(state.tunables.max_poll_interval);
-                    timeout = Some(timeout.map_or(send_timeout, |current| current.min(send_timeout)));
-                }
-                if let Some(stack_timeout) = smoltcp_timeout {
-                    timeout = Some(timeout.map_or(stack_timeout, |current| current.min(stack_timeout)));
-                }
-                if let Some(until) = blocked_until
-                    && *until > TokioInstant::now()
-                {
-                    let blocked_timeout =
-                        (*until - TokioInstant::now()).min(state.tunables.max_poll_interval);
-                    timeout = Some(timeout.map_or(blocked_timeout, |current| current.min(blocked_timeout)));
-                }
-                timeout
-            }
-            ActiveTunnel::Wg { .. } => smoltcp_timeout,
         }
     }
 
@@ -321,17 +323,29 @@ impl TunnelManager {
         }
     }
 
-    async fn poll_active_tunnel(tunnel: &mut ActiveTunnel, state: &mut RuntimeState) -> bool {
-        if let ActiveTunnel::Masque { tunnel, .. } = tunnel {
+    async fn poll_active_tunnel(
+        tunnel: &mut ActiveTunnel,
+        state: &mut RuntimeState,
+        stack_due: bool,
+        transport_timeout_due: bool,
+        transport_send_due: bool,
+    ) -> bool {
+        if transport_timeout_due
+            && let ActiveTunnel::Masque { tunnel, .. } = tunnel
+        {
             tunnel.quic_conn.conn.on_timeout();
         }
 
-        if !Self::poll_stack_common(state, true) {
+        if stack_due && !Self::poll_stack_common(state, true) {
             return false;
         }
 
-        Self::drain_stack_packets(tunnel, state).await;
-        Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
+        if stack_due || transport_send_due {
+            Self::drain_stack_packets(tunnel, state).await;
+        }
+        if stack_due || transport_timeout_due || transport_send_due {
+            Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
+        }
         true
     }
 
