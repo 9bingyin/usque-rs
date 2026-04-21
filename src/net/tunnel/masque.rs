@@ -1,36 +1,42 @@
-use crate::net::tunnel::quic::{QuicConnection, QuicError};
-use bytes::BytesMut;
+use crate::net::tunnel::quic::{
+    QuicConfig, QuicError, build_tokio_quiche_connection_params, configure_udp_socket_buffers,
+    fetch_dgram_max_writable_len, fetch_peer_cert, fetch_perf_stats, verify_peer_public_key,
+};
+use bytes::{Bytes, BytesMut};
+use futures::SinkExt;
 use quiche::h3::NameValue;
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
+use tokio::net::UdpSocket;
+use tokio_quiche::ClientH3Controller;
+use tokio_quiche::ClientH3Driver;
+use tokio_quiche::QuicConnection;
+use tokio_quiche::datagram_socket::DgramBuffer;
+use tokio_quiche::http3::driver::{
+    ClientH3Event, H3Event, InboundFrameStream, NewClientRequest, OutboundFrame,
+    OutboundFrameSender,
+};
+use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::quic::{ConnectionShutdownBehaviour, QuicCommand};
+use tokio_quiche::socket::Socket as TokioQuicSocket;
 
 // Context ID = 0 for IP packets (RFC 9484)
 const CONTEXT_ID_ZERO: u8 = 0x00;
+const CONNECT_REQUEST_ID: u64 = 1;
 
 #[derive(Error, Debug)]
 pub enum MasqueError {
     #[error("QUIC error: {0}")]
     QuicError(#[from] QuicError),
-    #[error("HTTP/3 error: {0}")]
-    H3Error(#[from] quiche::h3::Error),
     #[error("connection error: {0}")]
     ConnectionError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("tokio-quiche error: {0}")]
+    TokioQuiche(String),
     #[error("connect-ip failed: {0}")]
     ConnectIpFailed(String),
     #[error("timeout")]
@@ -46,94 +52,199 @@ pub enum DatagramSendState {
 
 pub struct MasqueTunnel {
     pub quic_conn: QuicConnection,
-    pub h3_conn: Option<quiche::h3::Connection>,
-    pub connect_stream_id: Option<u64>,
-    pub established: bool,
+    pub controller: ClientH3Controller,
+    pub connect_stream_id: u64,
+    pub connect_recv: InboundFrameStream,
+    pub flow_id: u64,
+    pub flow_send: OutboundFrameSender,
+    pub flow_recv: InboundFrameStream,
+    pub socket: Arc<UdpSocket>,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+    pub max_h3_dgram_len: Option<usize>,
     dgram_recv_buf: Vec<u8>,
     dgram_send_buf: Vec<u8>,
+    control_state: MasqueControlState,
+}
+
+#[derive(Default)]
+struct MasqueControlState {
+    recv_buf: BytesMut,
+    assigned_addresses: Vec<String>,
+    advertised_routes: Vec<String>,
 }
 
 impl MasqueTunnel {
-    pub fn new(quic_conn: QuicConnection) -> Self {
-        Self {
+    pub async fn connect(
+        endpoint: SocketAddr,
+        cert_der: &[u8],
+        key_der: &[u8],
+        sni: &str,
+        timeout: Duration,
+        expected_pub_key: Option<&[u8]>,
+        quic_cfg: &QuicConfig,
+    ) -> Result<Self, MasqueError> {
+        let socket = if endpoint.is_ipv4() {
+            UdpSocket::bind("0.0.0.0:0").await?
+        } else {
+            UdpSocket::bind("[::]:0").await?
+        };
+        socket.connect(endpoint).await?;
+        let std_socket = socket.into_std()?;
+        configure_udp_socket_buffers(
+            &std_socket,
+            env_usize("USQUE_QUIC_UDP_RECVBUF", 4 * 1024 * 1024),
+            env_usize("USQUE_QUIC_UDP_SNDBUF", 2 * 1024 * 1024),
+        );
+        let socket = UdpSocket::from_std(std_socket)?;
+        let socket: TokioQuicSocket<Arc<UdpSocket>, Arc<UdpSocket>> =
+            TokioQuicSocket::<Arc<UdpSocket>, Arc<UdpSocket>>::from_udp(socket)?;
+        let socket_ref = socket.send.clone();
+        let local_addr = socket.local_addr;
+        let peer_addr = socket.peer_addr;
+
+        let (driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
+        let params = build_tokio_quiche_connection_params(quic_cfg, cert_der, key_der);
+        let quic_conn = tokio_quiche::quic::connect_with_config(socket, Some(sni), &params, driver)
+            .await
+            .map_err(|e| MasqueError::TokioQuiche(e.to_string()))?;
+
+        if let Some(expected_key) = expected_pub_key {
+            match fetch_peer_cert(&controller).await? {
+                Some(peer_cert) if verify_peer_public_key(&peer_cert, expected_key) => {
+                    log::debug!("server public key verified");
+                }
+                Some(_) => return Err(MasqueError::QuicError(QuicError::PublicKeyMismatch)),
+                None => log::warn!("no peer certificate for verification"),
+            }
+        }
+
+        controller
+            .request_sender()
+            .send(NewClientRequest {
+                request_id: CONNECT_REQUEST_ID,
+                headers: connect_ip_headers(),
+                body_writer: None,
+            })
+            .map_err(|_| {
+                MasqueError::ConnectionError("CONNECT-IP request channel closed".into())
+            })?;
+
+        let started_at = std::time::Instant::now();
+        let mut connect_stream_id = None;
+        let mut connect_recv = None;
+        let mut connect_established = false;
+        let mut flow = None;
+
+        while !connect_established || flow.is_none() || connect_recv.is_none() {
+            let remaining = timeout
+                .checked_sub(started_at.elapsed())
+                .ok_or(MasqueError::Timeout)?;
+            let event = tokio::time::timeout(remaining, controller.event_receiver_mut().recv())
+                .await
+                .map_err(|_| MasqueError::Timeout)?
+                .ok_or_else(|| {
+                    MasqueError::ConnectionError("tokio-quiche event channel closed".into())
+                })?;
+
+            match event {
+                ClientH3Event::NewOutboundRequest {
+                    stream_id,
+                    request_id,
+                } if request_id == CONNECT_REQUEST_ID => {
+                    connect_stream_id = Some(stream_id);
+                    log::debug!("Connect-IP request sent (stream={})", stream_id);
+                }
+                ClientH3Event::Core(H3Event::NewFlow {
+                    flow_id,
+                    send,
+                    recv,
+                }) => {
+                    if flow.is_none() {
+                        log::debug!("MASQUE datagram flow established (flow={})", flow_id);
+                        flow = Some((flow_id, send, recv));
+                    }
+                }
+                ClientH3Event::Core(H3Event::IncomingHeaders(headers)) => {
+                    if Some(headers.stream_id) != connect_stream_id {
+                        continue;
+                    }
+                    connect_recv = Some(headers.recv);
+                    let status = headers
+                        .headers
+                        .iter()
+                        .find(|header| header.name() == b":status")
+                        .and_then(|header| std::str::from_utf8(header.value()).ok())
+                        .unwrap_or("unknown");
+                    log::debug!("Connect-IP response: status={}", status);
+                    if status == "200" {
+                        connect_established = true;
+                    } else {
+                        return Err(MasqueError::ConnectIpFailed(format!("status: {}", status)));
+                    }
+                }
+                ClientH3Event::Core(H3Event::ConnectionError(err)) => {
+                    return Err(MasqueError::ConnectionError(format!("H3 error: {:?}", err)));
+                }
+                ClientH3Event::Core(H3Event::ConnectionShutdown(err)) => {
+                    return Err(MasqueError::ConnectionError(format!(
+                        "H3 shutdown: {:?}",
+                        err
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let (flow_id, flow_send, flow_recv) = flow.expect("flow must exist");
+        let max_h3_dgram_len = fetch_dgram_max_writable_len(&controller)
+            .await?
+            .map(|max_len| max_len.saturating_sub(varint_len(flow_id)));
+
+        log::info!("MASQUE tunnel established");
+        Ok(Self {
             quic_conn,
-            h3_conn: None,
-            connect_stream_id: None,
-            established: false,
+            controller,
+            connect_stream_id: connect_stream_id.expect("stream id must exist"),
+            connect_recv: connect_recv.expect("connect recv must exist"),
+            flow_id,
+            flow_send,
+            flow_recv,
+            socket: socket_ref,
+            peer_addr,
+            local_addr,
+            max_h3_dgram_len,
             dgram_recv_buf: Vec::new(),
             dgram_send_buf: Vec::new(),
-        }
+            control_state: MasqueControlState::default(),
+        })
     }
 
-    pub fn init_h3(&mut self) -> Result<(), MasqueError> {
-        let mut h3_config = quiche::h3::Config::new()?;
-
-        // Note: Do NOT call enable_extended_connect(true) on client side.
-        // Per RFC 9220, SETTINGS_ENABLE_CONNECT_PROTOCOL is sent by SERVER to indicate
-        // it supports Extended CONNECT. Client should not send this setting.
-
-        // Disable QPACK compression (like Go version's DisableCompression: true)
-        h3_config.set_qpack_max_table_capacity(0);
-        h3_config.set_qpack_blocked_streams(0);
-
-        // quiche automatically sends SETTINGS_H3_DATAGRAM_00 (0x276) and
-        // SETTINGS_H3_DATAGRAM (0x33) when the QUIC connection has datagrams enabled
-
-        let h3_conn = quiche::h3::Connection::with_transport(&mut self.quic_conn.conn, &h3_config)?;
-        self.h3_conn = Some(h3_conn);
-        Ok(())
+    pub fn max_ip_packet_len(&self) -> usize {
+        self.max_h3_dgram_len
+            .map(|len| len.saturating_sub(1))
+            .unwrap_or(1280)
     }
 
-    pub fn send_connect_ip_request(&mut self) -> Result<u64, MasqueError> {
-        let h3_conn = self
-            .h3_conn
-            .as_mut()
-            .ok_or_else(|| MasqueError::ConnectionError("H3 not initialized".into()))?;
-
-        // Cloudflare uses "cf-connect-ip" instead of standard "connect-ip"
-        // Path is "/" not "/.well-known/masque/ip/*/*/" per official client qlog
-        let headers = vec![
-            quiche::h3::Header::new(b":method", b"CONNECT"),
-            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-            quiche::h3::Header::new(b":path", b"/"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-            quiche::h3::Header::new(b"user-agent", b""),
-        ];
-
-        let stream_id = h3_conn.send_request(&mut self.quic_conn.conn, &headers, false)?;
-
-        self.connect_stream_id = Some(stream_id);
-        Ok(stream_id)
-    }
-
-    pub fn send_datagram(&mut self, packet: &BytesMut) -> Result<DatagramSendState, MasqueError> {
-        let stream_id = self
-            .connect_stream_id
-            .ok_or_else(|| MasqueError::ConnectionError("No connect stream".into()))?;
-
-        let quarter_stream_id = stream_id / 4;
-        let qsid_len = varint_len(quarter_stream_id);
-        let dgram_len = qsid_len + 1 + packet.len();
-
+    pub async fn send_datagram(
+        &mut self,
+        packet: &BytesMut,
+    ) -> Result<DatagramSendState, MasqueError> {
+        let dgram_len = 1 + packet.len();
         if self.dgram_send_buf.len() < dgram_len {
             self.dgram_send_buf.resize(dgram_len, 0);
         } else {
             self.dgram_send_buf.truncate(dgram_len);
         }
 
-        let mut offset = encode_varint(quarter_stream_id, &mut self.dgram_send_buf);
-        self.dgram_send_buf[offset] = CONTEXT_ID_ZERO;
-        offset += 1;
-        self.dgram_send_buf[offset..].copy_from_slice(packet.as_ref());
+        self.dgram_send_buf[0] = CONTEXT_ID_ZERO;
+        self.dgram_send_buf[1..].copy_from_slice(packet.as_ref());
 
-        if !process_outgoing_ip_packet(&mut self.dgram_send_buf[offset..])? {
+        if !process_outgoing_ip_packet(&mut self.dgram_send_buf[1..])? {
             return Ok(DatagramSendState::Dropped);
         }
 
-        let max_dgram_len = self.quic_conn.conn.dgram_max_writable_len();
-        if let Some(max_len) = max_dgram_len
+        if let Some(max_len) = self.max_h3_dgram_len
             && self.dgram_send_buf.len() > max_len
         {
             log::debug!(
@@ -149,250 +260,154 @@ impl MasqueTunnel {
             );
         }
 
-        match self.quic_conn.conn.dgram_send(&self.dgram_send_buf) {
-            Ok(()) => Ok(DatagramSendState::Sent),
-            Err(quiche::Error::Done) => {
-                log::debug!(
-                    "Datagram blocked: congestion window full ({} bytes)",
-                    self.dgram_send_buf.len()
-                );
-                Ok(DatagramSendState::Blocked)
-            }
-            Err(quiche::Error::BufferTooShort) => {
-                log::debug!(
-                    "dgram_send BufferTooShort ({} bytes), generating ICMP",
-                    self.dgram_send_buf.len()
-                );
-                Ok(
-                    match compose_icmp_packet_too_big(packet.as_ref(), MIN_MTU) {
-                        Some(icmp) => DatagramSendState::PacketTooBig(icmp),
-                        None => DatagramSendState::Dropped,
-                    },
-                )
-            }
-            Err(e) => {
-                log::warn!(
-                    "dgram_send error: {:?}, buf len: {}",
-                    e,
-                    self.dgram_send_buf.len()
-                );
-                Err(MasqueError::QuicError(QuicError::Quiche(e)))
-            }
-        }
+        self.flow_send
+            .send(OutboundFrame::Datagram(
+                DgramBuffer::from_slice(&self.dgram_send_buf),
+                self.flow_id,
+            ))
+            .await
+            .map_err(|e| MasqueError::ConnectionError(format!("datagram send failed: {}", e)))?;
+
+        Ok(DatagramSendState::Sent)
     }
 
-    /// Process QUIC data that has already been received.
-    /// Call this after injecting data via quic_conn.conn.recv()
-    pub fn poll_h3(&mut self) {
-        if let Some(h3_conn) = self.h3_conn.as_mut() {
-            loop {
-                match h3_conn.poll(&mut self.quic_conn.conn) {
-                    Ok((stream_id, event)) => {
-                        log::trace!("H3 event on stream {}: {:?}", stream_id, event);
-                    }
-                    Err(quiche::h3::Error::Done) => break,
-                    Err(e) => {
-                        log::warn!("H3 poll error: {:?}", e);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn recv_datagram(&mut self, buf: &mut [u8]) -> Result<usize, MasqueError> {
-        let needed = buf.len() + 10; // Extra space for headers
+    pub fn decode_datagram(
+        &mut self,
+        dgram: DgramBuffer,
+        buf: &mut [u8],
+    ) -> Result<usize, MasqueError> {
+        let needed = dgram.len();
         if self.dgram_recv_buf.len() < needed {
             self.dgram_recv_buf.resize(needed, 0);
-        }
-
-        match self.quic_conn.conn.dgram_recv(&mut self.dgram_recv_buf) {
-            Ok(len) => {
-                // Parse HTTP/3 Datagram: [Quarter Stream ID (varint)] [Context ID (varint)] [IP Packet]
-                let (_, qsid_len) = decode_varint(&self.dgram_recv_buf[..len])?;
-                let (context_id, ctx_len) = decode_varint(&self.dgram_recv_buf[qsid_len..len])?;
-
-                // Only accept Context ID = 0 (IP packets)
-                if context_id != 0 {
-                    return Ok(0);
-                }
-
-                let header_len = qsid_len + ctx_len;
-                let payload_len = len - header_len;
-
-                if payload_len > buf.len() {
-                    return Err(MasqueError::ConnectionError("Buffer too small".into()));
-                }
-
-                buf[..payload_len].copy_from_slice(&self.dgram_recv_buf[header_len..len]);
-                Ok(payload_len)
-            }
-            Err(quiche::Error::Done) => Ok(0),
-            Err(e) => Err(MasqueError::QuicError(QuicError::Quiche(e))),
-        }
-    }
-
-    pub async fn establish(&mut self, timeout: Duration) -> Result<(), MasqueError> {
-        log::debug!("H3 init");
-        self.init_h3()?;
-
-        // Step 1: Send our SETTINGS frame
-        self.quic_conn.send_async().await?;
-        log::debug!("H3 SETTINGS sent");
-
-        let start = std::time::Instant::now();
-        let mut buf = vec![0u8; env_usize("USQUE_MASQUE_HANDSHAKE_BUFFER_SIZE", 64 * 1024)];
-
-        // Step 2: Wait for peer's SETTINGS frame before sending CONNECT request
-        while !self.peer_settings_received() {
-            if start.elapsed() > timeout {
-                return Err(MasqueError::Timeout);
-            }
-
-            self.recv_and_process_async(&mut buf).await?;
-            self.poll_h3_events()?;
-            self.quic_conn.send_async().await?;
-
-            if let Some(err) = self.quic_conn.conn.peer_error() {
-                let reason = String::from_utf8_lossy(err.reason.as_slice());
-                log::error!(
-                    "Connection closed by peer: error={}, reason={}",
-                    err.error_code,
-                    reason
-                );
-                return Err(MasqueError::ConnectionError(format!(
-                    "peer closed: {} - {}",
-                    err.error_code, reason
-                )));
-            }
-
-            if self.quic_conn.is_closed() {
-                return Err(MasqueError::ConnectionError("connection closed".into()));
-            }
-        }
-        log::debug!("H3 SETTINGS received");
-
-        // Step 3: Send Connect-IP request
-        let stream_id = self.send_connect_ip_request()?;
-        log::debug!("Connect-IP request sent (stream={})", stream_id);
-
-        self.quic_conn.send_async().await?;
-
-        // Step 4: Wait for Connect-IP response
-        while !self.established {
-            if start.elapsed() > timeout {
-                return Err(MasqueError::Timeout);
-            }
-
-            self.recv_and_process_async(&mut buf).await?;
-
-            if let Some(err) = self.quic_conn.conn.peer_error() {
-                let reason = String::from_utf8_lossy(err.reason.as_slice());
-                log::error!(
-                    "Connection closed by peer: error={}, reason={}",
-                    err.error_code,
-                    reason
-                );
-                return Err(MasqueError::ConnectionError(format!(
-                    "peer closed: {} - {}",
-                    err.error_code, reason
-                )));
-            }
-
-            self.poll_h3_events()?;
-            self.quic_conn.send_async().await?;
-
-            if self.quic_conn.is_closed() {
-                return Err(MasqueError::ConnectionError("connection closed".into()));
-            }
-        }
-
-        log::info!("MASQUE tunnel established");
-        Ok(())
-    }
-
-    async fn recv_and_process_async(&mut self, buf: &mut [u8]) -> Result<(), MasqueError> {
-        let recv_timeout = Duration::from_millis(env_u64("USQUE_MASQUE_RECV_TIMEOUT_MS", 100));
-        match tokio::time::timeout(recv_timeout, self.quic_conn.socket.recv_from(buf)).await {
-            Ok(Ok((len, from))) => {
-                let recv_info = quiche::RecvInfo {
-                    from,
-                    to: self.quic_conn.local_addr,
-                };
-                match self.quic_conn.conn.recv(&mut buf[..len], recv_info) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("QUIC recv failed: {:?}", e);
-                        return Err(MasqueError::QuicError(QuicError::Quiche(e)));
-                    }
-                }
-            }
-            Ok(Err(e)) => return Err(MasqueError::IoError(e)),
-            Err(_) => {} // timeout, continue
-        }
-        Ok(())
-    }
-
-    fn peer_settings_received(&self) -> bool {
-        if let Some(h3_conn) = &self.h3_conn {
-            h3_conn.peer_settings_raw().is_some()
         } else {
-            false
+            self.dgram_recv_buf.truncate(needed);
         }
+        self.dgram_recv_buf[..needed].copy_from_slice(dgram.as_slice());
+
+        let (context_id, ctx_len) = decode_varint(&self.dgram_recv_buf)?;
+        if context_id != 0 {
+            return Ok(0);
+        }
+
+        let payload_len = needed.saturating_sub(ctx_len);
+        if payload_len > buf.len() {
+            return Err(MasqueError::ConnectionError("Buffer too small".into()));
+        }
+
+        buf[..payload_len].copy_from_slice(&self.dgram_recv_buf[ctx_len..needed]);
+        Ok(payload_len)
     }
 
-    fn poll_h3_events(&mut self) -> Result<(), MasqueError> {
-        let h3_conn = match self.h3_conn.as_mut() {
-            Some(c) => c,
-            None => return Ok(()),
-        };
+    pub async fn sample_quic_stats(&self) -> Option<crate::net::tunnel::quic::QuicPerfStats> {
+        fetch_perf_stats(&self.controller).await.ok().flatten()
+    }
+
+    pub fn process_control_chunk(&mut self, chunk: Bytes, fin: bool) -> Result<(), MasqueError> {
+        self.control_state.recv_buf.extend_from_slice(&chunk);
 
         loop {
-            match h3_conn.poll(&mut self.quic_conn.conn) {
-                Ok((stream_id, event)) => {
-                    log::trace!("H3 event: stream={} {:?}", stream_id, event);
-                    match event {
-                        quiche::h3::Event::Headers { list, .. } => {
-                            log::trace!("H3 headers: stream={} {:?}", stream_id, list);
-                            if Some(stream_id) == self.connect_stream_id {
-                                for header in &list {
-                                    if header.name() == b":status" {
-                                        let status = std::str::from_utf8(header.value())
-                                            .unwrap_or("unknown");
-                                        log::debug!("Connect-IP response: status={}", status);
-                                        if status == "200" {
-                                            self.established = true;
-                                        } else {
-                                            return Err(MasqueError::ConnectIpFailed(format!(
-                                                "status: {}",
-                                                status
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        quiche::h3::Event::Data => {
-                            log::trace!("H3 data: stream={}", stream_id);
-                        }
-                        quiche::h3::Event::Finished => {}
-                        quiche::h3::Event::Reset(_) => {}
-                        quiche::h3::Event::PriorityUpdate => {}
-                        quiche::h3::Event::GoAway => {
-                            return Err(MasqueError::ConnectionError("received GOAWAY".into()));
-                        }
-                    }
+            let Some((capsule_type, capsule_type_len)) =
+                try_decode_varint(self.control_state.recv_buf.as_ref())
+            else {
+                break;
+            };
+            let Some((capsule_len, capsule_len_len)) =
+                try_decode_varint(&self.control_state.recv_buf[capsule_type_len..])
+            else {
+                break;
+            };
+            let frame_len = capsule_type_len
+                .checked_add(capsule_len_len)
+                .and_then(|len| len.checked_add(capsule_len as usize))
+                .ok_or_else(|| {
+                    MasqueError::ConnectionError("capsule frame length overflow".into())
+                })?;
+            if self.control_state.recv_buf.len() < frame_len {
+                break;
+            }
+
+            let frame = self.control_state.recv_buf.split_to(frame_len);
+            let payload_offset = capsule_type_len + capsule_len_len;
+            let payload = &frame[payload_offset..];
+            self.control_state.process_capsule(capsule_type, payload)?;
+        }
+
+        if fin && !self.control_state.recv_buf.is_empty() {
+            return Err(MasqueError::ConnectionError(
+                "truncated MASQUE control capsule".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn assigned_addresses(&self) -> &[String] {
+        &self.control_state.assigned_addresses
+    }
+
+    pub fn advertised_routes(&self) -> &[String] {
+        &self.control_state.advertised_routes
+    }
+
+    pub fn close(&self) {
+        let _ = self
+            .controller
+            .cmd_sender()
+            .send(QuicCommand::ConnectionClose(ConnectionShutdownBehaviour {
+                send_application_close: true,
+                error_code: 0,
+                reason: Vec::new(),
+            }));
+    }
+}
+
+impl MasqueControlState {
+    fn process_capsule(&mut self, capsule_type: u64, payload: &[u8]) -> Result<(), MasqueError> {
+        match capsule_type {
+            0x01 => {
+                let addresses = parse_address_assign_capsule(payload)?;
+                if !addresses.is_empty() {
+                    log::debug!("MASQUE AddressAssign: {}", addresses.join(", "));
+                    self.assigned_addresses.extend(addresses);
                 }
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => {
-                    log::error!("H3 poll error: {:?}", e);
-                    return Err(MasqueError::H3Error(e));
+            }
+            0x03 => {
+                let routes = parse_route_advertisement_capsule(payload)?;
+                if !routes.is_empty() {
+                    log::debug!("MASQUE RouteAdvertisement: {}", routes.join(", "));
+                    self.advertised_routes.extend(routes);
                 }
+            }
+            _ => {
+                log::trace!(
+                    "ignored MASQUE control capsule type={} len={}",
+                    capsule_type,
+                    payload.len()
+                );
             }
         }
 
         Ok(())
     }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn connect_ip_headers() -> Vec<quiche::h3::Header> {
+    vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        quiche::h3::Header::new(b"user-agent", b""),
+    ]
 }
 
 // QUIC varint encoding (RFC 9000)
@@ -406,33 +421,6 @@ fn varint_len(value: u64) -> usize {
     } else if value < 1073741824 {
         4
     } else {
-        8
-    }
-}
-
-fn encode_varint(value: u64, buf: &mut [u8]) -> usize {
-    if value < 64 {
-        buf[0] = value as u8;
-        1
-    } else if value < 16384 {
-        buf[0] = ((value >> 8) as u8) | 0x40;
-        buf[1] = value as u8;
-        2
-    } else if value < 1073741824 {
-        buf[0] = ((value >> 24) as u8) | 0x80;
-        buf[1] = (value >> 16) as u8;
-        buf[2] = (value >> 8) as u8;
-        buf[3] = value as u8;
-        4
-    } else {
-        buf[0] = ((value >> 56) as u8) | 0xc0;
-        buf[1] = (value >> 48) as u8;
-        buf[2] = (value >> 40) as u8;
-        buf[3] = (value >> 32) as u8;
-        buf[4] = (value >> 24) as u8;
-        buf[5] = (value >> 16) as u8;
-        buf[6] = (value >> 8) as u8;
-        buf[7] = value as u8;
         8
     }
 }
@@ -472,6 +460,134 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), MasqueError> {
     };
 
     Ok((value, len))
+}
+
+fn try_decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    decode_varint(buf).ok()
+}
+
+fn parse_address_assign_capsule(payload: &[u8]) -> Result<Vec<String>, MasqueError> {
+    let mut offset = 0usize;
+    let mut addresses = Vec::new();
+
+    while offset < payload.len() {
+        let (_, request_id_len) = decode_varint(&payload[offset..])?;
+        offset += request_id_len;
+        let ip_version = *payload.get(offset).ok_or_else(|| {
+            MasqueError::ConnectionError("truncated AddressAssign capsule".into())
+        })?;
+        offset += 1;
+
+        let entry = match ip_version {
+            4 => {
+                let addr = payload.get(offset..offset + 4).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated AddressAssign IPv4".into())
+                })?;
+                offset += 4;
+                let prefix = *payload.get(offset).ok_or_else(|| {
+                    MasqueError::ConnectionError("missing AddressAssign IPv4 prefix".into())
+                })?;
+                offset += 1;
+                format!(
+                    "{}/{}",
+                    IpAddr::from([addr[0], addr[1], addr[2], addr[3]]),
+                    prefix
+                )
+            }
+            6 => {
+                let addr = payload.get(offset..offset + 16).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated AddressAssign IPv6".into())
+                })?;
+                offset += 16;
+                let prefix = *payload.get(offset).ok_or_else(|| {
+                    MasqueError::ConnectionError("missing AddressAssign IPv6 prefix".into())
+                })?;
+                offset += 1;
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(addr);
+                format!("{}/{}", IpAddr::from(bytes), prefix)
+            }
+            other => {
+                return Err(MasqueError::ConnectionError(format!(
+                    "invalid AddressAssign IP version: {}",
+                    other
+                )));
+            }
+        };
+
+        addresses.push(entry);
+    }
+
+    Ok(addresses)
+}
+
+fn parse_route_advertisement_capsule(payload: &[u8]) -> Result<Vec<String>, MasqueError> {
+    let mut offset = 0usize;
+    let mut routes = Vec::new();
+
+    while offset < payload.len() {
+        let ip_version = *payload.get(offset).ok_or_else(|| {
+            MasqueError::ConnectionError("truncated RouteAdvertisement capsule".into())
+        })?;
+        offset += 1;
+
+        let route = match ip_version {
+            4 => {
+                let start = payload.get(offset..offset + 4).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated RouteAdvertisement IPv4".into())
+                })?;
+                offset += 4;
+                let end = payload.get(offset..offset + 4).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated RouteAdvertisement IPv4".into())
+                })?;
+                offset += 4;
+                let ip_proto = *payload.get(offset).ok_or_else(|| {
+                    MasqueError::ConnectionError("missing RouteAdvertisement IPv4 protocol".into())
+                })?;
+                offset += 1;
+                format!(
+                    "{}-{} proto={}",
+                    IpAddr::from([start[0], start[1], start[2], start[3]]),
+                    IpAddr::from([end[0], end[1], end[2], end[3]]),
+                    ip_proto
+                )
+            }
+            6 => {
+                let start = payload.get(offset..offset + 16).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated RouteAdvertisement IPv6".into())
+                })?;
+                offset += 16;
+                let end = payload.get(offset..offset + 16).ok_or_else(|| {
+                    MasqueError::ConnectionError("truncated RouteAdvertisement IPv6".into())
+                })?;
+                offset += 16;
+                let ip_proto = *payload.get(offset).ok_or_else(|| {
+                    MasqueError::ConnectionError("missing RouteAdvertisement IPv6 protocol".into())
+                })?;
+                offset += 1;
+                let mut start_bytes = [0u8; 16];
+                start_bytes.copy_from_slice(start);
+                let mut end_bytes = [0u8; 16];
+                end_bytes.copy_from_slice(end);
+                format!(
+                    "{}-{} proto={}",
+                    IpAddr::from(start_bytes),
+                    IpAddr::from(end_bytes),
+                    ip_proto
+                )
+            }
+            other => {
+                return Err(MasqueError::ConnectionError(format!(
+                    "invalid RouteAdvertisement IP version: {}",
+                    other
+                )));
+            }
+        };
+
+        routes.push(route);
+    }
+
+    Ok(routes)
 }
 
 // IPv4 header length
@@ -637,6 +753,81 @@ fn compose_icmpv4_packet_too_big(original_packet: &[u8], mtu: u16) -> Option<Vec
     packet[icmp_start + 3] = icmp_checksum as u8;
 
     Some(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        if value < 64 {
+            vec![value as u8]
+        } else if value < 16384 {
+            value |= 0x4000;
+            value.to_be_bytes()[6..].to_vec()
+        } else if value < 1073741824 {
+            value |= 0x8000_0000;
+            value.to_be_bytes()[4..].to_vec()
+        } else {
+            value |= 0xc000_0000_0000_0000;
+            value.to_be_bytes().to_vec()
+        }
+    }
+
+    fn build_capsule(capsule_type: u64, payload: &[u8]) -> Bytes {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&encode_varint(capsule_type));
+        bytes.extend_from_slice(&encode_varint(payload.len() as u64));
+        bytes.extend_from_slice(payload);
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn parses_address_assign_capsule() {
+        let payload = [0x00, 0x04, 10, 0, 0, 2, 32];
+        let addresses = parse_address_assign_capsule(&payload).unwrap();
+        assert_eq!(addresses, vec!["10.0.0.2/32"]);
+    }
+
+    #[test]
+    fn parses_fragmented_control_capsules() {
+        let mut control = MasqueControlState::default();
+        let capsule = build_capsule(0x01, &[0x00, 0x04, 10, 0, 0, 2, 32]);
+        let split = 3;
+        control.recv_buf.extend_from_slice(&capsule[..split]);
+        assert!(control.assigned_addresses.is_empty());
+        control.recv_buf.extend_from_slice(&capsule[split..]);
+        while let Some((capsule_type, capsule_type_len)) =
+            try_decode_varint(control.recv_buf.as_ref())
+        {
+            let (capsule_len, capsule_len_len) =
+                try_decode_varint(&control.recv_buf[capsule_type_len..]).unwrap();
+            let frame_len = capsule_type_len + capsule_len_len + capsule_len as usize;
+            let frame = control.recv_buf.split_to(frame_len);
+            control
+                .process_capsule(capsule_type, &frame[capsule_type_len + capsule_len_len..])
+                .unwrap();
+        }
+        assert_eq!(control.assigned_addresses, ["10.0.0.2/32"]);
+    }
+
+    #[test]
+    fn ignores_unknown_capsules() {
+        let mut control = MasqueControlState::default();
+        let capsule = build_capsule(0xdead, &[1, 2, 3]);
+        control.recv_buf.extend_from_slice(&capsule);
+        let (capsule_type, capsule_type_len) =
+            try_decode_varint(control.recv_buf.as_ref()).unwrap();
+        let (capsule_len, capsule_len_len) =
+            try_decode_varint(&control.recv_buf[capsule_type_len..]).unwrap();
+        let frame_len = capsule_type_len + capsule_len_len + capsule_len as usize;
+        let frame = control.recv_buf.split_to(frame_len);
+        control
+            .process_capsule(capsule_type, &frame[capsule_type_len + capsule_len_len..])
+            .unwrap();
+        assert!(control.assigned_addresses.is_empty());
+        assert!(control.advertised_routes.is_empty());
+    }
 }
 
 // Compose ICMPv6 Packet Too Big message

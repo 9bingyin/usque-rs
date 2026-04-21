@@ -142,7 +142,7 @@ impl TunnelManager {
             ..Default::default()
         };
 
-        let quic_conn = quic::connect_with_pinning(
+        let masque_tunnel = MasqueTunnel::connect(
             params.endpoint,
             &params.cert_der,
             &params.key_der,
@@ -153,17 +153,10 @@ impl TunnelManager {
         )
         .await?;
 
-        let mut masque_tunnel = MasqueTunnel::new(quic_conn);
-        masque_tunnel.establish(Duration::from_secs(30)).await?;
-
         // Dynamically get MTU from QUIC datagram max size
-        // Subtract HTTP/3 datagram header (~3 bytes for varint stream ID + context ID)
-        let dynamic_mtu = masque_tunnel
-            .quic_conn
-            .conn
-            .dgram_max_writable_len()
-            .map(|max| max.saturating_sub(3))
-            .unwrap_or(1280);
+        // tokio-quiche H3 driver already accounts for quarter stream id;
+        // we still reserve one byte for MASQUE Context ID.
+        let dynamic_mtu = masque_tunnel.max_ip_packet_len();
 
         let configured_mtu = params.mtu as usize;
         let mtu = if configured_mtu == 0 {

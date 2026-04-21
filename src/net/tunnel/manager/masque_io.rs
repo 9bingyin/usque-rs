@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::time::MissedTickBehavior;
+use tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame};
+
 struct MasqueIoHandle {
     socket: Arc<tokio::net::UdpSocket>,
     peer_addr: SocketAddr,
@@ -14,11 +17,11 @@ impl MasqueIoHandle {
     fn spawn(
         tunnel: Box<MasqueTunnel>,
         buffer_pool: BufferPool,
-        keepalive_secs: u64,
+        _keepalive_secs: u64,
         tunables: &ManagerTunables,
     ) -> (Self, IncomingTask) {
-        let socket = tunnel.quic_conn.socket.clone();
-        let peer_addr = tunnel.quic_conn.peer_addr;
+        let socket = tunnel.socket.clone();
+        let peer_addr = tunnel.peer_addr;
         let (send_tx, mut send_rx) = mpsc::channel::<BytesMut>(tunables.masque_io_channel_capacity);
         let (event_tx, event_rx) =
             mpsc::channel::<TransportIoEvent>(tunables.incoming_dgram_capacity);
@@ -34,209 +37,72 @@ impl MasqueIoHandle {
         let quic_stats_worker = quic_stats.clone();
         let pool_max_size = tunables.pool_max_size;
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
-        let max_poll_interval = tunables.max_poll_interval;
-        let keepalive_interval = Duration::from_secs(keepalive_secs);
         let send_budget_limit = tunables.masque_stack_drain_budget;
+        let stats_interval = tunables.max_poll_interval.max(Duration::from_millis(250));
 
         let recv_handle = tokio::spawn(async move {
             let _guard = worker_completion_tx;
             let mut tunnel = tunnel;
+            let mut h3_events = tunnel.controller.take_event_receiver();
             let mut recv_buf =
                 TunnelManager::take_pooled_buffer(&buffer_pool, udp_recv_buffer_size);
             recv_buf.resize(udp_recv_buffer_size, 0);
-            let mut pending_packet: Option<BytesMut> = None;
-            let mut last_keepalive = Instant::now();
+            let mut stats_tick = tokio::time::interval(stats_interval);
+            stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            if let Some(stats) = tunnel.sample_quic_stats().await
+                && let Ok(mut guard) = quic_stats_worker.lock()
+            {
+                *guard = Some(stats);
+            }
 
             loop {
-                if tunnel.quic_conn.is_closed() {
-                    log::warn!("MASQUE IO worker detected closed QUIC connection");
-                    break;
-                }
-
-                if let Ok(mut guard) = quic_stats_worker.lock() {
-                    *guard = tunnel.quic_conn.perf_stats();
-                }
-
-                if !keepalive_interval.is_zero() && last_keepalive.elapsed() >= keepalive_interval {
-                    if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
-                        log::warn!("keepalive PING failed: {:?}", e);
-                    } else {
-                        tunnel.quic_conn.mark_pending_send();
-                        last_keepalive = Instant::now();
-                    }
-                }
-
-                if let Some(timeout) = tunnel.quic_conn.conn.timeout()
-                    && timeout.is_zero()
-                {
-                    tunnel.quic_conn.conn.on_timeout();
-                    tunnel.quic_conn.mark_pending_send();
-                }
-
-                let mut queued_to_quiche = false;
-                let mut send_budget = 0usize;
-                loop {
-                    if send_budget >= send_budget_limit {
-                        break;
-                    }
-
-                    let packet = if let Some(packet) = pending_packet.take() {
-                        packet
-                    } else {
-                        match send_rx.try_recv() {
-                            Ok(packet) => packet,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                log::trace!("MASQUE IO send channel disconnected");
-                                break;
-                            }
-                        }
-                    };
-
-                    send_budget += 1;
-                    match tunnel.send_datagram(&packet) {
-                        Ok(crate::net::tunnel::masque::DatagramSendState::Sent)
-                        | Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
-                            queued_to_quiche = true;
-                            queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                            TunnelManager::return_pooled_buffer(
-                                &buffer_pool,
-                                packet,
-                                pool_max_size,
-                            );
-                        }
-                        Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
-                            queued_to_quiche = true;
-                            queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                            TunnelManager::return_pooled_buffer(
-                                &buffer_pool,
-                                packet,
-                                pool_max_size,
-                            );
-                            let mut icmp_packet =
-                                TunnelManager::take_pooled_buffer(&buffer_pool, icmp.len());
-                            icmp_packet.extend_from_slice(&icmp);
-                            if event_tx
-                                .send(TransportIoEvent::Incoming(IncomingDatagram {
-                                    data: icmp_packet,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Ok(crate::net::tunnel::masque::DatagramSendState::Blocked) => {
-                            pending_packet = Some(packet);
-                            let _ = event_tx.try_send(TransportIoEvent::MasqueBlocked);
-                            break;
-                        }
-                        Err(e) => {
-                            log::debug!("MASQUE IO dgram_send failed: {:?}", e);
-                            queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                            TunnelManager::return_pooled_buffer(
-                                &buffer_pool,
-                                packet,
-                                pool_max_size,
-                            );
-                        }
-                    }
-                }
-
-                let should_flush = queued_to_quiche
-                    || tunnel.quic_conn.pending_send_packets() > 0
-                    || tunnel.quic_conn.has_pending_send_work();
-
-                if should_flush {
-                    let _ = tunnel.quic_conn.take_pending_send();
-                    match tunnel.quic_conn.send_async().await {
-                        Ok(status) => {
-                            if status.packets_sent > 0
-                                || status.blocked
-                                || status.enobufs
-                                || status.paced
-                            {
-                                let _ = event_tx.try_send(TransportIoEvent::QuicFlush(status));
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!("MASQUE IO QUIC send failed: {:?}", e);
-                        }
-                    }
-                }
-
-                let recv_deadline = tunnel
-                    .quic_conn
-                    .conn
-                    .timeout()
-                    .map(|timeout| TokioInstant::now() + timeout.min(max_poll_interval));
-                let send_deadline = tunnel
-                    .quic_conn
-                    .next_send_at()
-                    .map(TokioInstant::from_std)
-                    .map(|deadline| deadline.min(TokioInstant::now() + max_poll_interval));
-                let keepalive_deadline = if keepalive_interval.is_zero() {
-                    None
-                } else {
-                    Some(TokioInstant::from_std(last_keepalive + keepalive_interval))
-                };
-                let poll_deadline = [recv_deadline, send_deadline, keepalive_deadline]
-                    .into_iter()
-                    .flatten()
-                    .min();
-                let has_poll_timer = poll_deadline.is_some();
-                let needs_socket_writable = tunnel.quic_conn.needs_socket_writable();
-                let poll_timer = tokio::time::sleep_until(
-                    poll_deadline.unwrap_or_else(|| {
-                        TokioInstant::now() + Duration::from_secs(365 * 24 * 60 * 60)
-                    }),
-                );
-                tokio::pin!(poll_timer);
-
                 tokio::select! {
                     biased;
                     _ = shutdown_sub.recv() => break,
 
-                    Some(packet) = send_rx.recv(), if pending_packet.is_none() => {
-                        pending_packet = Some(packet);
+                    _ = stats_tick.tick() => {
+                        if let Some(stats) = tunnel.sample_quic_stats().await
+                            && let Ok(mut guard) = quic_stats_worker.lock()
+                        {
+                            *guard = Some(stats);
+                        }
                     }
 
-                    readable = tunnel.quic_conn.socket.readable() => {
-                        if let Err(e) = readable {
-                            log::warn!("MASQUE IO readable wait failed: {}", e);
-                            continue;
-                        }
-
-                        let mut quic_progress = false;
-                        loop {
-                            let len = match tunnel.quic_conn.socket.try_recv(&mut recv_buf[..]) {
-                                Ok(len) => len,
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(e) => {
-                                    log::warn!("MASQUE IO UDP recv failed: {}", e);
-                                    break;
-                                }
-                            };
-
-                            let recv_info = quiche::RecvInfo {
-                                from: tunnel.quic_conn.peer_addr,
-                                to: tunnel.quic_conn.local_addr,
-                            };
-                            match tunnel.quic_conn.conn.recv(&mut recv_buf[..len], recv_info) {
-                                Ok(_) => {
-                                    quic_progress = true;
-                                }
-                                Err(e) => {
-                                    log::warn!("MASQUE IO QUIC recv failed: {:?}", e);
-                                }
+                    maybe_event = h3_events.recv() => {
+                        match maybe_event {
+                            Some(ClientH3Event::Core(H3Event::ConnectionError(error))) => {
+                                log::warn!("MASQUE H3 connection error: {:?}", error);
+                                break;
+                            }
+                            Some(ClientH3Event::Core(H3Event::ConnectionShutdown(reason))) => {
+                                log::warn!("MASQUE H3 connection shutdown: {:?}", reason);
+                                break;
+                            }
+                            Some(ClientH3Event::Core(H3Event::ResetStream { stream_id }))
+                                if stream_id == tunnel.connect_stream_id =>
+                            {
+                                log::warn!("MASQUE CONNECT-IP stream reset");
+                                break;
+                            }
+                            Some(ClientH3Event::Core(H3Event::StreamClosed { stream_id }))
+                                if stream_id == tunnel.connect_stream_id =>
+                            {
+                                log::warn!("MASQUE CONNECT-IP stream closed");
+                                break;
+                            }
+                            Some(_) => {}
+                            None => {
+                                log::warn!("MASQUE H3 controller event stream closed");
+                                break;
                             }
                         }
+                    }
 
-                        if quic_progress {
-                            tunnel.poll_h3();
-                            tunnel.quic_conn.mark_pending_send();
-                            loop {
-                                match tunnel.recv_datagram(recv_buf.as_mut()) {
+                    maybe_frame = tunnel.flow_recv.recv() => {
+                        match maybe_frame {
+                            Some(InboundFrame::Datagram(dgram)) => {
+                                match tunnel.decode_datagram(dgram, recv_buf.as_mut()) {
                                     Ok(len) if len > 0 => {
                                         let mut packet = TunnelManager::take_pooled_buffer(
                                             &buffer_pool,
@@ -244,41 +110,125 @@ impl MasqueIoHandle {
                                         );
                                         packet.extend_from_slice(&recv_buf[..len]);
                                         if event_tx
-                                            .send(TransportIoEvent::Incoming(IncomingDatagram {
-                                                data: packet,
-                                            }))
+                                            .send(TransportIoEvent::Incoming(IncomingDatagram { data: packet }))
                                             .await
                                             .is_err()
                                         {
                                             break;
                                         }
                                     }
-                                    _ => break,
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        log::debug!("MASQUE datagram decode failed: {:?}", error);
+                                    }
                                 }
+                            }
+                            Some(InboundFrame::Body(_, _)) => {}
+                            None => {
+                                log::warn!("MASQUE datagram flow closed");
+                                break;
                             }
                         }
                     }
 
-                    writable = tunnel.quic_conn.socket.writable(), if needs_socket_writable => {
-                        if let Err(e) = writable {
-                            log::debug!("MASQUE IO writable wait failed: {}", e);
+                    maybe_control = tunnel.connect_recv.recv() => {
+                        match maybe_control {
+                            Some(InboundFrame::Body(body, fin)) => {
+                                if let Err(error) = tunnel.process_control_chunk(body.freeze(), fin) {
+                                    log::warn!("MASQUE control stream parse failed: {:?}", error);
+                                    break;
+                                }
+                            }
+                            Some(InboundFrame::Datagram(_)) => {
+                                log::debug!("ignored unexpected MASQUE datagram on control stream");
+                            }
+                            None => {
+                                log::trace!("MASQUE control stream body closed");
+                            }
                         }
                     }
 
-                    _ = &mut poll_timer, if has_poll_timer => {}
+                    maybe_packet = send_rx.recv() => {
+                        let Some(first_packet) = maybe_packet else {
+                            log::trace!("MASQUE IO send channel disconnected");
+                            break;
+                        };
+
+                        let mut batch = Vec::with_capacity(send_budget_limit.min(16));
+                        batch.push(first_packet);
+                        while batch.len() < send_budget_limit {
+                            match send_rx.try_recv() {
+                                Ok(packet) => batch.push(packet),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                            }
+                        }
+
+                        let mut sent_packets = 0usize;
+                        let mut sent_bytes = 0usize;
+                        let mut blocked = false;
+
+                        for packet in batch {
+                            match tunnel.send_datagram(&packet).await {
+                                Ok(crate::net::tunnel::masque::DatagramSendState::Sent)
+                                | Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
+                                    sent_packets += 1;
+                                    sent_bytes += packet.len();
+                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
+                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+                                }
+                                Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
+                                    sent_packets += 1;
+                                    sent_bytes += packet.len();
+                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
+                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+                                    let mut icmp_packet =
+                                        TunnelManager::take_pooled_buffer(&buffer_pool, icmp.len());
+                                    icmp_packet.extend_from_slice(&icmp);
+                                    if event_tx
+                                        .send(TransportIoEvent::Incoming(IncomingDatagram { data: icmp_packet }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        blocked = true;
+                                        break;
+                                    }
+                                }
+                                Ok(crate::net::tunnel::masque::DatagramSendState::Blocked) => {
+                                    blocked = true;
+                                    let _ = event_tx.try_send(TransportIoEvent::MasqueBlocked);
+                                    break;
+                                }
+                                Err(error) => {
+                                    log::debug!("MASQUE datagram send failed: {:?}", error);
+                                    queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
+                                    TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
+                                }
+                            }
+                        }
+
+                        if sent_packets > 0 || blocked {
+                            let _ = event_tx.try_send(TransportIoEvent::QuicFlush(QuicSendStatus {
+                                bytes_sent: sent_bytes,
+                                packets_sent: sent_packets,
+                                blocked,
+                                enobufs: false,
+                                paced: false,
+                            }));
+                        }
+                    }
                 }
             }
+
+            tunnel.close();
 
             while let Ok(packet) = send_rx.try_recv() {
                 queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
                 TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
             }
-            if let Some(packet) = pending_packet.take() {
-                queued_packets_worker.fetch_sub(1, Ordering::AcqRel);
-                TunnelManager::return_pooled_buffer(&buffer_pool, packet, pool_max_size);
-            }
+            let final_stats = tunnel.sample_quic_stats().await;
             if let Ok(mut guard) = quic_stats_worker.lock() {
-                *guard = tunnel.quic_conn.perf_stats();
+                *guard = final_stats;
             }
             alive_worker.store(false, Ordering::Release);
         });
@@ -302,7 +252,10 @@ impl MasqueIoHandle {
         )
     }
 
-    fn try_send_packet(&self, packet: BytesMut) -> Result<(), tokio::sync::mpsc::error::TrySendError<BytesMut>> {
+    fn try_send_packet(
+        &self,
+        packet: BytesMut,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<BytesMut>> {
         match self.send_tx.try_send(packet) {
             Ok(()) => {
                 self.queued_packets.fetch_add(1, Ordering::AcqRel);

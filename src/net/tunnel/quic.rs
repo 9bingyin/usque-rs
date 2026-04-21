@@ -4,6 +4,12 @@ use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::sync::oneshot;
+use tokio_quiche::ClientH3Controller;
+use tokio_quiche::ConnectionParams as TokioConnectionParams;
+use tokio_quiche::quic::ConnectionHook;
+use tokio_quiche::quic::QuicCommand;
+use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -61,6 +67,14 @@ impl CongestionControl {
             CongestionControl::Bbr2 => quiche::CongestionControlAlgorithm::Bbr2Gcongestion,
         }
     }
+
+    fn to_tokio_quiche_name(self) -> &'static str {
+        match self {
+            CongestionControl::Reno => "reno",
+            CongestionControl::Cubic => "cubic",
+            CongestionControl::Bbr2 => "bbr2",
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -94,6 +108,41 @@ pub struct QuicConfig {
     pub max_stream_window: u64,
     pub send_capacity_factor: f64,
     pub congestion_control: CongestionControl,
+}
+
+struct InMemoryTlsHook {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+}
+
+impl InMemoryTlsHook {
+    fn new(cert_der: &[u8], key_der: &[u8]) -> Self {
+        Self {
+            cert_der: cert_der.to_vec(),
+            key_der: key_der.to_vec(),
+        }
+    }
+}
+
+impl ConnectionHook for InMemoryTlsHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        _settings: TlsCertificatePaths<'_>,
+    ) -> Option<boring::ssl::SslContextBuilder> {
+        use boring::ec::EcKey;
+        use boring::pkey::PKey;
+        use boring::ssl::{SslContextBuilder, SslMethod};
+        use boring::x509::X509;
+
+        let cert = X509::from_der(&self.cert_der).ok()?;
+        let ec_key = EcKey::private_key_from_der(&self.key_der).ok()?;
+        let pkey = PKey::from_ec_key(ec_key).ok()?;
+
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
+        builder.set_certificate(&cert).ok()?;
+        builder.set_private_key(&pkey).ok()?;
+        Some(builder)
+    }
 }
 
 impl Default for QuicConfig {
@@ -406,6 +455,117 @@ impl QuicConnection {
     }
 }
 
+pub fn build_tokio_quiche_connection_params(
+    quic_cfg: &QuicConfig,
+    cert_der: &[u8],
+    key_der: &[u8],
+) -> TokioConnectionParams<'static> {
+    let mut settings = QuicSettings::default();
+    settings.alpn = vec![b"h3".to_vec()];
+    settings.enable_dgram = quic_cfg.enable_dgram;
+    settings.dgram_recv_max_queue_len = quic_cfg.dgram_recv_max_queue_len as usize;
+    settings.dgram_send_max_queue_len = quic_cfg.dgram_send_max_queue_len as usize;
+    settings.max_idle_timeout = Some(Duration::from_millis(quic_cfg.idle_timeout));
+    settings.max_recv_udp_payload_size = quic_cfg.max_recv_udp_payload_size;
+    settings.max_send_udp_payload_size = quic_cfg.initial_packet_size as usize;
+    settings.initial_max_data = quic_cfg.initial_max_data;
+    settings.initial_max_stream_data_bidi_local = quic_cfg.initial_max_stream_data_bidi_local;
+    settings.initial_max_stream_data_bidi_remote = quic_cfg.initial_max_stream_data_bidi_remote;
+    settings.initial_max_stream_data_uni = quic_cfg.initial_max_stream_data_uni;
+    settings.initial_max_streams_bidi = quic_cfg.initial_max_streams_bidi;
+    settings.initial_max_streams_uni = quic_cfg.initial_max_streams_uni;
+    settings.disable_active_migration = true;
+    settings.cc_algorithm = quic_cfg
+        .congestion_control
+        .to_tokio_quiche_name()
+        .to_string();
+    settings.enable_pacing = true;
+    settings.verify_peer = false;
+    settings.grease = false;
+    settings.max_connection_window = quic_cfg.max_connection_window;
+    settings.max_stream_window = quic_cfg.max_stream_window;
+    settings.send_capacity_factor = quic_cfg.send_capacity_factor;
+
+    if let Some(max_pacing_rate_mbps) = std::env::var("USQUE_QUIC_MAX_PACING_RATE_MBPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        settings.max_pacing_rate = Some(max_pacing_rate_mbps * 1_000_000);
+    }
+
+    let hooks = Hooks {
+        connection_hook: Some(Arc::new(InMemoryTlsHook::new(cert_der, key_der))),
+        ..Default::default()
+    };
+
+    TokioConnectionParams::new_client(
+        settings,
+        Some(TlsCertificatePaths {
+            cert: "in-memory-cert",
+            private_key: "in-memory-key",
+            kind: CertificateKind::X509,
+        }),
+        hooks,
+    )
+}
+
+pub async fn fetch_peer_cert(
+    controller: &ClientH3Controller,
+) -> Result<Option<Vec<u8>>, QuicError> {
+    let (tx, rx) = oneshot::channel();
+    controller
+        .cmd_sender()
+        .send(QuicCommand::Custom(Box::new(move |qconn| {
+            let _ = tx.send(qconn.peer_cert().map(|cert| cert.to_vec()));
+        })))
+        .map_err(|_| QuicError::ConnectionError("tokio-quiche command channel closed".into()))?;
+
+    rx.await
+        .map_err(|_| QuicError::ConnectionError("tokio-quiche peer cert response dropped".into()))
+}
+
+pub async fn fetch_dgram_max_writable_len(
+    controller: &ClientH3Controller,
+) -> Result<Option<usize>, QuicError> {
+    let (tx, rx) = oneshot::channel();
+    controller
+        .cmd_sender()
+        .send(QuicCommand::Custom(Box::new(move |qconn| {
+            let _ = tx.send(qconn.dgram_max_writable_len());
+        })))
+        .map_err(|_| QuicError::ConnectionError("tokio-quiche command channel closed".into()))?;
+
+    rx.await.map_err(|_| {
+        QuicError::ConnectionError("tokio-quiche datagram size response dropped".into())
+    })
+}
+
+pub async fn fetch_perf_stats(
+    controller: &ClientH3Controller,
+) -> Result<Option<QuicPerfStats>, QuicError> {
+    let (tx, rx) = oneshot::channel();
+    controller
+        .cmd_sender()
+        .send(QuicCommand::ConnectionStats(Box::new(move |stats| {
+            let path = stats.path_stats;
+            let perf = path.map(|path| QuicPerfStats {
+                rtt_ms: path.rtt.as_millis().min(u128::from(u64::MAX)) as u64,
+                cwnd: path.cwnd,
+                lost: path.lost,
+                total_pto_count: path.total_pto_count,
+                delivery_rate_bps: path.delivery_rate,
+                dgram_recv: path.dgram_recv,
+                dgram_sent: path.dgram_sent,
+            });
+            let _ = tx.send(perf);
+        })))
+        .map_err(|_| QuicError::ConnectionError("tokio-quiche command channel closed".into()))?;
+
+    rx.await
+        .map_err(|_| QuicError::ConnectionError("tokio-quiche stats response dropped".into()))
+}
+
 pub async fn connect(
     endpoint: SocketAddr,
     cert_der: &[u8],
@@ -484,7 +644,11 @@ pub async fn connect(
     Ok(quic_conn)
 }
 
-fn configure_udp_socket_buffers(socket: &std::net::UdpSocket, recv_size: usize, send_size: usize) {
+pub(crate) fn configure_udp_socket_buffers(
+    socket: &std::net::UdpSocket,
+    recv_size: usize,
+    send_size: usize,
+) {
     let sock = socket2::SockRef::from(socket);
 
     if let Err(e) = sock.set_recv_buffer_size(recv_size) {
@@ -538,7 +702,7 @@ pub async fn connect_with_pinning(
     Ok(quic_conn)
 }
 
-fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool {
+pub(crate) fn verify_peer_public_key(cert_der: &[u8], expected_pub_key_spki: &[u8]) -> bool {
     use der::{Decode, Encode};
     use x509_cert::Certificate;
 
