@@ -1,13 +1,13 @@
 use super::{
-    format_ip_addr, interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
-    CONNECTION_ATTEMPT_DELAY, CONNECT_TIMEOUT, IDLE_TIMEOUT, TCP_READ_BUFFER_SIZE,
+    CONNECT_TIMEOUT, CONNECTION_ATTEMPT_DELAY, IDLE_TIMEOUT, TCP_READ_BUFFER_SIZE, format_ip_addr,
+    interleave_addresses, map_connect_error_to_reply, map_manager_error_to_reply,
 };
 use super::{Socks5Error, get_local_port};
 use crate::net::tunnel::manager::{SocketChannels, TcpSocketState, TunnelManager};
 use bytes::BytesMut;
+use fast_socks5::ReplyError;
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
-use fast_socks5::ReplyError;
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpAddress;
 use std::net::{IpAddr, SocketAddr};
@@ -31,7 +31,14 @@ pub(crate) async fn handle_tcp_connect<T: AsyncRead + AsyncWrite + Unpin>(
                 Socks5Error::ProtocolError(format!("DNS resolution failed: {:?}", e))
             })?;
             let sorted = interleave_addresses(ips);
-            log::debug!("resolved [{}]", sorted.iter().map(|ip| format_ip_addr(*ip)).collect::<Vec<_>>().join(", "));
+            log::debug!(
+                "resolved [{}]",
+                sorted
+                    .iter()
+                    .map(|ip| format_ip_addr(*ip))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             (sorted, *port)
         }
     };

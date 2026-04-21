@@ -105,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn init_logger(level: LogLevel, disable_color: bool, full_timestamp: bool) {
-    use colored::control::set_override;
     use colored::Colorize;
+    use colored::control::set_override;
     use env_logger::Builder;
     use log::{Level, LevelFilter};
     use std::io::Write;

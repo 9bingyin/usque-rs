@@ -137,10 +137,11 @@ impl WgConfig {
             .map_err(|e| WgConfigError::Parse(e.to_string()))?;
 
         let get = |section: &str, key: &str| -> Result<String, WgConfigError> {
-            ini.get(section, key).ok_or_else(|| WgConfigError::MissingField {
-                section: section.to_string(),
-                key: key.to_string(),
-            })
+            ini.get(section, key)
+                .ok_or_else(|| WgConfigError::MissingField {
+                    section: section.to_string(),
+                    key: key.to_string(),
+                })
         };
 
         let get_opt = |section: &str, key: &str| -> Option<String> { ini.get(section, key) };
@@ -197,37 +198,45 @@ impl WgConfig {
 
     pub fn get_private_key_bytes(&self) -> Result<[u8; 32], WgConfigError> {
         let decoded = base64::engine::general_purpose::STANDARD.decode(&self.private_key)?;
-        decoded.try_into().map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
-            section: "Account".to_string(),
-            key: "PrivateKey".to_string(),
-            reason: format!("expected 32 bytes, got {}", v.len()),
-        })
+        decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
+                section: "Account".to_string(),
+                key: "PrivateKey".to_string(),
+                reason: format!("expected 32 bytes, got {}", v.len()),
+            })
     }
 
     pub fn get_client_id_bytes(&self) -> Result<[u8; 3], WgConfigError> {
         let decoded = base64::engine::general_purpose::STANDARD.decode(&self.client_id)?;
-        decoded.try_into().map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
-            section: "Account".to_string(),
-            key: "ClientId".to_string(),
-            reason: format!("expected 3 bytes, got {}", v.len()),
-        })
+        decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
+                section: "Account".to_string(),
+                key: "ClientId".to_string(),
+                reason: format!("expected 3 bytes, got {}", v.len()),
+            })
     }
 
     pub fn get_peer_public_key_bytes(&self) -> Result<[u8; 32], WgConfigError> {
         let decoded = base64::engine::general_purpose::STANDARD.decode(&self.peer_public_key)?;
-        decoded.try_into().map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
-            section: "Peer".to_string(),
-            key: "PublicKey".to_string(),
-            reason: format!("expected 32 bytes, got {}", v.len()),
-        })
+        decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| WgConfigError::InvalidValue {
+                section: "Peer".to_string(),
+                key: "PublicKey".to_string(),
+                reason: format!("expected 32 bytes, got {}", v.len()),
+            })
     }
 
     pub fn get_endpoint_addr(&self) -> Result<SocketAddr, WgConfigError> {
-        self.endpoint.parse().map_err(|e| WgConfigError::InvalidValue {
-            section: "Peer".to_string(),
-            key: "Endpoint".to_string(),
-            reason: format!("{}", e),
-        })
+        self.endpoint
+            .parse()
+            .map_err(|e| WgConfigError::InvalidValue {
+                section: "Peer".to_string(),
+                key: "Endpoint".to_string(),
+                reason: format!("{}", e),
+            })
     }
 
     /// Extract the IPv4 address without CIDR suffix.
@@ -237,6 +246,8 @@ impl WgConfig {
 
     /// Extract the IPv6 address without CIDR suffix, if present.
     pub fn ipv6_address(&self) -> Option<&str> {
-        self.address6.as_deref().map(|a| a.split('/').next().unwrap_or(a))
+        self.address6
+            .as_deref()
+            .map(|a| a.split('/').next().unwrap_or(a))
     }
 }

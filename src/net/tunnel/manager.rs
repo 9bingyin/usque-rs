@@ -4,8 +4,8 @@ use crate::net::tunnel::dns::{
 };
 use crate::net::tunnel::masque::MasqueTunnel;
 use crate::net::tunnel::quic;
-use crate::net::tunnel::wireguard::WgTunnel;
 use crate::net::tunnel::stack::{BufferPool, DeviceStats, NetworkStack, StackError};
+use crate::net::tunnel::wireguard::WgTunnel;
 use bytes::{Bytes, BytesMut};
 use quick_cache::unsync::Cache;
 use rand::Rng;
@@ -149,6 +149,9 @@ struct SocketState {
     pending_from_client_bytes: usize,
     pending_to_client: VecDeque<Bytes>,
     pending_to_client_bytes: usize,
+    close_requested: bool,
+    write_shutdown: bool,
+    fin_sent: bool,
     // Waiters for socket ready notification (event-driven instead of polling)
     ready_waiters: Vec<oneshot::Sender<TcpSocketState>>,
 }
@@ -211,6 +214,34 @@ struct IncomingDatagram {
     from: SocketAddr,
 }
 
+enum TunnelConn {
+    Masque(Box<MasqueTunnel>, NetworkStack),
+    Wg(Box<WgTunnel>, NetworkStack),
+}
+
+enum ActiveTunnel {
+    Masque {
+        tunnel: Box<MasqueTunnel>,
+        local_addr: SocketAddr,
+        keepalive_interval: Duration,
+        last_keepalive: Instant,
+        blocked_streak: u8,
+        blocked_until: Option<TokioInstant>,
+    },
+    Wg {
+        tunnel: Box<WgTunnel>,
+        next_timer_at: TokioInstant,
+    },
+}
+
+struct IncomingTask {
+    incoming_rx: mpsc::Receiver<IncomingDatagram>,
+    shutdown_tx: broadcast::Sender<()>,
+    completion_tx: mpsc::Sender<()>,
+    completion_rx: mpsc::Receiver<()>,
+    recv_handle: tokio::task::JoinHandle<()>,
+}
+
 struct PerfSnapshot {
     sockets: usize,
     udp_sessions: usize,
@@ -224,6 +255,7 @@ struct PerfSnapshot {
     cmd_queue_len: usize,
     udp_queue_len: usize,
     incoming_queue_len: usize,
+    transport_pending_send_packets: usize,
 }
 
 struct PerfCounters {
@@ -236,6 +268,9 @@ struct PerfCounters {
     tx_bytes: u64,
     poll_count: u64,
     loop_iterations: u64,
+    scheduler_yields: u64,
+    masque_blocked_events: u64,
+    wg_flushes: u64,
 }
 
 impl PerfCounters {
@@ -251,6 +286,9 @@ impl PerfCounters {
             tx_bytes: 0,
             poll_count: 0,
             loop_iterations: 0,
+            scheduler_yields: 0,
+            masque_blocked_events: 0,
+            wg_flushes: 0,
         }
     }
 
@@ -284,6 +322,24 @@ impl PerfCounters {
         }
     }
 
+    fn inc_yield(&mut self) {
+        if self.enabled {
+            self.scheduler_yields += 1;
+        }
+    }
+
+    fn inc_masque_blocked(&mut self) {
+        if self.enabled {
+            self.masque_blocked_events += 1;
+        }
+    }
+
+    fn inc_wg_flush(&mut self) {
+        if self.enabled {
+            self.wg_flushes += 1;
+        }
+    }
+
     fn report(&mut self, snapshot: PerfSnapshot) {
         if !self.enabled {
             return;
@@ -294,13 +350,16 @@ impl PerfCounters {
         }
         let secs = elapsed.as_secs_f64();
         log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={}",
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s wg_flushes={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} transport_pending={}",
             self.rx_packets as f64 / secs,
             self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.tx_packets as f64 / secs,
             self.tx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.poll_count as f64 / secs,
             self.loop_iterations as f64 / secs,
+            self.scheduler_yields as f64 / secs,
+            self.masque_blocked_events as f64 / secs,
+            self.wg_flushes as f64 / secs,
             snapshot.sockets,
             snapshot.udp_sessions,
             snapshot.dns_groups,
@@ -313,6 +372,7 @@ impl PerfCounters {
             snapshot.cmd_queue_len,
             snapshot.udp_queue_len,
             snapshot.incoming_queue_len,
+            snapshot.transport_pending_send_packets,
         );
         self.last_report = Instant::now();
         self.rx_packets = 0;
@@ -321,6 +381,9 @@ impl PerfCounters {
         self.tx_bytes = 0;
         self.poll_count = 0;
         self.loop_iterations = 0;
+        self.scheduler_yields = 0;
+        self.masque_blocked_events = 0;
+        self.wg_flushes = 0;
     }
 }
 
@@ -359,6 +422,27 @@ impl RuntimeState {
             perf: PerfCounters::new(perf_enabled, perf_interval_secs),
         }
     }
+
+    fn has_poll_work(&self) -> bool {
+        if !self.tcp_handles.is_empty()
+            || !self.udp_ports.is_empty()
+            || !self.dns_queries.is_empty()
+            || !self.dns_groups.is_empty()
+        {
+            return true;
+        }
+
+        if self.sockets.values().any(|socket| {
+            socket.pending_from_client_bytes > 0
+                || socket.pending_to_client_bytes > 0
+                || socket.close_requested
+        }) {
+            return true;
+        }
+
+        let (rx_queue_len, tx_queue_len) = self.stack.queue_lengths();
+        rx_queue_len > 0 || tx_queue_len > 0
+    }
 }
 
 const CMD_CHANNEL_CAPACITY: usize = 256;
@@ -376,7 +460,11 @@ const MAX_PENDING_TO_CLIENT: usize = 256 * 1024; // 256KB per socket
 const UDP_BATCH_READ_BUDGET: usize = 128;
 const CMD_BATCH_BUDGET: usize = 64;
 const UDP_BATCH_BUDGET: usize = 64;
+const MASQUE_STACK_DRAIN_BUDGET: usize = 128;
+const WG_STACK_DRAIN_BUDGET: usize = 256;
 const POOL_MAX_SIZE: usize = 256;
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const WG_TIMER_INTERVAL_MS: u64 = 250;
 
 enum DeliverError {
     Backpressure,
@@ -416,4 +504,9 @@ impl TunnelManagerPool {
     }
 }
 
+include!("manager/transport.rs");
+include!("manager/commands.rs");
+include!("manager/dns_ops.rs");
+include!("manager/io.rs");
+include!("manager/phases.rs");
 include!("manager/runloop.rs");

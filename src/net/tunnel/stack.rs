@@ -132,6 +132,10 @@ impl VirtualDevice {
         self.tx_queue.pop_front()
     }
 
+    pub fn requeue_packet_front(&mut self, packet: BytesMut) {
+        self.tx_queue.push_front(packet);
+    }
+
     pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
         self.return_buffer(buf);
     }
@@ -150,6 +154,10 @@ impl VirtualDevice {
     pub fn buffer_pool(&self) -> BufferPool {
         self.buffer_pool.clone()
     }
+
+    fn has_tx_capacity(&self) -> bool {
+        self.tx_queue.len() < MAX_QUEUE_SIZE
+    }
 }
 
 impl Device for VirtualDevice {
@@ -166,6 +174,9 @@ impl Device for VirtualDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if !self.has_tx_capacity() {
+            return None;
+        }
         let packet = self.rx_queue.pop_front()?;
         let buffer = self.get_buffer(self.mtu);
         Some((
@@ -176,16 +187,21 @@ impl Device for VirtualDevice {
             VirtualTxToken {
                 queue: &mut self.tx_queue,
                 buffer,
+                buffer_pool: self.buffer_pool.clone(),
                 drop_logger: &mut self.tx_drop_logger,
             },
         ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        if !self.has_tx_capacity() {
+            return None;
+        }
         let buffer = self.get_buffer(self.mtu);
         Some(VirtualTxToken {
             queue: &mut self.tx_queue,
             buffer,
+            buffer_pool: self.buffer_pool.clone(),
             drop_logger: &mut self.tx_drop_logger,
         })
     }
@@ -237,6 +253,7 @@ impl RxToken for VirtualRxToken {
 pub struct VirtualTxToken<'a> {
     queue: &'a mut VecDeque<BytesMut>,
     buffer: BytesMut,
+    buffer_pool: BufferPool,
     drop_logger: &'a mut DropLogger,
 }
 
@@ -248,12 +265,88 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         self.buffer.clear();
         self.buffer.resize(len, 0);
         let result = f(&mut self.buffer);
-        while self.queue.len() >= MAX_QUEUE_SIZE {
-            drop(self.queue.pop_front());
+
+        if self.queue.len() >= MAX_QUEUE_SIZE {
             self.drop_logger.log_drop();
+            let mut dropped = std::mem::take(&mut self.buffer);
+            dropped.clear();
+            let mut pool = match self.buffer_pool.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if pool.len() < BUFFER_POOL_SIZE {
+                pool.push(dropped);
+            }
+            return result;
         }
+
         self.queue.push_back(self.buffer);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::phy::Device;
+
+    fn test_buffer_pool() -> BufferPool {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    #[test]
+    fn receive_preserves_rx_packet_when_tx_queue_is_full() {
+        let mut device = VirtualDevice::new(1500, test_buffer_pool());
+        device.inject_packet(&[1, 2, 3, 4]);
+
+        for _ in 0..MAX_QUEUE_SIZE {
+            device.tx_queue.push_back(BytesMut::from(&b"x"[..]));
+        }
+
+        let received = device.receive(SmolInstant::now());
+        assert!(
+            received.is_none(),
+            "receive must defer when tx queue is full"
+        );
+        assert_eq!(device.rx_queue.len(), 1, "rx packet must stay queued");
+
+        device.tx_queue.pop_front();
+
+        let received = device.receive(SmolInstant::now());
+        assert!(
+            received.is_some(),
+            "receive must resume after tx queue drains"
+        );
+        assert!(
+            device.rx_queue.is_empty(),
+            "rx packet should be consumed once accepted"
+        );
+    }
+
+    #[test]
+    fn transmit_returns_none_when_tx_queue_is_full() {
+        let mut device = VirtualDevice::new(1500, test_buffer_pool());
+        for _ in 0..MAX_QUEUE_SIZE {
+            device.tx_queue.push_back(BytesMut::from(&b"x"[..]));
+        }
+
+        assert!(
+            device.transmit(SmolInstant::now()).is_none(),
+            "transmit must apply backpressure instead of dropping packets"
+        );
+    }
+
+    #[test]
+    fn requeue_packet_front_restores_packet_order() {
+        let mut device = VirtualDevice::new(1500, test_buffer_pool());
+        device.tx_queue.push_back(BytesMut::from(&b"b"[..]));
+        device.requeue_packet_front(BytesMut::from(&b"a"[..]));
+
+        let first = device.take_packet().expect("first packet");
+        let second = device.take_packet().expect("second packet");
+
+        assert_eq!(&first[..], b"a");
+        assert_eq!(&second[..], b"b");
     }
 }
 
@@ -544,12 +637,20 @@ impl NetworkStack {
         self.device.take_packet()
     }
 
+    pub fn requeue_packet_front(&mut self, packet: BytesMut) {
+        self.device.requeue_packet_front(packet);
+    }
+
     pub fn recycle_tx_buffer(&mut self, buf: BytesMut) {
         self.device.recycle_tx_buffer(buf);
     }
 
     pub fn buffer_pool(&self) -> BufferPool {
         self.buffer_pool.clone()
+    }
+
+    pub fn queue_lengths(&self) -> (usize, usize) {
+        self.device.queue_lengths()
     }
 
     pub fn take_device_stats(&mut self) -> DeviceStats {

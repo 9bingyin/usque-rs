@@ -1,8 +1,8 @@
-use super::{format_target_addr, AuthConfig, Socks5Error};
+use super::{AuthConfig, Socks5Error, format_target_addr};
 use super::{max_concurrent_connections, resolve, tcp, udp};
 use crate::net::tunnel::manager::TunnelManagerPool;
-use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::Socks5Command;
+use fast_socks5::server::Socks5ServerProtocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -39,7 +39,10 @@ impl Socks5Server {
     pub async fn run(&self) -> Result<(), Socks5Error> {
         let listener = TcpListener::bind(self.bind_addr).await?;
         log::debug!("TCP listener bound on {}", self.bind_addr);
-        log::debug!("max concurrent connections: {}", max_concurrent_connections());
+        log::debug!(
+            "max concurrent connections: {}",
+            max_concurrent_connections()
+        );
 
         let max_conns = max_concurrent_connections();
         let semaphore = Arc::new(Semaphore::new(max_conns));

@@ -76,6 +76,10 @@ impl WgTunnel {
         self.socket.clone()
     }
 
+    pub fn pending_send_packets(&self) -> usize {
+        self.send_queue.len()
+    }
+
     /// Initiate WG handshake and wait for completion.
     pub async fn establish(&mut self, timeout: Duration) -> Result<(), WgTunnelError> {
         let init = self
@@ -132,7 +136,7 @@ impl WgTunnel {
     }
 
     /// Batch send all buffered encrypted packets and queued control packets.
-    pub async fn flush_send_queue(&mut self) {
+    pub async fn flush_send_queue(&mut self) -> usize {
         // Drain queued control packets (keepalive, rekey) into send_queue
         loop {
             let next = self.tunn.get_queued_packets().next();
@@ -142,6 +146,7 @@ impl WgTunnel {
             }
         }
         let mut queue = std::mem::take(&mut self.send_queue);
+        let packet_count = queue.len();
         for packet in &queue {
             let data: &[u8] = packet;
             if let Err(e) = self.try_send_udp(data).await {
@@ -150,6 +155,7 @@ impl WgTunnel {
         }
         queue.clear();
         self.send_queue = queue;
+        packet_count
     }
 
     /// Synchronously decrypt an incoming WG packet and inject IP payload into smoltcp.
@@ -187,7 +193,8 @@ impl WgTunnel {
     }
 
     /// Move tunn's internally queued control packets (keepalive, rekey) into send_queue.
-    pub fn drain_queued_to_send_queue(&mut self) {
+    pub fn drain_queued_to_send_queue(&mut self) -> usize {
+        let start_len = self.send_queue.len();
         loop {
             let next = self.tunn.get_queued_packets().next();
             match next {
@@ -195,6 +202,7 @@ impl WgTunnel {
                 None => break,
             }
         }
+        self.send_queue.len().saturating_sub(start_len)
     }
 
     /// Process incoming packet during handshake (no stack injection needed).

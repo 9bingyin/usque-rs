@@ -198,9 +198,7 @@ pub async fn run_socks_server(
 
     let has_auth = username.is_some();
     let server = match (username, password) {
-        (Some(user), Some(pass)) => {
-            proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
-        }
+        (Some(user), Some(pass)) => proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass),
         (Some(_), None) => {
             return Err("Password is required when username is set".into());
         }
@@ -270,7 +268,12 @@ pub async fn run_socks_server_wg(
     let keepalive = wg_cfg.keepalive as u64;
 
     log::debug!("endpoint: {}", endpoint);
-    log::trace!("client_id: [{}, {}, {}]", client_id[0], client_id[1], client_id[2]);
+    log::trace!(
+        "client_id: [{}, {}, {}]",
+        client_id[0],
+        client_id[1],
+        client_id[2]
+    );
 
     // Use DNS from config if available, otherwise use CLI-provided servers
     let (dns_addrs, dns_display) = if !wg_cfg.dns.trim().is_empty() {
@@ -322,9 +325,7 @@ pub async fn run_socks_server_wg(
 
     let has_auth = username.is_some();
     let server = match (username, password) {
-        (Some(user), Some(pass)) => {
-            proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass)
-        }
+        (Some(user), Some(pass)) => proxy::Socks5Server::with_auth(addr, tunnel_pool, user, pass),
         (Some(_), None) => {
             return Err("Password is required when username is set".into());
         }

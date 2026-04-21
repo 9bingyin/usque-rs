@@ -23,6 +23,13 @@ pub enum MasqueError {
     Timeout,
 }
 
+pub enum DatagramSendState {
+    Sent,
+    Dropped,
+    PacketTooBig(Vec<u8>),
+    Blocked,
+}
+
 pub struct MasqueTunnel {
     pub quic_conn: QuicConnection,
     pub h3_conn: Option<quiche::h3::Connection>,
@@ -87,33 +94,30 @@ impl MasqueTunnel {
         Ok(stream_id)
     }
 
-    pub fn send_datagram(&mut self, packet: &mut BytesMut) -> Result<Option<Vec<u8>>, MasqueError> {
+    pub fn send_datagram(&mut self, packet: &BytesMut) -> Result<DatagramSendState, MasqueError> {
         let stream_id = self
             .connect_stream_id
             .ok_or_else(|| MasqueError::ConnectionError("No connect stream".into()))?;
 
-        // Process IP packet (decrement TTL/Hop Limit, recalculate checksum)
-        if !process_outgoing_ip_packet(packet.as_mut())? {
-            // Packet should be dropped (TTL too small, etc.)
-            return Ok(None);
-        }
-
-        // Build HTTP/3 Datagram: [Quarter Stream ID (varint)] [Context ID (varint)] [IP Packet]
         let quarter_stream_id = stream_id / 4;
         let qsid_len = varint_len(quarter_stream_id);
-
         let dgram_len = qsid_len + 1 + packet.len();
+
         if self.dgram_send_buf.len() < dgram_len {
             self.dgram_send_buf.resize(dgram_len, 0);
         } else {
             self.dgram_send_buf.truncate(dgram_len);
         }
+
         let mut offset = encode_varint(quarter_stream_id, &mut self.dgram_send_buf);
         self.dgram_send_buf[offset] = CONTEXT_ID_ZERO;
         offset += 1;
         self.dgram_send_buf[offset..].copy_from_slice(packet.as_ref());
 
-        // Check if datagram exceeds maximum writable length
+        if !process_outgoing_ip_packet(&mut self.dgram_send_buf[offset..])? {
+            return Ok(DatagramSendState::Dropped);
+        }
+
         let max_dgram_len = self.quic_conn.conn.dgram_max_writable_len();
         if let Some(max_len) = max_dgram_len
             && self.dgram_send_buf.len() > max_len
@@ -123,26 +127,34 @@ impl MasqueTunnel {
                 self.dgram_send_buf.len(),
                 max_len
             );
-            let icmp = compose_icmp_packet_too_big(packet.as_ref(), MIN_MTU);
-            return Ok(icmp);
+            return Ok(
+                match compose_icmp_packet_too_big(packet.as_ref(), MIN_MTU) {
+                    Some(icmp) => DatagramSendState::PacketTooBig(icmp),
+                    None => DatagramSendState::Dropped,
+                },
+            );
         }
 
         match self.quic_conn.conn.dgram_send(&self.dgram_send_buf) {
-            Ok(()) => Ok(None),
+            Ok(()) => Ok(DatagramSendState::Sent),
             Err(quiche::Error::Done) => {
                 log::debug!(
-                    "Datagram dropped: congestion window full ({} bytes)",
+                    "Datagram blocked: congestion window full ({} bytes)",
                     self.dgram_send_buf.len()
                 );
-                Ok(None)
+                Ok(DatagramSendState::Blocked)
             }
             Err(quiche::Error::BufferTooShort) => {
                 log::debug!(
                     "dgram_send BufferTooShort ({} bytes), generating ICMP",
                     self.dgram_send_buf.len()
                 );
-                let icmp = compose_icmp_packet_too_big(packet.as_ref(), MIN_MTU);
-                Ok(icmp)
+                Ok(
+                    match compose_icmp_packet_too_big(packet.as_ref(), MIN_MTU) {
+                        Some(icmp) => DatagramSendState::PacketTooBig(icmp),
+                        None => DatagramSendState::Dropped,
+                    },
+                )
             }
             Err(e) => {
                 log::warn!(

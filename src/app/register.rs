@@ -191,7 +191,10 @@ pub async fn register_wg_device(
 
     let endpoint6_str = endpoint_v6.map(|v6| {
         let trimmed = v6.trim_matches(|c| c == '[' || c == ']');
-        match trimmed.parse::<SocketAddr>().or_else(|_| v6.parse::<SocketAddr>()) {
+        match trimmed
+            .parse::<SocketAddr>()
+            .or_else(|_| v6.parse::<SocketAddr>())
+        {
             Ok(addr) if addr.port() == 0 => SocketAddr::new(addr.ip(), 2408).to_string(),
             Ok(addr) => addr.to_string(),
             Err(_) => {

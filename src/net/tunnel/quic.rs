@@ -179,11 +179,7 @@ impl QuicConnection {
                 Err(e) => return Err(QuicError::Quiche(e)),
             };
 
-            match self
-                .socket
-                .send_to(&self.send_buf[..write], self.peer_addr)
-                .await
-            {
+            match self.socket.send(&self.send_buf[..write]).await {
                 Ok(_) => {
                     total_sent += write;
                 }
@@ -226,7 +222,10 @@ pub async fn connect(
     } else {
         UdpSocket::bind("[::]:0").await?
     };
-
+    socket.connect(endpoint).await?;
+    let std_socket = socket.into_std()?;
+    configure_udp_socket_buffers(&std_socket, 4 * 1024 * 1024, 2 * 1024 * 1024);
+    let socket = UdpSocket::from_std(std_socket)?;
     let local_addr = socket.local_addr()?;
     let socket = Arc::new(socket);
 
@@ -252,15 +251,12 @@ pub async fn connect(
             return Err(QuicError::HandshakeTimeout);
         }
 
-        match tokio::time::timeout(
-            Duration::from_millis(100),
-            quic_conn.socket.recv_from(&mut buf),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_millis(100), quic_conn.socket.recv(&mut buf))
+            .await
         {
-            Ok(Ok((len, from))) => {
+            Ok(Ok(len)) => {
                 let recv_info = quiche::RecvInfo {
-                    from,
+                    from: endpoint,
                     to: local_addr,
                 };
                 quic_conn.conn.recv(&mut buf[..len], recv_info)?;
@@ -278,6 +274,35 @@ pub async fn connect(
 
     log::debug!("QUIC connection established to {}", endpoint);
     Ok(quic_conn)
+}
+
+fn configure_udp_socket_buffers(socket: &std::net::UdpSocket, recv_size: usize, send_size: usize) {
+    let sock = socket2::SockRef::from(socket);
+
+    if let Err(e) = sock.set_recv_buffer_size(recv_size) {
+        log::warn!(
+            "failed to set QUIC SO_RCVBUF to {}KB: {}",
+            recv_size / 1024,
+            e
+        );
+    }
+    if let Err(e) = sock.set_send_buffer_size(send_size) {
+        log::warn!(
+            "failed to set QUIC SO_SNDBUF to {}KB: {}",
+            send_size / 1024,
+            e
+        );
+    }
+
+    let actual_recv = sock.recv_buffer_size().unwrap_or(0);
+    let actual_send = sock.send_buffer_size().unwrap_or(0);
+    log::info!(
+        "QUIC UDP socket buffers: recv={}KB (req {}KB), send={}KB (req {}KB)",
+        actual_recv / 1024,
+        recv_size / 1024,
+        actual_send / 1024,
+        send_size / 1024,
+    );
 }
 
 pub async fn connect_with_pinning(

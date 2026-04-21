@@ -1,10 +1,10 @@
-use super::{cleanup_fragments, get_local_port, FragBuffer, Socks5Error};
+use super::{FragBuffer, Socks5Error, cleanup_fragments, get_local_port};
 use crate::net::proxy::socks5::resolve;
 use crate::net::tunnel::manager::{ManagerCommand, TunnelManager};
 use bytes::Bytes;
 use fast_socks5::server::Socks5ServerProtocol;
-use fast_socks5::{new_udp_header, parse_udp_request};
 use fast_socks5::util::target_addr::TargetAddr;
+use fast_socks5::{new_udp_header, parse_udp_request};
 use smoltcp::wire::IpAddress;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};

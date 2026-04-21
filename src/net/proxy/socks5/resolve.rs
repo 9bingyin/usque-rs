@@ -1,4 +1,4 @@
-use super::{format_ip_addr, Socks5Error, std_ip_to_smoltcp};
+use super::{Socks5Error, format_ip_addr, std_ip_to_smoltcp};
 use crate::net::tunnel::manager::TunnelManager;
 use fast_socks5::util::target_addr::TargetAddr;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};

@@ -210,7 +210,9 @@ pub struct AuthConfig {
     pub password: String,
 }
 
-fn cleanup_fragments(frag_buffers: &mut HashMap<fast_socks5::util::target_addr::TargetAddr, FragBuffer>) {
+fn cleanup_fragments(
+    frag_buffers: &mut HashMap<fast_socks5::util::target_addr::TargetAddr, FragBuffer>,
+) {
     let now = Instant::now();
     frag_buffers.retain(|_, buffer| !buffer.is_expired(now));
 }
