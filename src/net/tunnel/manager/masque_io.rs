@@ -143,13 +143,12 @@ impl MasqueIoHandle {
                     }
                 }
 
-                if queued_to_quiche {
-                    tunnel.quic_conn.mark_pending_send();
-                }
+                let should_flush = queued_to_quiche
+                    || tunnel.quic_conn.pending_send_packets() > 0
+                    || tunnel.quic_conn.has_pending_send_work();
 
-                let should_flush = tunnel.quic_conn.pending_send_packets() > 0
-                    || tunnel.quic_conn.take_pending_send();
                 if should_flush {
+                    let _ = tunnel.quic_conn.take_pending_send();
                     match tunnel.quic_conn.send_async().await {
                         Ok(status) => {
                             if status.packets_sent > 0
@@ -202,46 +201,60 @@ impl MasqueIoHandle {
                         pending_packet = Some(packet);
                     }
 
-                    recv_result = tunnel.quic_conn.socket.recv_from(&mut recv_buf[..]) => {
-                        match recv_result {
-                            Ok((len, from)) => {
-                                let recv_info = quiche::RecvInfo {
-                                    from,
-                                    to: tunnel.quic_conn.local_addr,
-                                };
-                                match tunnel.quic_conn.conn.recv(&mut recv_buf[..len], recv_info) {
-                                    Ok(_) => {
-                                        tunnel.poll_h3();
-                                        tunnel.quic_conn.mark_pending_send();
-                                        loop {
-                                            match tunnel.recv_datagram(recv_buf.as_mut()) {
-                                                Ok(len) if len > 0 => {
-                                                    let mut packet = TunnelManager::take_pooled_buffer(
-                                                        &buffer_pool,
-                                                        len,
-                                                    );
-                                                    packet.extend_from_slice(&recv_buf[..len]);
-                                                    if event_tx
-                                                        .send(TransportIoEvent::Incoming(IncomingDatagram {
-                                                            data: packet,
-                                                        }))
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        break;
-                                                    }
-                                                }
-                                                _ => break,
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!("MASQUE IO QUIC recv failed: {:?}", e);
-                                    }
+                    readable = tunnel.quic_conn.socket.readable() => {
+                        if let Err(e) = readable {
+                            log::warn!("MASQUE IO readable wait failed: {}", e);
+                            continue;
+                        }
+
+                        let mut quic_progress = false;
+                        loop {
+                            let len = match tunnel.quic_conn.socket.try_recv(&mut recv_buf[..]) {
+                                Ok(len) => len,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => {
+                                    log::warn!("MASQUE IO UDP recv failed: {}", e);
+                                    break;
+                                }
+                            };
+
+                            let recv_info = quiche::RecvInfo {
+                                from: tunnel.quic_conn.peer_addr,
+                                to: tunnel.quic_conn.local_addr,
+                            };
+                            match tunnel.quic_conn.conn.recv(&mut recv_buf[..len], recv_info) {
+                                Ok(_) => {
+                                    quic_progress = true;
+                                }
+                                Err(e) => {
+                                    log::warn!("MASQUE IO QUIC recv failed: {:?}", e);
                                 }
                             }
-                            Err(e) => {
-                                log::warn!("MASQUE IO UDP recv failed: {}", e);
+                        }
+
+                        if quic_progress {
+                            tunnel.poll_h3();
+                            tunnel.quic_conn.mark_pending_send();
+                            loop {
+                                match tunnel.recv_datagram(recv_buf.as_mut()) {
+                                    Ok(len) if len > 0 => {
+                                        let mut packet = TunnelManager::take_pooled_buffer(
+                                            &buffer_pool,
+                                            len,
+                                        );
+                                        packet.extend_from_slice(&recv_buf[..len]);
+                                        if event_tx
+                                            .send(TransportIoEvent::Incoming(IncomingDatagram {
+                                                data: packet,
+                                            }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
+                                }
                             }
                         }
                     }
