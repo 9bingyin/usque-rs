@@ -70,7 +70,8 @@ impl TunnelManager {
 
         let needs_stack_poll =
             handled_commands || handled_udp_sends || incoming_result.stack_ingress;
-        let needs_targeted_tcp_service = handled_socket_events || !state.ready_tcp_handles.is_empty();
+        let needs_targeted_tcp_service =
+            handled_socket_events || !state.ready_tcp_handles.is_empty();
         let mut needs_stack_egress = false;
 
         if needs_stack_poll {
@@ -94,14 +95,14 @@ impl TunnelManager {
 
         let needs_transport_drain =
             needs_stack_poll || needs_stack_egress || state.stack.has_tx_packets();
-        let needs_transport_flush = incoming_result.needs_transport_flush
-            || tunnel.transport_pending_send_packets() > 0
-            || needs_transport_drain;
 
         if needs_transport_drain {
             Self::drain_stack_packets(tunnel, state).await;
         }
-        if needs_transport_flush {
+        if incoming_result.needs_transport_flush {
+            tunnel.mark_transport_flush_pending();
+        }
+        if tunnel.has_transport_flush_pending() || tunnel.transport_pending_send_packets() > 0 {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
 
@@ -437,8 +438,16 @@ impl TunnelManager {
             state.ready_tcp_set.clear();
             state.tcp_handles.clone()
         } else {
-            let mut handles = Vec::with_capacity(state.ready_tcp_handles.len());
-            while let Some(handle) = state.ready_tcp_handles.pop_front() {
+            let budget = state
+                .tunables
+                .targeted_tcp_sweep_budget
+                .max(1)
+                .min(state.ready_tcp_handles.len().max(1));
+            let mut handles = Vec::with_capacity(budget);
+            while handles.len() < budget {
+                let Some(handle) = state.ready_tcp_handles.pop_front() else {
+                    break;
+                };
                 state.ready_tcp_set.remove(&handle);
                 handles.push(handle);
             }
@@ -657,6 +666,7 @@ impl TunnelManager {
             incoming_queue_len,
             ready_tcp_queue_len: state.ready_tcp_handles.len(),
             transport_pending_send_packets: tunnel.transport_pending_send_packets(),
+            quic_stats: tunnel.quic_perf_stats(),
         }
     }
 }

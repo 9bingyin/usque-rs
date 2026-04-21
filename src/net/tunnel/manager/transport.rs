@@ -152,6 +152,26 @@ impl ActiveTunnel {
         }
     }
 
+    fn has_transport_flush_pending(&self) -> bool {
+        match self {
+            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.has_pending_send_work(),
+            ActiveTunnel::Wg { .. } => false,
+        }
+    }
+
+    fn mark_transport_flush_pending(&mut self) {
+        if let ActiveTunnel::Masque { tunnel, .. } = self {
+            tunnel.quic_conn.mark_pending_send();
+        }
+    }
+
+    fn quic_perf_stats(&self) -> Option<quic::QuicPerfStats> {
+        match self {
+            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.perf_stats(),
+            ActiveTunnel::Wg { .. } => None,
+        }
+    }
+
     fn masque_drain_blocked(&self) -> bool {
         matches!(
             self,
@@ -263,6 +283,7 @@ impl TunnelManager {
                         log::warn!("keepalive PING failed: {:?}", e);
                     } else {
                         log::trace!("sent keepalive PING");
+                        tunnel.quic_conn.mark_pending_send();
                     }
                     *last_keepalive = Instant::now();
                 }
@@ -282,10 +303,19 @@ impl TunnelManager {
                 tunnel,
                 local_addr,
                 ..
-            } => IncomingHandling {
-                stack_ingress: Self::handle_udp_recv(tunnel, state, &mut data[..], incoming.from, *local_addr),
-                needs_transport_flush: true,
-            },
+            } => {
+                tunnel.quic_conn.mark_pending_send();
+                IncomingHandling {
+                    stack_ingress: Self::handle_udp_recv(
+                    tunnel,
+                    state,
+                    &mut data[..],
+                    incoming.from,
+                    *local_addr,
+                    ),
+                    needs_transport_flush: true,
+                }
+            }
             ActiveTunnel::Wg { tunnel, .. } => {
                 state.perf.inc_rx(data.len());
                 let packet = tunnel.decrypt_incoming(&mut data);
@@ -314,10 +344,20 @@ impl TunnelManager {
         perf: &mut PerfCounters,
     ) {
         match tunnel {
-            ActiveTunnel::Masque { tunnel, .. } => match tunnel.quic_conn.send_async().await {
-                Ok(status) => perf.record_quic_flush(status),
-                Err(e) => log::debug!("QUIC send failed: {:?}", e),
-            },
+            ActiveTunnel::Masque {
+                tunnel: masque_tunnel,
+                ..
+            } => {
+                let should_flush = masque_tunnel.quic_conn.pending_send_packets() > 0
+                    || masque_tunnel.quic_conn.take_pending_send();
+                if !should_flush {
+                    return;
+                }
+                match masque_tunnel.quic_conn.send_async().await {
+                    Ok(status) => perf.record_quic_flush(status),
+                    Err(e) => log::debug!("QUIC send failed: {:?}", e),
+                }
+            }
             ActiveTunnel::Wg { tunnel, .. } => {
                 let _ = tunnel.drain_queued_to_send_queue();
                 if tunnel.pending_send_packets() > 0 {
@@ -341,6 +381,7 @@ impl TunnelManager {
             && let ActiveTunnel::Masque { tunnel, .. } = tunnel
         {
             tunnel.quic_conn.conn.on_timeout();
+            tunnel.quic_conn.mark_pending_send();
         }
 
         if stack_due && !Self::poll_stack_common(state, true) {
@@ -350,7 +391,10 @@ impl TunnelManager {
         if stack_due || transport_send_due {
             Self::drain_stack_packets(tunnel, state).await;
         }
-        if stack_due || transport_timeout_due || transport_send_due {
+        if stack_due || transport_send_due {
+            tunnel.mark_transport_flush_pending();
+        }
+        if tunnel.has_transport_flush_pending() || tunnel.transport_pending_send_packets() > 0 {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
         true
@@ -370,6 +414,7 @@ impl TunnelManager {
                 ..
             } => {
                 let mut attempted = 0usize;
+                let mut queued_to_quiche = false;
                 while attempted < budget {
                     let Some(packet) = state.stack.take_packet() else {
                         break;
@@ -380,16 +425,19 @@ impl TunnelManager {
                         Ok(crate::net::tunnel::masque::DatagramSendState::Sent) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
+                            queued_to_quiche = true;
                             state.stack.recycle_tx_buffer(packet);
                         }
                         Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
+                            queued_to_quiche = true;
                             state.stack.recycle_tx_buffer(packet);
                         }
                         Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
+                            queued_to_quiche = true;
                             state.stack.recycle_tx_buffer(packet);
                             log::debug!("injecting ICMP Packet Too Big ({} bytes)", icmp.len());
                             state
@@ -412,6 +460,9 @@ impl TunnelManager {
                             log::debug!("datagram send failed: {:?}", e);
                         }
                     }
+                }
+                if queued_to_quiche {
+                    masque_tunnel.quic_conn.mark_pending_send();
                 }
             }
             ActiveTunnel::Wg { tunnel, .. } => {

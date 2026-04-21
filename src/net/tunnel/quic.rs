@@ -193,6 +193,7 @@ pub struct QuicConnection {
     pending_len: usize,
     pending_at: Option<Instant>,
     pending_socket_blocked: bool,
+    flush_pending: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -202,6 +203,17 @@ pub struct QuicSendStatus {
     pub blocked: bool,
     pub enobufs: bool,
     pub paced: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuicPerfStats {
+    pub rtt_ms: u64,
+    pub cwnd: usize,
+    pub lost: usize,
+    pub total_pto_count: usize,
+    pub delivery_rate_bps: u64,
+    pub dgram_recv: usize,
+    pub dgram_sent: usize,
 }
 
 impl QuicSendStatus {
@@ -300,6 +312,10 @@ impl QuicConnection {
         self.pending_len > 0
     }
 
+    pub fn has_pending_send_work(&self) -> bool {
+        self.flush_pending
+    }
+
     pub fn pending_send_packets(&self) -> usize {
         usize::from(self.pending_len > 0)
     }
@@ -319,6 +335,31 @@ impl QuicConnection {
             && self
                 .pending_at
                 .is_none_or(|deadline| deadline <= Instant::now())
+    }
+
+    pub fn mark_pending_send(&mut self) {
+        self.flush_pending = true;
+    }
+
+    pub fn take_pending_send(&mut self) -> bool {
+        std::mem::take(&mut self.flush_pending)
+    }
+
+    pub fn perf_stats(&self) -> Option<QuicPerfStats> {
+        let path = self
+            .conn
+            .path_stats()
+            .find(|stats| stats.active)
+            .or_else(|| self.conn.path_stats().next())?;
+        Some(QuicPerfStats {
+            rtt_ms: path.rtt.as_millis().min(u128::from(u64::MAX)) as u64,
+            cwnd: path.cwnd,
+            lost: path.lost,
+            total_pto_count: path.total_pto_count,
+            delivery_rate_bps: path.delivery_rate,
+            dgram_recv: path.dgram_recv,
+            dgram_sent: path.dgram_sent,
+        })
     }
 
     fn cache_pending_packet(&mut self, len: usize, send_at: Instant) {
@@ -392,6 +433,7 @@ pub async fn connect(
         pending_len: 0,
         pending_at: None,
         pending_socket_blocked: false,
+        flush_pending: false,
     };
 
     let start = std::time::Instant::now();

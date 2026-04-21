@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
-use crate::net::tunnel::quic::{CongestionControl, QuicSendStatus};
+use crate::net::tunnel::quic::{CongestionControl, QuicPerfStats, QuicSendStatus};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket};
 
 #[derive(Clone, Debug)]
@@ -38,6 +38,7 @@ pub struct ManagerTunables {
     pub cmd_batch_budget: usize,
     pub udp_batch_budget: usize,
     pub socket_event_batch_budget: usize,
+    pub targeted_tcp_sweep_budget: usize,
     pub masque_stack_drain_budget: usize,
     pub wg_stack_drain_budget: usize,
     pub pool_max_size: usize,
@@ -63,6 +64,7 @@ impl Default for ManagerTunables {
             cmd_batch_budget: 128,
             udp_batch_budget: 128,
             socket_event_batch_budget: 128,
+            targeted_tcp_sweep_budget: 64,
             masque_stack_drain_budget: 128,
             wg_stack_drain_budget: 256,
             pool_max_size: 256,
@@ -140,6 +142,10 @@ impl ManagerTunables {
             socket_event_batch_budget: env_usize(
                 "USQUE_SOCKET_EVENT_BATCH_BUDGET",
                 defaults.socket_event_batch_budget,
+            ),
+            targeted_tcp_sweep_budget: env_usize(
+                "USQUE_TARGETED_TCP_SWEEP_BUDGET",
+                defaults.targeted_tcp_sweep_budget,
             ),
             masque_stack_drain_budget: env_usize(
                 "USQUE_MASQUE_STACK_DRAIN_BUDGET",
@@ -432,6 +438,7 @@ struct PerfSnapshot {
     incoming_queue_len: usize,
     ready_tcp_queue_len: usize,
     transport_pending_send_packets: usize,
+    quic_stats: Option<QuicPerfStats>,
 }
 
 struct PerfCounters {
@@ -577,7 +584,7 @@ impl PerfCounters {
         }
         let secs = elapsed.as_secs_f64();
         log::info!(
-            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s quic_flushes={:.0}/s quic_socket_blocked={:.0}/s quic_enobufs={:.0}/s quic_pacing={:.0}/s wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
+            "PERF: rx={:.0}pps ({:.1}Mbps) tx={:.0}pps ({:.1}Mbps) polls={:.0}/s loops={:.0}/s yields={:.0}/s masque_blocked={:.0}/s quic_flushes={:.0}/s quic_socket_blocked={:.0}/s quic_enobufs={:.0}/s quic_pacing={:.0}/s quic_rtt={}ms quic_cwnd={} quic_lost={} quic_pto={} quic_delivery={:.1}Mbps quic_dgram_rx={} quic_dgram_tx={} wg_flushes={:.0}/s socket_event_batches={:.0}/s socket_events={:.0}/s tcp_sweeps_full={:.0}/s tcp_sweeps_targeted={:.0}/s sockets={} udp_sessions={} dns_groups={} pending_from={}B pending_to={}B rx_q={} tx_q={} drops_rx={} drops_tx={} cmd_q={} udp_q={} in_q={} ready_tcp_q={} transport_pending={}",
             self.rx_packets as f64 / secs,
             self.rx_bytes as f64 * 8.0 / secs / 1_000_000.0,
             self.tx_packets as f64 / secs,
@@ -590,6 +597,15 @@ impl PerfCounters {
             self.quic_socket_blocked as f64 / secs,
             self.quic_send_enobufs as f64 / secs,
             self.quic_pacing_events as f64 / secs,
+            snapshot.quic_stats.map_or(0, |stats| stats.rtt_ms),
+            snapshot.quic_stats.map_or(0, |stats| stats.cwnd),
+            snapshot.quic_stats.map_or(0, |stats| stats.lost),
+            snapshot.quic_stats.map_or(0, |stats| stats.total_pto_count),
+            snapshot.quic_stats.map_or(0.0, |stats| {
+                stats.delivery_rate_bps as f64 * 8.0 / 1_000_000.0
+            }),
+            snapshot.quic_stats.map_or(0, |stats| stats.dgram_recv),
+            snapshot.quic_stats.map_or(0, |stats| stats.dgram_sent),
             self.wg_flushes as f64 / secs,
             self.socket_event_batches as f64 / secs,
             self.socket_events as f64 / secs,
