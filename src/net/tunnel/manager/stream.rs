@@ -76,13 +76,25 @@ impl SocketStreamHandle {
         }
     }
 
-    fn clear_all_events(&self) {
+    fn clear_read_event(&self) {
         self.read_event_queued
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn clear_write_event(&self) {
         self.write_event_queued
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn clear_close_event(&self) {
         self.close_event_queued
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn clear_all_events(&self) {
+        self.clear_read_event();
+        self.clear_write_event();
+        self.clear_close_event();
     }
 }
 

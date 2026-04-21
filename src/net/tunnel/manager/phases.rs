@@ -191,11 +191,12 @@ impl TunnelManager {
     }
 
     fn handle_socket_event(state: &mut RuntimeState, event: SocketEvent) {
-        if let Some(socket_state) = state.sockets.get_mut(&event.handle)
-            && matches!(event.kind, SocketEventKind::Closed)
-        {
+        if let Some(socket_state) = state.sockets.get_mut(&event.handle) {
+            socket_state.pending_events |= event.kind.bit();
+            if matches!(event.kind, SocketEventKind::Closed) {
                 socket_state.close_requested = true;
                 socket_state.write_shutdown = true;
+            }
         }
         state.enqueue_ready_tcp_handle(event.handle);
     }
@@ -461,7 +462,23 @@ impl TunnelManager {
             }
 
             if let Some(socket_state) = state.sockets.get_mut(&handle) {
-                socket_state.stream.clear_all_events();
+                let event_mask = if full_sweep {
+                    socket_state.pending_events = 0;
+                    socket_state.stream.clear_all_events();
+                    SOCKET_EVENT_READ | SOCKET_EVENT_WRITE | SOCKET_EVENT_CLOSED
+                } else {
+                    let event_mask = std::mem::take(&mut socket_state.pending_events);
+                    if event_mask & SOCKET_EVENT_READ != 0 {
+                        socket_state.stream.clear_read_event();
+                    }
+                    if event_mask & SOCKET_EVENT_WRITE != 0 {
+                        socket_state.stream.clear_write_event();
+                    }
+                    if event_mask & SOCKET_EVENT_CLOSED != 0 {
+                        socket_state.stream.clear_close_event();
+                    }
+                    event_mask
+                };
                 if socket_state
                     .stream
                     .socket_dropped
@@ -478,14 +495,24 @@ impl TunnelManager {
                     socket_state.write_shutdown = true;
                 }
                 let tcp_chunk_size = state.tunables.tcp_chunk_size;
-                Self::flush_pending_to_stack(
-                    stack,
-                    write_buffer,
-                    handle,
-                    socket_state,
-                    tcp_chunk_size,
-                );
-                Self::fill_recv_buffer(handle, stack, read_buffer, socket_state, tcp_chunk_size);
+                let should_service_write = full_sweep
+                    || event_mask & (SOCKET_EVENT_WRITE | SOCKET_EVENT_CLOSED) != 0
+                    || socket_state.close_requested
+                    || socket_state.write_shutdown;
+                let should_service_read = full_sweep || event_mask & SOCKET_EVENT_READ != 0;
+
+                if should_service_write {
+                    Self::flush_pending_to_stack(
+                        stack,
+                        write_buffer,
+                        handle,
+                        socket_state,
+                        tcp_chunk_size,
+                    );
+                }
+                if should_service_read {
+                    Self::fill_recv_buffer(handle, stack, read_buffer, socket_state, tcp_chunk_size);
+                }
 
                 let past_handshake = stack.tcp_is_past_handshake(handle);
 

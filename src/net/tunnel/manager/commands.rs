@@ -199,6 +199,7 @@ impl TunnelManager {
         let state = SocketState {
             stream: control,
             flow_key: Some(flow_key),
+            pending_events: SOCKET_EVENT_WRITE,
             close_requested: false,
             write_shutdown: false,
             fin_sent: false,

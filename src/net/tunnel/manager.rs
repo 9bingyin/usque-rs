@@ -297,6 +297,21 @@ enum SocketEventKind {
     WriteReady,
     Closed,
 }
+
+impl SocketEventKind {
+    const fn bit(self) -> u8 {
+        match self {
+            SocketEventKind::ReadReady => 1 << 0,
+            SocketEventKind::WriteReady => 1 << 1,
+            SocketEventKind::Closed => 1 << 2,
+        }
+    }
+}
+
+const SOCKET_EVENT_READ: u8 = SocketEventKind::ReadReady.bit();
+const SOCKET_EVENT_WRITE: u8 = SocketEventKind::WriteReady.bit();
+const SOCKET_EVENT_CLOSED: u8 = SocketEventKind::Closed.bit();
+
 struct SocketEvent {
     handle: SocketHandle,
     kind: SocketEventKind,
@@ -307,6 +322,7 @@ include!("manager/stream.rs");
 struct SocketState {
     stream: Arc<SocketStreamHandle>,
     flow_key: Option<TcpFlowKey>,
+    pending_events: u8,
     close_requested: bool,
     write_shutdown: bool,
     fin_sent: bool,
