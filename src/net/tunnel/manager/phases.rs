@@ -7,15 +7,17 @@ impl TunnelManager {
         incoming_task: &mut IncomingTask,
         params: &ConnectionParams,
     ) -> bool {
-        Self::drain_socket_event_batch(state, state.tunables.socket_event_batch_budget);
-        Self::drain_command_batch(
+        let handled_socket_events =
+            Self::drain_socket_event_batch(state, state.tunables.socket_event_batch_budget);
+        let handled_commands = Self::drain_command_batch(
             state,
             &params.dns_servers,
             params.tcp_buffer_size,
             cmd_rx,
             state.tunables.cmd_batch_budget,
         );
-        Self::drain_udp_send_batch(state, udp_rx, state.tunables.udp_batch_budget);
+        let handled_udp_sends =
+            Self::drain_udp_send_batch(state, udp_rx, state.tunables.udp_batch_budget);
 
         let handled_incoming = Self::drain_incoming_batch(
             tunnel,
@@ -24,10 +26,26 @@ impl TunnelManager {
             state.tunables.udp_batch_read_budget,
         );
 
-        Self::flush_active_tunnel(tunnel, state, handled_incoming).await
+        let needs_stack_poll = handled_commands || handled_udp_sends || handled_incoming;
+        let needs_targeted_tcp_service = handled_socket_events || !state.ready_tcp_handles.is_empty();
+
+        if needs_stack_poll {
+            if !Self::flush_stack_reads(state, handled_incoming) {
+                return false;
+            }
+        } else if needs_targeted_tcp_service {
+            Self::poll_tcp_sockets(state, false);
+        }
+
+        if needs_stack_poll || needs_targeted_tcp_service {
+            Self::drain_stack_packets(tunnel, state).await;
+            Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
+        }
+
+        true
     }
 
-    fn drain_socket_event_batch(state: &mut RuntimeState, budget: usize) {
+    fn drain_socket_event_batch(state: &mut RuntimeState, budget: usize) -> bool {
         let mut remaining = budget;
         let mut drained = 0usize;
         while remaining > 0 {
@@ -41,6 +59,7 @@ impl TunnelManager {
             }
         }
         state.perf.inc_socket_event_batch(drained);
+        drained > 0
     }
 
     fn drain_command_batch(
@@ -49,34 +68,40 @@ impl TunnelManager {
         tcp_buffer_size: usize,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         budget: usize,
-    ) {
+    ) -> bool {
         let mut remaining = budget;
+        let mut handled = false;
         while remaining > 0 {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     Self::handle_command(state, dns_servers, tcp_buffer_size, cmd);
                     remaining -= 1;
+                    handled = true;
                 }
                 Err(_) => break,
             }
         }
+        handled
     }
 
     fn drain_udp_send_batch(
         state: &mut RuntimeState,
         udp_rx: &mut mpsc::Receiver<UdpSend>,
         budget: usize,
-    ) {
+    ) -> bool {
         let mut remaining = budget;
+        let mut handled = false;
         while remaining > 0 {
             match udp_rx.try_recv() {
                 Ok(udp_cmd) => {
                     Self::handle_udp_send(&mut state.stack, &mut state.udp_sessions, udp_cmd);
                     remaining -= 1;
+                    handled = true;
                 }
                 Err(_) => break,
             }
         }
+        handled
     }
 
     fn drain_incoming_batch(
@@ -234,32 +259,43 @@ impl TunnelManager {
     }
 
     fn poll_stack_common(state: &mut RuntimeState, full_tcp_sweep: bool) -> bool {
-        if let Err(e) = state.stack.poll() {
-            log::error!("network stack poll failed: {}", e);
-            return false;
-        }
+        let outcome = match state.stack.poll_bounded(state.tunables.stack_ingress_budget) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                log::error!("network stack poll failed: {}", e);
+                return false;
+            }
+        };
         state.perf.inc_poll();
 
-        Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
+        let should_full_tcp_sweep = full_tcp_sweep && outcome.socket_state_changed;
+        let should_targeted_tcp_sweep = !should_full_tcp_sweep && !state.ready_tcp_handles.is_empty();
 
-        Self::process_dns_responses(
-            &mut state.stack,
-            &mut state.dns_queries,
-            &mut state.dns_groups,
-            &mut state.dns_cache,
-            &state.dns_sockets,
-        );
+        if outcome.socket_state_changed {
+            Self::notify_ready_waiters(&mut state.stack, &mut state.sockets);
 
-        Self::process_udp_responses(
-            &mut state.stack,
-            &mut state.udp_sessions,
-            &state.udp_ports,
-            &mut state.udp_buffer,
-        );
+            Self::process_dns_responses(
+                &mut state.stack,
+                &mut state.dns_queries,
+                &mut state.dns_groups,
+                &mut state.dns_cache,
+                &state.dns_sockets,
+            );
 
-        Self::expire_dns_groups(state);
-        Self::expire_udp_sessions(state);
-        Self::poll_tcp_sockets(state, full_tcp_sweep);
+            Self::process_udp_responses(
+                &mut state.stack,
+                &mut state.udp_sessions,
+                &state.udp_ports,
+                &mut state.udp_buffer,
+            );
+
+            Self::expire_dns_groups(state);
+            Self::expire_udp_sessions(state);
+        }
+
+        if should_full_tcp_sweep || should_targeted_tcp_sweep {
+            Self::poll_tcp_sockets(state, should_full_tcp_sweep);
+        }
 
         true
     }

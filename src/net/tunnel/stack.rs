@@ -1,5 +1,7 @@
 use bytes::BytesMut;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::socket::{
@@ -464,6 +466,13 @@ pub struct DeviceStats {
     pub tx_drops: u64,
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+pub struct StackPollOutcome {
+    pub ingress_processed: usize,
+    pub more_ingress: bool,
+    pub socket_state_changed: bool,
+}
+
 pub struct NetworkStack {
     device: VirtualDevice,
     iface: Interface,
@@ -627,6 +636,76 @@ impl NetworkStack {
         Ok(())
     }
 
+    pub fn poll_bounded(&mut self, ingress_budget: usize) -> Result<StackPollOutcome, StackError> {
+        let timestamp = SmolInstant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut outcome = StackPollOutcome::default();
+            self.iface.poll_maintenance(timestamp);
+
+            let ingress_budget = ingress_budget.max(1);
+            for _ in 0..ingress_budget {
+                match self
+                    .iface
+                    .poll_ingress_single(timestamp, &mut self.device, &mut self.sockets)
+                {
+                    PollIngressSingleResult::None => break,
+                    PollIngressSingleResult::PacketProcessed => {
+                        outcome.ingress_processed += 1;
+                    }
+                    PollIngressSingleResult::SocketStateChanged => {
+                        outcome.ingress_processed += 1;
+                        outcome.socket_state_changed = true;
+                    }
+                }
+            }
+
+            if outcome.ingress_processed == ingress_budget {
+                outcome.more_ingress = self.device.queue_lengths().0 > 0;
+            }
+
+            if matches!(
+                self.iface
+                    .poll_egress(timestamp, &mut self.device, &mut self.sockets),
+                PollResult::SocketStateChanged
+            ) {
+                outcome.socket_state_changed = true;
+            }
+
+            outcome
+        }));
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                log::error!(
+                    "smoltcp poll_bounded panicked, snapshot: {}",
+                    self.socket_snapshot()
+                );
+                Err(StackError::PollPanic)
+            }
+        }
+    }
+
+    pub fn poll_egress(&mut self) -> Result<bool, StackError> {
+        let timestamp = SmolInstant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matches!(
+                self.iface
+                    .poll_egress(timestamp, &mut self.device, &mut self.sockets),
+                PollResult::SocketStateChanged
+            )
+        }));
+        match result {
+            Ok(state_changed) => Ok(state_changed),
+            Err(_) => {
+                log::error!(
+                    "smoltcp poll_egress panicked, snapshot: {}",
+                    self.socket_snapshot()
+                );
+                Err(StackError::PollPanic)
+            }
+        }
+    }
+
     /// Returns the optimal delay before the next poll, based on smoltcp's internal timers
     /// (TCP retransmission, delayed ACK, etc.). Returns None if immediate polling is needed.
     pub fn poll_delay(&mut self) -> Option<Duration> {
@@ -768,6 +847,14 @@ impl NetworkStack {
 
     pub fn queue_lengths(&self) -> (usize, usize) {
         self.device.queue_lengths()
+    }
+
+    pub fn has_rx_packets(&self) -> bool {
+        self.device.queue_lengths().0 > 0
+    }
+
+    pub fn has_tx_packets(&self) -> bool {
+        self.device.queue_lengths().1 > 0
     }
 
     pub fn take_device_stats(&mut self) -> DeviceStats {

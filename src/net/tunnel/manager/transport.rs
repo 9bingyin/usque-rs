@@ -4,6 +4,10 @@ impl ActiveTunnel {
             return None;
         }
 
+        if state.stack.has_rx_packets() {
+            return Some(TokioInstant::now());
+        }
+
         let timeout = state
             .stack
             .poll_delay()
@@ -346,20 +350,6 @@ impl TunnelManager {
         if stack_due || transport_timeout_due || transport_send_due {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
-        true
-    }
-
-    async fn flush_active_tunnel(
-        tunnel: &mut ActiveTunnel,
-        state: &mut RuntimeState,
-        full_tcp_sweep: bool,
-    ) -> bool {
-        if !Self::flush_stack_reads(state, full_tcp_sweep) {
-            return false;
-        }
-
-        Self::drain_stack_packets(tunnel, state).await;
-        Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         true
     }
 

@@ -33,6 +33,7 @@ pub struct ManagerTunables {
     pub max_pending_data: usize,
     pub max_pending_to_client: usize,
     pub udp_batch_read_budget: usize,
+    pub stack_ingress_budget: usize,
     pub cmd_batch_budget: usize,
     pub udp_batch_budget: usize,
     pub socket_event_batch_budget: usize,
@@ -57,6 +58,7 @@ impl Default for ManagerTunables {
             max_pending_data: 256 * 1024,
             max_pending_to_client: 256 * 1024,
             udp_batch_read_budget: 128,
+            stack_ingress_budget: 64,
             cmd_batch_budget: 128,
             udp_batch_budget: 128,
             socket_event_batch_budget: 128,
@@ -127,6 +129,10 @@ impl ManagerTunables {
             udp_batch_read_budget: env_usize(
                 "USQUE_UDP_BATCH_READ_BUDGET",
                 defaults.udp_batch_read_budget,
+            ),
+            stack_ingress_budget: env_usize(
+                "USQUE_STACK_INGRESS_BUDGET",
+                defaults.stack_ingress_budget,
             ),
             cmd_batch_budget: env_usize("USQUE_CMD_BATCH_BUDGET", defaults.cmd_batch_budget),
             udp_batch_budget: env_usize("USQUE_UDP_BATCH_BUDGET", defaults.udp_batch_budget),
@@ -669,10 +675,7 @@ impl RuntimeState {
     }
 
     fn has_poll_work(&self) -> bool {
-        if !self.tcp_handles.is_empty()
-            || !self.udp_ports.is_empty()
-            || !self.dns_queries.is_empty()
-            || !self.dns_groups.is_empty()
+        if !self.udp_ports.is_empty() || !self.dns_queries.is_empty() || !self.dns_groups.is_empty()
         {
             return true;
         }
@@ -686,7 +689,7 @@ impl RuntimeState {
         }
 
         let (rx_queue_len, tx_queue_len) = self.stack.queue_lengths();
-        rx_queue_len > 0 || tx_queue_len > 0
+        rx_queue_len > 0 || tx_queue_len > 0 || !self.tcp_handles.is_empty()
     }
 
     fn enqueue_ready_tcp_handle(&mut self, handle: SocketHandle) {
