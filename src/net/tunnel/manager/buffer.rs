@@ -44,10 +44,6 @@ impl TcpRingBuffer {
         self.capacity - self.len() - 1
     }
 
-    fn usable_capacity(&self) -> usize {
-        self.capacity - 1
-    }
-
     fn enqueue_slice(&self, data: &[u8]) -> usize {
         let write_pos = self.write_pos.load(std::sync::atomic::Ordering::Relaxed);
         let to_write = data.len().min(self.remaining_capacity());

@@ -297,8 +297,6 @@ struct SocketEvent {
 }
 include!("manager/stream.rs");
 
-const TCP_REFILL_ROUNDS: u8 = 4;
-
 // Internal state for each socket
 struct SocketState {
     stream: Arc<SocketStreamHandle>,
@@ -306,7 +304,6 @@ struct SocketState {
     close_requested: bool,
     write_shutdown: bool,
     fin_sent: bool,
-    refill_rounds: u8,
     // Waiters for socket ready notification (event-driven instead of polling)
     ready_waiters: Vec<oneshot::Sender<TcpSocketState>>,
 }
@@ -716,10 +713,6 @@ impl RuntimeState {
         if self.ready_tcp_set.insert(handle) {
             self.ready_tcp_handles.push_back(handle);
         }
-    }
-
-    fn has_refill_work(&self) -> bool {
-        self.sockets.values().any(|socket| socket.refill_rounds > 0)
     }
 }
 
