@@ -39,6 +39,7 @@ pub struct ManagerTunables {
     pub udp_batch_budget: usize,
     pub socket_event_batch_budget: usize,
     pub targeted_tcp_sweep_budget: usize,
+    pub masque_io_channel_capacity: usize,
     pub masque_stack_drain_budget: usize,
     pub wg_stack_drain_budget: usize,
     pub pool_max_size: usize,
@@ -65,6 +66,7 @@ impl Default for ManagerTunables {
             udp_batch_budget: 128,
             socket_event_batch_budget: 128,
             targeted_tcp_sweep_budget: 64,
+            masque_io_channel_capacity: 1024,
             masque_stack_drain_budget: 128,
             wg_stack_drain_budget: 256,
             pool_max_size: 256,
@@ -146,6 +148,10 @@ impl ManagerTunables {
             targeted_tcp_sweep_budget: env_usize(
                 "USQUE_TARGETED_TCP_SWEEP_BUDGET",
                 defaults.targeted_tcp_sweep_budget,
+            ),
+            masque_io_channel_capacity: env_usize(
+                "USQUE_MASQUE_IO_CHANNEL_CAPACITY",
+                defaults.masque_io_channel_capacity,
             ),
             masque_stack_drain_budget: env_usize(
                 "USQUE_MASQUE_STACK_DRAIN_BUDGET",
@@ -402,7 +408,12 @@ struct UdpSend {
 
 struct IncomingDatagram {
     data: BytesMut,
-    from: SocketAddr,
+}
+
+enum TransportIoEvent {
+    Incoming(IncomingDatagram),
+    QuicFlush(QuicSendStatus),
+    MasqueBlocked,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -411,6 +422,8 @@ struct IncomingHandling {
     needs_transport_flush: bool,
 }
 
+include!("manager/masque_io.rs");
+
 enum TunnelConn {
     Masque(Box<MasqueTunnel>, NetworkStack),
     Wg(Box<WgTunnel>, NetworkStack),
@@ -418,10 +431,7 @@ enum TunnelConn {
 
 enum ActiveTunnel {
     Masque {
-        tunnel: Box<MasqueTunnel>,
-        local_addr: SocketAddr,
-        keepalive_interval: Duration,
-        last_keepalive: Instant,
+        io: MasqueIoHandle,
         blocked_streak: u8,
         blocked_until: Option<TokioInstant>,
     },
@@ -432,11 +442,11 @@ enum ActiveTunnel {
 }
 
 struct IncomingTask {
-    incoming_rx: mpsc::Receiver<IncomingDatagram>,
-    shutdown_tx: broadcast::Sender<()>,
-    completion_tx: mpsc::Sender<()>,
-    completion_rx: mpsc::Receiver<()>,
-    recv_handle: tokio::task::JoinHandle<()>,
+    incoming_rx: mpsc::Receiver<TransportIoEvent>,
+    shutdown_tx: Option<broadcast::Sender<()>>,
+    completion_tx: Option<mpsc::Sender<()>>,
+    completion_rx: Option<mpsc::Receiver<()>>,
+    recv_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct PerfSnapshot {

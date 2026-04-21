@@ -45,11 +45,12 @@ impl TunnelManager {
                             Ok(Ok(conn)) => {
                                 log::info!("tunnel established");
                                 backoff.reset();
-                                let (active_tunnel, stack) =
+                                let (active_tunnel, stack, incoming_task) =
                                     ActiveTunnel::from_conn(conn, params.keepalive, &params.manager_tunables);
                                 Self::run_active_tunnel(
                                     active_tunnel,
                                     stack,
+                                    incoming_task,
                                     &mut cmd_rx,
                                     &mut udp_rx,
                                     &params,
@@ -106,9 +107,37 @@ impl TunnelManager {
     async fn establish_connection(
         params: &ConnectionParams,
     ) -> Result<(MasqueTunnel, NetworkStack), Box<dyn std::error::Error + Send + Sync>> {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_f64(name: &str, default: f64) -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
         let quic_cfg = quic::QuicConfig {
             idle_timeout: params.quic_idle_timeout_ms,
             initial_packet_size: params.initial_packet_size,
+            max_recv_udp_payload_size: env_usize(
+                "USQUE_QUIC_MAX_RECV_UDP_PAYLOAD_SIZE",
+                usize::from(params.initial_packet_size.max(1350)),
+            ),
+            max_connection_window: env_u64("USQUE_QUIC_MAX_CONNECTION_WINDOW", 20_000_000),
+            max_stream_window: env_u64("USQUE_QUIC_MAX_STREAM_WINDOW", 8_000_000),
+            send_capacity_factor: env_f64("USQUE_QUIC_SEND_CAPACITY_FACTOR", 2.0),
             congestion_control: params.congestion_control,
             ..Default::default()
         };
@@ -341,16 +370,19 @@ impl TunnelManager {
     async fn run_active_tunnel(
         mut tunnel: ActiveTunnel,
         stack: NetworkStack,
+        incoming_task: Option<IncomingTask>,
         cmd_rx: &mut mpsc::Receiver<ManagerCommand>,
         udp_rx: &mut mpsc::Receiver<UdpSend>,
         params: &ConnectionParams,
     ) {
-        let mut incoming_task = Self::spawn_incoming_task(
-            tunnel.socket(),
-            stack.buffer_pool(),
-            tunnel.peer_addr(),
-            &params.manager_tunables,
-        );
+        let mut incoming_task = incoming_task.unwrap_or_else(|| {
+            Self::spawn_incoming_task(
+                tunnel.socket(),
+                stack.buffer_pool(),
+                tunnel.peer_addr(),
+                &params.manager_tunables,
+            )
+        });
         let mut state = RuntimeState::new(
             stack,
             params.manager_tunables.clone(),
@@ -407,8 +439,8 @@ impl TunnelManager {
                     dirty = true;
                 }
 
-                Some(incoming) = incoming_task.incoming_rx.recv() => {
-                    let handled = Self::handle_incoming_datagram(&mut tunnel, &mut state, incoming);
+                Some(event) = incoming_task.incoming_rx.recv() => {
+                    let handled = Self::handle_transport_io_event(&mut tunnel, &mut state, event);
                     needs_transport_flush |= handled.needs_transport_flush;
                     dirty = true;
                 }

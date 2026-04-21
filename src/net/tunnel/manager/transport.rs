@@ -16,35 +16,20 @@ impl ActiveTunnel {
         Some(TokioInstant::now() + timeout)
     }
 
-    fn transport_timeout_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
+    fn transport_timeout_deadline(&self, _max_poll_interval: Duration) -> Option<TokioInstant> {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel
-                .quic_conn
-                .conn
-                .timeout()
-                .map(|timeout| TokioInstant::now() + timeout.min(max_poll_interval)),
+            ActiveTunnel::Masque { .. } => None,
             ActiveTunnel::Wg { .. } => None,
         }
     }
 
     fn transport_send_deadline(&self, max_poll_interval: Duration) -> Option<TokioInstant> {
         match self {
-            ActiveTunnel::Masque {
-                tunnel,
-                blocked_until,
-                ..
-            } => {
-                let mut deadline = tunnel
-                    .quic_conn
-                    .next_send_at()
-                    .map(TokioInstant::from_std);
-                if let Some(until) = blocked_until
-                    && *until > TokioInstant::now()
-                {
-                    deadline = Some(deadline.map_or(*until, |current| current.min(*until)));
-                }
-                deadline.map(|when| when.min(TokioInstant::now() + max_poll_interval))
-            }
+            ActiveTunnel::Masque { blocked_until, .. } => blocked_until
+                .as_ref()
+                .copied()
+                .filter(|until| *until > TokioInstant::now())
+                .map(|until| until.min(TokioInstant::now() + max_poll_interval)),
             ActiveTunnel::Wg { .. } => None,
         }
     }
@@ -53,39 +38,42 @@ impl ActiveTunnel {
         conn: TunnelConn,
         keepalive_secs: u64,
         tunables: &ManagerTunables,
-    ) -> (Self, NetworkStack) {
+    ) -> (Self, NetworkStack, Option<IncomingTask>) {
         match conn {
-            TunnelConn::Masque(tunnel, stack) => (
-                Self::Masque {
-                    local_addr: tunnel.quic_conn.local_addr,
-                    tunnel,
-                    keepalive_interval: Duration::from_secs(keepalive_secs),
-                    last_keepalive: Instant::now(),
-                    blocked_streak: 0,
-                    blocked_until: None,
-                },
-                stack,
-            ),
+            TunnelConn::Masque(tunnel, stack) => {
+                let (io, incoming_task) =
+                    MasqueIoHandle::spawn(tunnel, stack.buffer_pool(), keepalive_secs, tunables);
+                (
+                    Self::Masque {
+                        io,
+                        blocked_streak: 0,
+                        blocked_until: None,
+                    },
+                    stack,
+                    Some(incoming_task),
+                )
+            }
             TunnelConn::Wg(tunnel, stack) => (
                 Self::Wg {
                     tunnel,
                     next_timer_at: TokioInstant::now() + tunables.wg_timer_interval,
                 },
                 stack,
+                None,
             ),
         }
     }
 
     fn socket(&self) -> Arc<tokio::net::UdpSocket> {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.socket.clone(),
+            ActiveTunnel::Masque { io, .. } => io.socket.clone(),
             ActiveTunnel::Wg { tunnel, .. } => tunnel.socket(),
         }
     }
 
     fn peer_addr(&self) -> SocketAddr {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.peer_addr,
+            ActiveTunnel::Masque { io, .. } => io.peer_addr,
             ActiveTunnel::Wg { tunnel, .. } => tunnel
                 .socket()
                 .peer_addr()
@@ -102,9 +90,9 @@ impl ActiveTunnel {
 
     fn check_alive(&self) -> bool {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => {
-                if tunnel.quic_conn.is_closed() {
-                    log::error!("QUIC connection closed unexpectedly");
+            ActiveTunnel::Masque { io, .. } => {
+                if !io.is_alive() {
+                    log::error!("QUIC IO worker closed unexpectedly");
                     false
                 } else {
                     true
@@ -124,17 +112,7 @@ impl ActiveTunnel {
     fn maintenance_deadline(&self) -> Option<TokioInstant> {
         match self {
             ActiveTunnel::Wg { next_timer_at, .. } => Some(*next_timer_at),
-            ActiveTunnel::Masque {
-                keepalive_interval,
-                last_keepalive,
-                ..
-            } => {
-                if keepalive_interval.is_zero() {
-                    None
-                } else {
-                    Some(TokioInstant::from_std(*last_keepalive + *keepalive_interval))
-                }
-            }
+            ActiveTunnel::Masque { .. } => None,
         }
     }
 
@@ -147,27 +125,25 @@ impl ActiveTunnel {
 
     fn transport_pending_send_packets(&self) -> usize {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.pending_send_packets(),
+            ActiveTunnel::Masque { io, .. } => io.pending_send_packets(),
             ActiveTunnel::Wg { tunnel, .. } => tunnel.pending_send_packets(),
         }
     }
 
     fn has_transport_flush_pending(&self) -> bool {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.has_pending_send_work(),
+            ActiveTunnel::Masque { .. } => false,
             ActiveTunnel::Wg { .. } => false,
         }
     }
 
     fn mark_transport_flush_pending(&mut self) {
-        if let ActiveTunnel::Masque { tunnel, .. } = self {
-            tunnel.quic_conn.mark_pending_send();
-        }
+        let _ = self;
     }
 
     fn quic_perf_stats(&self) -> Option<quic::QuicPerfStats> {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.perf_stats(),
+            ActiveTunnel::Masque { io, .. } => io.quic_perf_stats(),
             ActiveTunnel::Wg { .. } => None,
         }
     }
@@ -184,9 +160,13 @@ impl ActiveTunnel {
 
     fn needs_socket_writable(&self) -> bool {
         match self {
-            ActiveTunnel::Masque { tunnel, .. } => tunnel.quic_conn.needs_socket_writable(),
+            ActiveTunnel::Masque { .. } => false,
             ActiveTunnel::Wg { .. } => false,
         }
+    }
+
+    fn manager_drives_transport_flush(&self) -> bool {
+        matches!(self, ActiveTunnel::Wg { .. })
     }
 
 }
@@ -195,7 +175,7 @@ impl TunnelManager {
     fn spawn_incoming_task(
         socket: Arc<tokio::net::UdpSocket>,
         buffer_pool: BufferPool,
-        peer_addr: SocketAddr,
+        _peer_addr: SocketAddr,
         tunables: &ManagerTunables,
     ) -> IncomingTask {
         let (incoming_tx, incoming_rx) = mpsc::channel(tunables.incoming_dgram_capacity);
@@ -226,7 +206,11 @@ impl TunnelManager {
                                     continue;
                                 }
                                 buf.truncate(len);
-                                if incoming_tx.send(IncomingDatagram { data: buf, from: peer_addr }).await.is_err() {
+                                if incoming_tx
+                                    .send(TransportIoEvent::Incoming(IncomingDatagram { data: buf }))
+                                    .await
+                                    .is_err()
+                                {
                                     log::trace!("incoming datagram channel closed");
                                     break;
                                 }
@@ -243,20 +227,26 @@ impl TunnelManager {
 
         IncomingTask {
             incoming_rx,
-            shutdown_tx,
-            completion_tx,
-            completion_rx,
-            recv_handle,
+            shutdown_tx: Some(shutdown_tx),
+            completion_tx: Some(completion_tx),
+            completion_rx: Some(completion_rx),
+            recv_handle: Some(recv_handle),
         }
     }
 
     async fn shutdown_incoming_task(mut task: IncomingTask) {
-        if task.shutdown_tx.send(()).is_err() {
+        if let Some(shutdown_tx) = task.shutdown_tx.take()
+            && shutdown_tx.send(()).is_err()
+        {
             log::trace!("shutdown signal dropped");
         }
-        drop(task.completion_tx);
-        let _ = task.completion_rx.recv().await;
-        if let Err(e) = task.recv_handle.await {
+        drop(task.completion_tx.take());
+        if let Some(completion_rx) = task.completion_rx.as_mut() {
+            let _ = completion_rx.recv().await;
+        }
+        if let Some(recv_handle) = task.recv_handle.take()
+            && let Err(e) = recv_handle.await
+        {
             log::trace!("recv task join error: {:?}", e);
         }
     }
@@ -272,22 +262,7 @@ impl TunnelManager {
                 }
                 *next_timer_at = TokioInstant::now() + tunables.wg_timer_interval;
             }
-            ActiveTunnel::Masque {
-                tunnel,
-                last_keepalive,
-                keepalive_interval,
-                ..
-            } => {
-                if !keepalive_interval.is_zero() {
-                    if let Err(e) = tunnel.quic_conn.conn.send_ack_eliciting() {
-                        log::warn!("keepalive PING failed: {:?}", e);
-                    } else {
-                        log::trace!("sent keepalive PING");
-                        tunnel.quic_conn.mark_pending_send();
-                    }
-                    *last_keepalive = Instant::now();
-                }
-            }
+            ActiveTunnel::Masque { .. } => {}
         }
     }
 
@@ -296,30 +271,21 @@ impl TunnelManager {
         state: &mut RuntimeState,
         incoming: IncomingDatagram,
     ) -> IncomingHandling {
-        let mut data = incoming.data;
-
-        let handling = match tunnel {
-            ActiveTunnel::Masque {
-                tunnel,
-                local_addr,
-                ..
-            } => {
-                tunnel.quic_conn.mark_pending_send();
+        match tunnel {
+            ActiveTunnel::Masque { .. } => {
+                let data = incoming.data;
+                state.perf.inc_rx(data.len());
+                Self::note_incoming_tcp_handle(state, &data[..]);
+                state.stack.inject_packet_owned(data);
                 IncomingHandling {
-                    stack_ingress: Self::handle_udp_recv(
-                    tunnel,
-                    state,
-                    &mut data[..],
-                    incoming.from,
-                    *local_addr,
-                    ),
-                    needs_transport_flush: true,
+                    stack_ingress: true,
+                    needs_transport_flush: false,
                 }
             }
             ActiveTunnel::Wg { tunnel, .. } => {
+                let mut data = incoming.data;
                 state.perf.inc_rx(data.len());
-                let packet = tunnel.decrypt_incoming(&mut data);
-                if let Some(packet) = packet {
+                let handling = if let Some(packet) = tunnel.decrypt_incoming(&mut data) {
                     Self::note_incoming_tcp_handle(state, &packet[..]);
                     state.stack.inject_packet_owned(packet);
                     IncomingHandling {
@@ -331,12 +297,31 @@ impl TunnelManager {
                         stack_ingress: false,
                         needs_transport_flush: true,
                     }
-                }
+                };
+                Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
+                handling
             }
-        };
+        }
+    }
 
-        Self::return_pooled_buffer(&state.buffer_pool, data, state.tunables.pool_max_size);
-        handling
+    fn handle_transport_io_event(
+        tunnel: &mut ActiveTunnel,
+        state: &mut RuntimeState,
+        event: TransportIoEvent,
+    ) -> IncomingHandling {
+        match event {
+            TransportIoEvent::Incoming(incoming) => {
+                Self::handle_incoming_datagram(tunnel, state, incoming)
+            }
+            TransportIoEvent::QuicFlush(status) => {
+                state.perf.record_quic_flush(status);
+                IncomingHandling::default()
+            }
+            TransportIoEvent::MasqueBlocked => {
+                state.perf.inc_masque_blocked();
+                IncomingHandling::default()
+            }
+        }
     }
 
     async fn flush_transport_side_effects(
@@ -345,19 +330,8 @@ impl TunnelManager {
     ) {
         match tunnel {
             ActiveTunnel::Masque {
-                tunnel: masque_tunnel,
                 ..
-            } => {
-                let should_flush = masque_tunnel.quic_conn.pending_send_packets() > 0
-                    || masque_tunnel.quic_conn.take_pending_send();
-                if !should_flush {
-                    return;
-                }
-                match masque_tunnel.quic_conn.send_async().await {
-                    Ok(status) => perf.record_quic_flush(status),
-                    Err(e) => log::debug!("QUIC send failed: {:?}", e),
-                }
-            }
+            } => {}
             ActiveTunnel::Wg { tunnel, .. } => {
                 let _ = tunnel.drain_queued_to_send_queue();
                 if tunnel.pending_send_packets() > 0 {
@@ -377,12 +351,7 @@ impl TunnelManager {
         transport_timeout_due: bool,
         transport_send_due: bool,
     ) -> bool {
-        if transport_timeout_due
-            && let ActiveTunnel::Masque { tunnel, .. } = tunnel
-        {
-            tunnel.quic_conn.conn.on_timeout();
-            tunnel.quic_conn.mark_pending_send();
-        }
+        let _ = transport_timeout_due;
 
         if stack_due && !Self::poll_stack_common(state, true) {
             return false;
@@ -391,10 +360,12 @@ impl TunnelManager {
         if stack_due || transport_send_due {
             Self::drain_stack_packets(tunnel, state).await;
         }
-        if stack_due || transport_send_due {
+        if tunnel.manager_drives_transport_flush() && (stack_due || transport_send_due) {
             tunnel.mark_transport_flush_pending();
         }
-        if tunnel.has_transport_flush_pending() || tunnel.transport_pending_send_packets() > 0 {
+        if tunnel.manager_drives_transport_flush()
+            && (tunnel.has_transport_flush_pending() || tunnel.transport_pending_send_packets() > 0)
+        {
             Self::flush_transport_side_effects(tunnel, &mut state.perf).await;
         }
         true
@@ -408,43 +379,24 @@ impl TunnelManager {
 
         match tunnel {
             ActiveTunnel::Masque {
-                tunnel: masque_tunnel,
+                io,
                 blocked_streak,
                 blocked_until,
                 ..
             } => {
                 let mut attempted = 0usize;
-                let mut queued_to_quiche = false;
                 while attempted < budget {
                     let Some(packet) = state.stack.take_packet() else {
                         break;
                     };
                     state.perf.inc_tx(packet.len());
                     attempted += 1;
-                    match masque_tunnel.send_datagram(&packet) {
-                        Ok(crate::net::tunnel::masque::DatagramSendState::Sent) => {
+                    match io.try_send_packet(packet) {
+                        Ok(()) => {
                             *blocked_streak = 0;
                             *blocked_until = None;
-                            queued_to_quiche = true;
-                            state.stack.recycle_tx_buffer(packet);
                         }
-                        Ok(crate::net::tunnel::masque::DatagramSendState::Dropped) => {
-                            *blocked_streak = 0;
-                            *blocked_until = None;
-                            queued_to_quiche = true;
-                            state.stack.recycle_tx_buffer(packet);
-                        }
-                        Ok(crate::net::tunnel::masque::DatagramSendState::PacketTooBig(icmp)) => {
-                            *blocked_streak = 0;
-                            *blocked_until = None;
-                            queued_to_quiche = true;
-                            state.stack.recycle_tx_buffer(packet);
-                            log::debug!("injecting ICMP Packet Too Big ({} bytes)", icmp.len());
-                            state
-                                .stack
-                                .inject_packet_owned(BytesMut::from(Bytes::from(icmp)));
-                        }
-                        Ok(crate::net::tunnel::masque::DatagramSendState::Blocked) => {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
                             state.perf.inc_masque_blocked();
                             *blocked_streak = blocked_streak.saturating_add(1).min(6);
                             let backoff_ms = 1u64 << (*blocked_streak as u32 - 1);
@@ -455,14 +407,12 @@ impl TunnelManager {
                             state.stack.requeue_packet_front(packet);
                             break;
                         }
-                        Err(e) => {
-                            state.stack.recycle_tx_buffer(packet);
-                            log::debug!("datagram send failed: {:?}", e);
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(packet)) => {
+                            log::debug!("MASQUE IO channel closed");
+                            state.stack.requeue_packet_front(packet);
+                            break;
                         }
                     }
-                }
-                if queued_to_quiche {
-                    masque_tunnel.quic_conn.mark_pending_send();
                 }
             }
             ActiveTunnel::Wg { tunnel, .. } => {

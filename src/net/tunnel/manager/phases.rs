@@ -171,15 +171,15 @@ impl TunnelManager {
     fn drain_incoming_batch(
         tunnel: &mut ActiveTunnel,
         state: &mut RuntimeState,
-        incoming_rx: &mut mpsc::Receiver<IncomingDatagram>,
+        incoming_rx: &mut mpsc::Receiver<TransportIoEvent>,
         budget: usize,
     ) -> IncomingHandling {
         let mut remaining = budget;
         let mut result = IncomingHandling::default();
         while remaining > 0 {
             match incoming_rx.try_recv() {
-                Ok(incoming) => {
-                    let handled = Self::handle_incoming_datagram(tunnel, state, incoming);
+                Ok(event) => {
+                    let handled = Self::handle_transport_io_event(tunnel, state, event);
                     result.stack_ingress |= handled.stack_ingress;
                     result.needs_transport_flush |= handled.needs_transport_flush;
                     remaining -= 1;

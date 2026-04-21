@@ -1,40 +1,4 @@
 impl TunnelManager {
-    fn handle_udp_recv(
-        tunnel: &mut MasqueTunnel,
-        state: &mut RuntimeState,
-        data: &mut [u8],
-        from: std::net::SocketAddr,
-        local_addr: std::net::SocketAddr,
-    ) -> bool {
-        let recv_info = quiche::RecvInfo {
-            from,
-            to: local_addr,
-        };
-
-        if let Err(e) = tunnel.quic_conn.conn.recv(data, recv_info) {
-            log::warn!("QUIC recv failed: {:?}", e);
-            return false;
-        }
-
-        tunnel.poll_h3();
-
-        let mut injected_packet = false;
-        loop {
-            match tunnel.recv_datagram(state.udp_buffer.as_mut()) {
-                Ok(len) if len > 0 => {
-                    let mut packet = Self::take_pooled_buffer(&state.buffer_pool, len);
-                    packet.extend_from_slice(&state.udp_buffer[..len]);
-                    state.perf.inc_rx(len);
-                    Self::note_incoming_tcp_handle(state, &packet[..]);
-                    state.stack.inject_packet_owned(packet);
-                    injected_packet = true;
-                }
-                _ => break,
-            }
-        }
-        injected_packet
-    }
-
     fn configure_udp_socket_buffers(
         socket: &std::net::UdpSocket,
         recv_size: usize,

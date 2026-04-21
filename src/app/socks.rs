@@ -187,7 +187,7 @@ pub async fn run_socks_server(
     };
 
     log::info!(
-        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} stack_ingress={} targeted_tcp={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
+        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} stack_ingress={} targeted_tcp={} masque_io_q={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
         tcp_buffer_size / 1024,
         manager_tunables.max_pending_data / 1024,
         manager_tunables.max_pending_to_client / 1024,
@@ -196,6 +196,7 @@ pub async fn run_socks_server(
         manager_tunables.incoming_dgram_capacity,
         manager_tunables.stack_ingress_budget,
         manager_tunables.targeted_tcp_sweep_budget,
+        manager_tunables.masque_io_channel_capacity,
         stack_tunables
             .tcp_ack_delay
             .map(|d| d.as_millis().to_string())
@@ -336,7 +337,7 @@ pub async fn run_socks_server_wg(
     };
 
     log::info!(
-        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} stack_ingress={} targeted_tcp={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
+        "tunables: tcp_buf={}KB pending_tx={}KB pending_rx={}KB cmd_q={} udp_q={} in_q={} stack_ingress={} targeted_tcp={} masque_io_q={} tcp_ack_delay_ms={} wg_udp_recvbuf={}KB wg_udp_sendbuf={}KB",
         tcp_buffer_size / 1024,
         manager_tunables.max_pending_data / 1024,
         manager_tunables.max_pending_to_client / 1024,
@@ -345,6 +346,7 @@ pub async fn run_socks_server_wg(
         manager_tunables.incoming_dgram_capacity,
         manager_tunables.stack_ingress_budget,
         manager_tunables.targeted_tcp_sweep_budget,
+        manager_tunables.masque_io_channel_capacity,
         stack_tunables
             .tcp_ack_delay
             .map(|d| d.as_millis().to_string())

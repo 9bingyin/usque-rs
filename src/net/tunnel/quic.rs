@@ -89,6 +89,10 @@ pub struct QuicConfig {
     pub dgram_recv_max_queue_len: u64,
     pub dgram_send_max_queue_len: u64,
     pub initial_packet_size: u16,
+    pub max_recv_udp_payload_size: usize,
+    pub max_connection_window: u64,
+    pub max_stream_window: u64,
+    pub send_capacity_factor: f64,
     pub congestion_control: CongestionControl,
 }
 
@@ -106,6 +110,10 @@ impl Default for QuicConfig {
             dgram_recv_max_queue_len: 10000,
             dgram_send_max_queue_len: 10000,
             initial_packet_size: 1242,
+            max_recv_udp_payload_size: 1350,
+            max_connection_window: 20_000_000,
+            max_stream_window: 8_000_000,
+            send_capacity_factor: 2.0,
             congestion_control: CongestionControl::Cubic,
         }
     }
@@ -154,12 +162,17 @@ pub fn create_quiche_config(
     }
 
     config.set_max_idle_timeout(quic_cfg.idle_timeout);
+    config.set_max_recv_udp_payload_size(quic_cfg.max_recv_udp_payload_size);
     config.set_initial_max_data(quic_cfg.initial_max_data);
     config.set_initial_max_stream_data_bidi_local(quic_cfg.initial_max_stream_data_bidi_local);
     config.set_initial_max_stream_data_bidi_remote(quic_cfg.initial_max_stream_data_bidi_remote);
     config.set_initial_max_stream_data_uni(quic_cfg.initial_max_stream_data_uni);
     config.set_initial_max_streams_bidi(quic_cfg.initial_max_streams_bidi);
     config.set_initial_max_streams_uni(quic_cfg.initial_max_streams_uni);
+    config.set_disable_active_migration(true);
+    config.set_max_connection_window(quic_cfg.max_connection_window);
+    config.set_max_stream_window(quic_cfg.max_stream_window);
+    config.set_send_capacity_factor(quic_cfg.send_capacity_factor);
 
     config.verify_peer(false);
 
