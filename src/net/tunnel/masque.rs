@@ -276,13 +276,29 @@ impl MasqueTunnel {
             );
         }
 
-        self.flow_send
-            .send(OutboundFrame::Datagram(
-                DgramBuffer::from_slice(&self.dgram_send_buf),
-                self.flow_id,
-            ))
-            .await
-            .map_err(|e| MasqueError::ConnectionError(format!("datagram send failed: {}", e)))?;
+        let frame =
+            OutboundFrame::Datagram(DgramBuffer::from_slice(&self.dgram_send_buf), self.flow_id);
+
+        let sender = self.flow_send.get_ref().ok_or_else(|| {
+            MasqueError::ConnectionError("datagram flow sender unavailable".into())
+        })?;
+
+        match sender.try_send(frame) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
+                self.flow_send.send(frame).await.map_err(|e| {
+                    MasqueError::ConnectionError(format!(
+                        "datagram send failed after waiting: {}",
+                        e
+                    ))
+                })?;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(MasqueError::ConnectionError(
+                    "datagram flow sender closed".into(),
+                ));
+            }
+        }
 
         Ok(DatagramSendState::Sent)
     }
