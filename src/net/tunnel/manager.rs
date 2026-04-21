@@ -746,6 +746,13 @@ impl RuntimeState {
             self.ready_tcp_handles.push_back(handle);
         }
     }
+
+    fn mark_ready_tcp_handle(&mut self, handle: SocketHandle, event_mask: u8) {
+        if let Some(socket_state) = self.sockets.get_mut(&handle) {
+            socket_state.pending_events |= event_mask;
+        }
+        self.enqueue_ready_tcp_handle(handle);
+    }
 }
 
 static DNS_GROUP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);

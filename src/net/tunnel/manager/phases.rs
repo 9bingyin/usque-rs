@@ -37,7 +37,7 @@ impl TunnelManager {
 
     fn note_incoming_tcp_handle(state: &mut RuntimeState, packet: &[u8]) {
         if let Some(handle) = Self::classify_incoming_tcp_handle(state, packet) {
-            state.enqueue_ready_tcp_handle(handle);
+            state.mark_ready_tcp_handle(handle, SOCKET_EVENT_READ | SOCKET_EVENT_WRITE);
         }
     }
 
