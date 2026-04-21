@@ -1,8 +1,9 @@
 use bytes::BytesMut;
+use gotatun::noise::index_table::IndexTable;
 use gotatun::noise::rate_limiter::RateLimiter;
 use gotatun::noise::{Tunn, TunnResult};
 use gotatun::packet::{Packet, PacketBufPool, WgKind};
-use ring::rand::SecureRandom;
+use gotatun::tun::MtuWatcher;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -42,6 +43,7 @@ pub struct WgTunnel {
     client_id: [u8; 3],
     packet_pool: PacketBufPool,
     send_queue: Vec<Packet>,
+    tun_mtu: MtuWatcher,
 }
 
 impl WgTunnel {
@@ -51,27 +53,21 @@ impl WgTunnel {
         socket: Arc<UdpSocket>,
         client_id: [u8; 3],
         keepalive: Option<u16>,
+        mtu: usize,
     ) -> Self {
         let static_secret = gotatun::x25519::StaticSecret::from(private_key);
         let static_public = gotatun::x25519::PublicKey::from(&static_secret);
         let peer_public = gotatun::x25519::PublicKey::from(peer_public_key);
 
         let rate_limiter = Arc::new(RateLimiter::new(&static_public, 100));
-
-        let rng = ring::rand::SystemRandom::new();
-        let mut idx_bytes = [0u8; 4];
-        if rng.fill(&mut idx_bytes).is_err() {
-            log::warn!("Failed to generate random tunnel index, using fallback");
-            idx_bytes = [0x01, 0x00, 0x00, 0x00];
-        }
-        let index = u32::from_le_bytes(idx_bytes);
+        let index_table = IndexTable::from_os_rng();
 
         let tunn = Tunn::new(
             static_secret,
             peer_public,
             None,
             keepalive,
-            index,
+            index_table,
             rate_limiter,
         );
 
@@ -83,6 +79,7 @@ impl WgTunnel {
             client_id,
             packet_pool,
             send_queue: Vec::with_capacity(env_usize("USQUE_WG_SEND_QUEUE_CAPACITY", 64)),
+            tun_mtu: MtuWatcher::new(mtu.min(u16::MAX as usize) as u16),
         }
     }
 
@@ -144,7 +141,10 @@ impl WgTunnel {
         let mut packet = self.packet_pool.get();
         packet.truncate(ip_data.len());
         packet.copy_from_slice(ip_data);
-        if let Some(wg_kind) = self.tunn.handle_outgoing_packet(packet) {
+        if let Some(wg_kind) = self
+            .tunn
+            .handle_outgoing_packet(packet, Some(&mut self.tun_mtu))
+        {
             self.prepare_and_queue(wg_kind);
         }
     }
@@ -153,7 +153,7 @@ impl WgTunnel {
     pub async fn flush_send_queue(&mut self) -> usize {
         // Drain queued control packets (keepalive, rekey) into send_queue
         loop {
-            let next = self.tunn.get_queued_packets().next();
+            let next = self.tunn.get_queued_packets(&mut self.tun_mtu).next();
             match next {
                 Some(wg_kind) => self.prepare_and_queue(wg_kind),
                 None => break,
@@ -210,7 +210,7 @@ impl WgTunnel {
     pub fn drain_queued_to_send_queue(&mut self) -> usize {
         let start_len = self.send_queue.len();
         loop {
-            let next = self.tunn.get_queued_packets().next();
+            let next = self.tunn.get_queued_packets(&mut self.tun_mtu).next();
             match next {
                 Some(wg_kind) => self.prepare_and_queue(wg_kind),
                 None => break,
@@ -260,7 +260,7 @@ impl WgTunnel {
     /// borrow on self.tunn between iterations (avoids collecting into Vec).
     async fn flush_queued_packets(&mut self) {
         loop {
-            let next = self.tunn.get_queued_packets().next();
+            let next = self.tunn.get_queued_packets(&mut self.tun_mtu).next();
             match next {
                 Some(wg_kind) => {
                     if let Err(e) = self.send_wg_packet(wg_kind).await {

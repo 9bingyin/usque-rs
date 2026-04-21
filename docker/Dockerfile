@@ -1,4 +1,4 @@
-FROM rust:1.93 AS builder
+FROM rust:1.95-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -17,7 +17,7 @@ COPY src ./src
 
 RUN cargo build --release --locked
 
-FROM bitnami/minideb:latest
+FROM bitnami/minideb:trixie
 
 RUN install_packages ca-certificates curl
 

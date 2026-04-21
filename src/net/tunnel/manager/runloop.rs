@@ -179,6 +179,11 @@ impl TunnelManager {
         } else {
             None
         };
+        let mtu = if params.mtu == 0 {
+            1280
+        } else {
+            params.mtu as usize
+        };
 
         let mut wg_tunnel = WgTunnel::new(
             wg_private_key,
@@ -186,15 +191,11 @@ impl TunnelManager {
             socket,
             wg_client_id,
             keepalive,
+            mtu,
         );
 
         wg_tunnel.establish(Duration::from_secs(30)).await?;
 
-        let mtu = if params.mtu == 0 {
-            1280
-        } else {
-            params.mtu as usize
-        };
         log::info!("WireGuard tunnel established, MTU {}", mtu);
         if let Some(ref v6) = params.ipv6 {
             log::info!("client IP: {}, {}", params.ipv4, v6);
