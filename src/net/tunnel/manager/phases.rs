@@ -80,15 +80,13 @@ impl TunnelManager {
             }
         } else if needs_targeted_tcp_service {
             Self::poll_tcp_sockets(state, false);
-            if handled_socket_events {
-                match state.stack.poll_egress() {
-                    Ok(_state_changed) => {
-                        needs_stack_egress = state.stack.has_tx_packets();
-                    }
-                    Err(e) => {
-                        log::debug!("stack egress poll failed after socket event: {}", e);
-                        return false;
-                    }
+            match state.stack.poll_egress() {
+                Ok(_state_changed) => {
+                    needs_stack_egress = state.stack.has_tx_packets();
+                }
+                Err(e) => {
+                    log::debug!("stack egress poll failed after targeted tcp service: {}", e);
+                    return false;
                 }
             }
         }
@@ -200,6 +198,7 @@ impl TunnelManager {
                 socket_state.write_shutdown = true;
             }
         }
+        state.sync_socket_poll_interest(event.handle);
         state.enqueue_ready_tcp_handle(event.handle);
     }
 
@@ -496,6 +495,12 @@ impl TunnelManager {
                 {
                     socket_state.write_shutdown = true;
                 }
+                RuntimeState::sync_socket_poll_interest_counters(
+                    socket_state,
+                    &mut state.pending_from_client_sockets,
+                    &mut state.pending_to_client_sockets,
+                    &mut state.close_requested_sockets,
+                );
                 let tcp_chunk_size = state.tunables.tcp_chunk_size;
                 let should_service_write = full_sweep
                     || event_mask & (SOCKET_EVENT_WRITE | SOCKET_EVENT_CLOSED) != 0
@@ -515,8 +520,19 @@ impl TunnelManager {
                 if should_service_read {
                     Self::fill_recv_buffer(handle, stack, read_buffer, socket_state, tcp_chunk_size);
                 }
+                RuntimeState::sync_socket_poll_interest_counters(
+                    socket_state,
+                    &mut state.pending_from_client_sockets,
+                    &mut state.pending_to_client_sockets,
+                    &mut state.close_requested_sockets,
+                );
 
                 let past_handshake = stack.tcp_is_past_handshake(handle);
+                RuntimeState::sync_socket_connecting_counters(
+                    socket_state,
+                    !past_handshake,
+                    &mut state.connecting_sockets,
+                );
 
                 if past_handshake && !stack.tcp_may_recv(handle) {
                     socket_state
@@ -546,6 +562,13 @@ impl TunnelManager {
 
         for handle in &closed_handles {
             if let Some(socket_state) = state.sockets.remove(handle) {
+                let socket_state = RuntimeState::remove_socket_poll_interest_counters(
+                    socket_state,
+                    &mut state.pending_from_client_sockets,
+                    &mut state.pending_to_client_sockets,
+                    &mut state.close_requested_sockets,
+                    &mut state.connecting_sockets,
+                );
                 if let Some(flow_key) = socket_state.flow_key {
                     state.tcp_flow_map.remove(&flow_key);
                 }

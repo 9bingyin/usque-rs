@@ -26,13 +26,7 @@ impl TunnelManager {
                 }
             }
             ManagerCommand::Close { handle } => {
-                Self::close_connection(
-                    &mut state.stack,
-                    &mut state.sockets,
-                    &mut state.tcp_flow_map,
-                    &mut state.tcp_handles,
-                    handle,
-                );
+                Self::close_connection(state, handle);
             }
             ManagerCommand::DnsResolve {
                 domain,
@@ -214,12 +208,18 @@ impl TunnelManager {
             flow_key: Some(flow_key),
             pending_events: SOCKET_EVENT_WRITE,
             close_requested: false,
+            counted_pending_from_client: false,
+            counted_pending_to_client: false,
+            counted_close_requested: false,
+            counted_connecting: false,
             write_shutdown: false,
             fin_sent: false,
             ready_waiters: Vec::new(),
         };
 
         state.sockets.insert(handle, socket_state);
+        state.sync_socket_poll_interest(handle);
+        state.sync_socket_connecting_state(handle, true);
         state.tcp_flow_map.insert(flow_key, handle);
         state.tcp_handles.push(handle);
         if reserved_slot {
@@ -229,31 +229,29 @@ impl TunnelManager {
         Ok(stream)
     }
 
-    fn close_connection(
-        stack: &mut NetworkStack,
-        sockets: &mut HashMap<SocketHandle, SocketState>,
-        tcp_flow_map: &mut HashMap<TcpFlowKey, SocketHandle>,
-        tcp_handles: &mut Vec<SocketHandle>,
-        handle: SocketHandle,
-    ) {
-        if let Some(state) = sockets.get_mut(&handle) {
-            state.close_requested = true;
-            state.write_shutdown = true;
-            state.stream.write_shutdown.store(true, std::sync::atomic::Ordering::Release);
-            state.stream.send_waker.wake();
-            state.stream.notify_closed();
-            for waiter in state.ready_waiters.drain(..) {
+    fn close_connection(state: &mut RuntimeState, handle: SocketHandle) {
+        if let Some(socket_state) = state.sockets.get_mut(&handle) {
+            socket_state.close_requested = true;
+            socket_state.write_shutdown = true;
+            socket_state
+                .stream
+                .write_shutdown
+                .store(true, std::sync::atomic::Ordering::Release);
+            socket_state.stream.send_waker.wake();
+            socket_state.stream.notify_closed();
+            for waiter in socket_state.ready_waiters.drain(..) {
                 if waiter.send(TcpSocketState::Closed).is_err() {
                     log::trace!("Failed to notify waiter of connection close: receiver dropped");
                 }
             }
+            state.sync_socket_poll_interest(handle);
             return;
         }
 
-        stack.tcp_close(handle);
-        stack.remove_socket(handle);
-        tcp_flow_map.retain(|_, mapped_handle| *mapped_handle != handle);
-        tcp_handles.retain(|h| *h != handle);
+        state.stack.tcp_close(handle);
+        state.stack.remove_socket(handle);
+        state.tcp_flow_map.retain(|_, mapped_handle| *mapped_handle != handle);
+        state.tcp_handles.retain(|h| *h != handle);
     }
 
     fn get_tcp_socket_state(

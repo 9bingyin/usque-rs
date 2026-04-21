@@ -179,6 +179,7 @@ impl TunnelManager {
         let udp_recv_buffer_size = tunables.udp_recv_buffer_size;
         let pool_max_size = tunables.pool_max_size;
         let buffer_reuse_max_capacity = tunables.buffer_reuse_max_capacity;
+        let udp_read_drain_budget = tunables.udp_batch_read_budget.saturating_mul(4).max(1);
 
         let recv_handle = tokio::spawn(async move {
             let _guard = recv_completion_tx;
@@ -195,6 +196,7 @@ impl TunnelManager {
                                     udp_recv_buffer_size,
                                     pool_max_size,
                                     buffer_reuse_max_capacity,
+                                    udp_read_drain_budget,
                                 )
                                 .await
                                 .is_err()
@@ -227,9 +229,10 @@ impl TunnelManager {
         udp_recv_buffer_size: usize,
         pool_max_size: usize,
         buffer_reuse_max_capacity: usize,
+        budget: usize,
     ) -> Result<usize, ()> {
         let mut drained = 0usize;
-        loop {
+        while drained < budget {
             let mut buf = Self::take_pooled_buffer(buffer_pool, udp_recv_buffer_size);
             buf.resize(udp_recv_buffer_size, 0);
             match socket.try_recv(&mut buf[..]) {
@@ -528,6 +531,7 @@ mod transport_tests {
             2048,
             8,
             2048,
+            8,
         )
         .await
         .unwrap();
@@ -540,6 +544,64 @@ mod transport_tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"two"
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_ready_udp_socket_respects_budget() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+
+        sender.send(b"one").await.unwrap();
+        sender.send(b"two").await.unwrap();
+        sender.send(b"three").await.unwrap();
+
+        receiver.readable().await.unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let drained = TunnelManager::drain_ready_udp_socket(
+            &receiver,
+            &event_tx,
+            &test_buffer_pool(),
+            2048,
+            8,
+            2048,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(drained, 2);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"one"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"two"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let drained = TunnelManager::drain_ready_udp_socket(
+            &receiver,
+            &event_tx,
+            &test_buffer_pool(),
+            2048,
+            8,
+            2048,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(drained, 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TransportIoEvent::Incoming(IncomingDatagram { data })) if &data[..] == b"three"
         ));
     }
 }

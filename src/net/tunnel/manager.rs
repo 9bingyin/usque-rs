@@ -354,6 +354,10 @@ struct SocketState {
     flow_key: Option<TcpFlowKey>,
     pending_events: u8,
     close_requested: bool,
+    counted_pending_from_client: bool,
+    counted_pending_to_client: bool,
+    counted_close_requested: bool,
+    counted_connecting: bool,
     write_shutdown: bool,
     fin_sent: bool,
     // Waiters for socket ready notification (event-driven instead of polling)
@@ -499,6 +503,10 @@ struct RuntimeState {
     datagram_pool: BufferPool,
     runtime_stats: Arc<ManagerRuntimeStats>,
     perf: PerfCounters,
+    pending_from_client_sockets: usize,
+    pending_to_client_sockets: usize,
+    close_requested_sockets: usize,
+    connecting_sockets: usize,
 }
 
 impl RuntimeState {
@@ -535,6 +543,10 @@ impl RuntimeState {
             datagram_pool,
             runtime_stats,
             perf: PerfCounters::new(perf_enabled, perf_interval_secs),
+            pending_from_client_sockets: 0,
+            pending_to_client_sockets: 0,
+            close_requested_sockets: 0,
+            connecting_sockets: 0,
         }
     }
 
@@ -545,7 +557,13 @@ impl RuntimeState {
         }
 
         let (rx_queue_len, tx_queue_len) = self.stack.queue_lengths();
-        rx_queue_len > 0 || tx_queue_len > 0 || !self.tcp_handles.is_empty()
+        rx_queue_len > 0
+            || tx_queue_len > 0
+            || !self.ready_tcp_handles.is_empty()
+            || self.pending_from_client_sockets > 0
+            || self.pending_to_client_sockets > 0
+            || self.close_requested_sockets > 0
+            || self.connecting_sockets > 0
     }
 
     fn enqueue_ready_tcp_handle(&mut self, handle: SocketHandle) {
@@ -559,6 +577,114 @@ impl RuntimeState {
             socket_state.pending_events |= event_mask;
         }
         self.enqueue_ready_tcp_handle(handle);
+    }
+
+    fn sync_socket_poll_interest(&mut self, handle: SocketHandle) {
+        let Some(socket_state) = self.sockets.get_mut(&handle) else {
+            return;
+        };
+        Self::sync_socket_poll_interest_counters(
+            socket_state,
+            &mut self.pending_from_client_sockets,
+            &mut self.pending_to_client_sockets,
+            &mut self.close_requested_sockets,
+        );
+    }
+
+    fn sync_socket_connecting_state(&mut self, handle: SocketHandle, is_connecting: bool) {
+        let Some(socket_state) = self.sockets.get_mut(&handle) else {
+            return;
+        };
+        Self::sync_socket_connecting_counters(
+            socket_state,
+            is_connecting,
+            &mut self.connecting_sockets,
+        );
+    }
+
+    fn sync_socket_poll_interest_counters(
+        socket_state: &mut SocketState,
+        pending_from_client_sockets: &mut usize,
+        pending_to_client_sockets: &mut usize,
+        close_requested_sockets: &mut usize,
+    ) {
+        let has_pending_from_client = socket_state.buffered_from_client_bytes() > 0;
+        if has_pending_from_client != socket_state.counted_pending_from_client {
+            if has_pending_from_client {
+                *pending_from_client_sockets += 1;
+            } else {
+                debug_assert!(*pending_from_client_sockets > 0);
+                *pending_from_client_sockets -= 1;
+            }
+            socket_state.counted_pending_from_client = has_pending_from_client;
+        }
+
+        let has_pending_to_client = socket_state.buffered_to_client_bytes() > 0;
+        if has_pending_to_client != socket_state.counted_pending_to_client {
+            if has_pending_to_client {
+                *pending_to_client_sockets += 1;
+            } else {
+                debug_assert!(*pending_to_client_sockets > 0);
+                *pending_to_client_sockets -= 1;
+            }
+            socket_state.counted_pending_to_client = has_pending_to_client;
+        }
+
+        if socket_state.close_requested != socket_state.counted_close_requested {
+            if socket_state.close_requested {
+                *close_requested_sockets += 1;
+            } else {
+                debug_assert!(*close_requested_sockets > 0);
+                *close_requested_sockets -= 1;
+            }
+            socket_state.counted_close_requested = socket_state.close_requested;
+        }
+    }
+
+    fn remove_socket_poll_interest_counters(
+        mut socket_state: SocketState,
+        pending_from_client_sockets: &mut usize,
+        pending_to_client_sockets: &mut usize,
+        close_requested_sockets: &mut usize,
+        connecting_sockets: &mut usize,
+    ) -> SocketState {
+        if socket_state.counted_pending_from_client {
+            debug_assert!(*pending_from_client_sockets > 0);
+            *pending_from_client_sockets -= 1;
+            socket_state.counted_pending_from_client = false;
+        }
+        if socket_state.counted_pending_to_client {
+            debug_assert!(*pending_to_client_sockets > 0);
+            *pending_to_client_sockets -= 1;
+            socket_state.counted_pending_to_client = false;
+        }
+        if socket_state.counted_close_requested {
+            debug_assert!(*close_requested_sockets > 0);
+            *close_requested_sockets -= 1;
+            socket_state.counted_close_requested = false;
+        }
+        if socket_state.counted_connecting {
+            debug_assert!(*connecting_sockets > 0);
+            *connecting_sockets -= 1;
+            socket_state.counted_connecting = false;
+        }
+        socket_state
+    }
+
+    fn sync_socket_connecting_counters(
+        socket_state: &mut SocketState,
+        is_connecting: bool,
+        connecting_sockets: &mut usize,
+    ) {
+        if is_connecting != socket_state.counted_connecting {
+            if is_connecting {
+                *connecting_sockets += 1;
+            } else {
+                debug_assert!(*connecting_sockets > 0);
+                *connecting_sockets -= 1;
+            }
+            socket_state.counted_connecting = is_connecting;
+        }
     }
 }
 
@@ -715,6 +841,165 @@ mod manager_pool_tests {
         assert_eq!(manager1.reported_load().pending_connects, 1);
 
         assert!(matches!(pool.pick_for_tcp(), Err(ManagerError::Overloaded)));
+    }
+
+    #[test]
+    fn has_poll_work_ignores_idle_tcp_socket() {
+        let stack = NetworkStack::new(Some("10.0.0.1"), None, 1500, StackTunables::default());
+        let datagram_pool = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime_stats = Arc::new(ManagerRuntimeStats::new(8));
+        let mut state = RuntimeState::new(
+            stack,
+            datagram_pool,
+            ManagerTunables::default(),
+            runtime_stats,
+            false,
+            1,
+        );
+        let (stream, control) = SocketStream::new(
+            SocketHandle::default(),
+            state.tunables.max_pending_data,
+            state.tunables.max_pending_to_client,
+            state.socket_event_tx.clone(),
+        );
+        let handle = stream.handle;
+        std::mem::forget(stream);
+
+        state.sockets.insert(
+            handle,
+            SocketState {
+                stream: control,
+                flow_key: None,
+                pending_events: 0,
+                close_requested: false,
+                counted_pending_from_client: false,
+                counted_pending_to_client: false,
+                counted_close_requested: false,
+                counted_connecting: false,
+                write_shutdown: false,
+                fin_sent: false,
+                ready_waiters: Vec::new(),
+            },
+        );
+        state.tcp_handles.push(handle);
+
+        assert!(!state.has_poll_work());
+    }
+
+    #[test]
+    fn has_poll_work_tracks_pending_socket_interest_precisely() {
+        let stack = NetworkStack::new(Some("10.0.0.1"), None, 1500, StackTunables::default());
+        let datagram_pool = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime_stats = Arc::new(ManagerRuntimeStats::new(8));
+        let mut state = RuntimeState::new(
+            stack,
+            datagram_pool,
+            ManagerTunables::default(),
+            runtime_stats,
+            false,
+            1,
+        );
+        let (stream, control) = SocketStream::new(
+            SocketHandle::default(),
+            state.tunables.max_pending_data,
+            state.tunables.max_pending_to_client,
+            state.socket_event_tx.clone(),
+        );
+        let handle = stream.handle;
+        std::mem::forget(stream);
+
+        state.sockets.insert(
+            handle,
+            SocketState {
+                stream: control.clone(),
+                flow_key: None,
+                pending_events: 0,
+                close_requested: false,
+                counted_pending_from_client: false,
+                counted_pending_to_client: false,
+                counted_close_requested: false,
+                counted_connecting: false,
+                write_shutdown: false,
+                fin_sent: false,
+                ready_waiters: Vec::new(),
+            },
+        );
+        state.tcp_handles.push(handle);
+
+        control.send_buffer.enqueue_slice(b"hello");
+        state.sync_socket_poll_interest(handle);
+        assert!(state.has_poll_work());
+        assert_eq!(state.pending_from_client_sockets, 1);
+
+        control.send_buffer.consume(5);
+        state.sync_socket_poll_interest(handle);
+        assert!(!state.has_poll_work());
+        assert_eq!(state.pending_from_client_sockets, 0);
+
+        control.recv_buffer.enqueue_slice(b"world");
+        state.sync_socket_poll_interest(handle);
+        assert!(state.has_poll_work());
+        assert_eq!(state.pending_to_client_sockets, 1);
+
+        let mut buf = [0u8; 5];
+        assert_eq!(control.recv_buffer.dequeue_slice(&mut buf), 5);
+        state.sync_socket_poll_interest(handle);
+        assert!(!state.has_poll_work());
+        assert_eq!(state.pending_to_client_sockets, 0);
+
+        state.sockets.get_mut(&handle).unwrap().close_requested = true;
+        state.sync_socket_poll_interest(handle);
+        assert!(state.has_poll_work());
+        assert_eq!(state.close_requested_sockets, 1);
+    }
+
+    #[test]
+    fn has_poll_work_tracks_connecting_socket_interest() {
+        let stack = NetworkStack::new(Some("10.0.0.1"), None, 1500, StackTunables::default());
+        let datagram_pool = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime_stats = Arc::new(ManagerRuntimeStats::new(8));
+        let mut state = RuntimeState::new(
+            stack,
+            datagram_pool,
+            ManagerTunables::default(),
+            runtime_stats,
+            false,
+            1,
+        );
+        let (stream, control) = SocketStream::new(
+            SocketHandle::default(),
+            state.tunables.max_pending_data,
+            state.tunables.max_pending_to_client,
+            state.socket_event_tx.clone(),
+        );
+        let handle = stream.handle;
+        std::mem::forget(stream);
+
+        state.sockets.insert(
+            handle,
+            SocketState {
+                stream: control,
+                flow_key: None,
+                pending_events: 0,
+                close_requested: false,
+                counted_pending_from_client: false,
+                counted_pending_to_client: false,
+                counted_close_requested: false,
+                counted_connecting: false,
+                write_shutdown: false,
+                fin_sent: false,
+                ready_waiters: Vec::new(),
+            },
+        );
+        state.tcp_handles.push(handle);
+
+        state.sync_socket_connecting_state(handle, true);
+        assert!(state.has_poll_work());
+        assert_eq!(state.connecting_sockets, 1);
+
+        state.sync_socket_connecting_state(handle, false);
+        assert!(!state.has_poll_work());
+        assert_eq!(state.connecting_sockets, 0);
     }
 }
 
